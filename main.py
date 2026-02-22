@@ -121,16 +121,23 @@ async def send_telegram(message: str) -> None:
 # =============================================================================
 
 def notion_find_page(notion: Client, db_id: str, edikt_id: str):
-    """Sucht ein bestehendes Notion-Page anhand der Edikt-ID."""
-    response = notion.databases.query(
-        database_id=db_id,
-        filter={
-            "property": "Edikt-ID",
-            "rich_text": {"equals": edikt_id},
-        },
+    """Sucht ein bestehendes Notion-Page anhand der Edikt-ID (via search)."""
+    response = notion.search(
+        query=edikt_id,
+        filter={"value": "page", "property": "object"},
     )
-    results = response.get("results", [])
-    return results[0] if results else None
+    for page in response.get("results", []):
+        # Nur Seiten aus unserer Datenbank
+        parent = page.get("parent", {})
+        if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+            continue
+        # Edikt-ID Property prüfen
+        props = page.get("properties", {})
+        edikt_prop = props.get("Edikt-ID", {})
+        rich_text = edikt_prop.get("rich_text", [])
+        if rich_text and rich_text[0].get("plain_text", "") == edikt_id:
+            return page
+    return None
 
 
 def notion_create_versteigerung(notion: Client, db_id: str, data: dict) -> None:

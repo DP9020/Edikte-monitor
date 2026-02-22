@@ -47,17 +47,24 @@ def check_notion_properties():
 
     db = notion.databases.retrieve(database_id=db_id)
 
-    # properties fehlt → über query einen Eintrag holen um Schema zu lesen
+    # properties fehlt → über search() einen Eintrag holen um Schema zu lesen
     if "properties" not in db:
-        print("⚠️  retrieve() gibt kein 'properties' zurück – versuche query()...\n")
-        query_result = notion.databases.query(database_id=db_id, page_size=1)
-        pages = query_result.get("results", [])
+        print("⚠️  retrieve() gibt kein 'properties' zurück – versuche search()...\n")
+        search_result = notion.search(
+            filter={"value": "page", "property": "object"},
+            query=""
+        )
+        pages = [
+            p for p in search_result.get("results", [])
+            if p.get("parent", {}).get("database_id", "").replace("-", "") == db_id.replace("-", "")
+        ]
         if pages:
             db = {"properties": pages[0].get("properties", {}), "title": []}
-            print("✅ Schema über query() geladen\n")
+            print(f"✅ Schema über search() geladen ({len(pages[0].get('properties', {}))} Properties)\n")
         else:
-            print("❌ Datenbank ist leer oder Integration hat keinen Zugriff!")
+            print("❌ Kein Eintrag in der Datenbank gefunden oder Integration hat keinen Zugriff!")
             print(f"   API-Antwort Keys: {list(db.keys())}")
+            print(f"   Hinweis: notion-client v3 hat kein databases.query() mehr")
             return
 
     db_name = ""
