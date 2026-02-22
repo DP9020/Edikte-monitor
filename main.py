@@ -265,15 +265,29 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     Lädt ALLE bestehenden Einträge aus der Notion-DB und gibt ein Dict
     {edikt_id -> page_id} zurück.
 
-    Wird einmalig beim Start aufgerufen – danach braucht kein einzelner
-    API-Call mehr zur Deduplizierung gemacht zu werden.
+    Zusätzlich werden Einträge mit fortgeschrittener Workflow-Phase
+    (z.B. 'Angeschrieben', 'Angebot', 'Gekauft') unter dem Sentinel-Wert
+    "(geschuetzt)" gespeichert – der Scraper überspringt diese komplett,
+    auch wenn die Hash-ID matcht. So werden bereits bearbeitete Immobilien
+    niemals dupliziert oder überschrieben.
+
     Paginierung: Notion liefert max. 100 Ergebnisse pro Anfrage.
     """
+    # Workflow-Phasen die NICHT überschrieben werden dürfen
+    GESCHUETZT_PHASEN = {
+        "📨 Angeschrieben",
+        "🤝 Angebot",
+        "📋 Due Diligence",
+        "✅ Gekauft",
+        "❌ Abgelehnt",
+    }
+
     print("[Notion] 📥 Lade alle bestehenden IDs aus der Datenbank …")
-    known: dict[str, str] = {}  # edikt_id -> page_id
+    known: dict[str, str] = {}  # edikt_id -> page_id  (oder "(geschuetzt)")
     has_more = True
     cursor = None
     page_count = 0
+    geschuetzt_count = 0
 
     while has_more:
         kwargs: dict = {"filter": {"value": "page", "property": "object"}, "page_size": 100}
@@ -290,18 +304,44 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             parent = page.get("parent", {})
             if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
                 continue
-            props    = page.get("properties", {})
-            hash_rt  = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
+
+            props = page.get("properties", {})
+
+            # Workflow-Phase prüfen
+            phase_sel = props.get("Workflow-Phase", {}).get("select") or {}
+            phase = phase_sel.get("name", "")
+            ist_geschuetzt = phase in GESCHUETZT_PHASEN
+
+            # Hash-ID auslesen
+            hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
+            eid = ""
             if hash_rt:
                 eid = hash_rt[0].get("plain_text", "").strip().lower()
-                if eid:
+
+            if eid:
+                if ist_geschuetzt:
+                    known[eid] = "(geschuetzt)"
+                    geschuetzt_count += 1
+                else:
                     known[eid] = page["id"]
+
+            # Einträge OHNE Hash-ID aber MIT fortgeschrittener Phase:
+            # Titel als Ersatz-Fingerprint speichern (verhindert Doppelanlage
+            # bei manuell eingetragenen Immobilien ohne Hash-ID)
+            elif ist_geschuetzt:
+                title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
+                title = title_rt[0].get("plain_text", "").strip().lower() if title_rt else ""
+                if title:
+                    known[f"__titel__{title}"] = "(geschuetzt)"
+                    geschuetzt_count += 1
+
             page_count += 1
 
         has_more = resp.get("has_more", False)
         cursor   = resp.get("next_cursor")
 
-    print(f"[Notion] ✅ {len(known)} bekannte IDs geladen ({page_count} Seiten geprüft)")
+    print(f"[Notion] ✅ {len(known)} Einträge geladen "
+          f"({geschuetzt_count} geschützt, {page_count} Seiten geprüft)")
     return known
 
 
@@ -712,7 +752,9 @@ async def main() -> None:
                 eid = item["edikt_id"].lower()
 
                 if item["type"] == "Versteigerung":
-                    if eid not in known_ids:
+                    if known_ids.get(eid) == "(geschuetzt)":
+                        print(f"  [Notion] 🔒 Geschützt (bereits bearbeitet): {eid}")
+                    elif eid not in known_ids:
                         detail = notion_create_eintrag(notion, db_id, item)
                         item["_detail"] = detail or {}
                         neue_eintraege.append(item)
