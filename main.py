@@ -124,8 +124,12 @@ async def scrape_for_state(page, bundesland):
     await bundesland_select.select_option(label=bundesland)
 
     # Suchen klicken
-    await page.locator('input[type="submit"], button[type="submit"]').first.click()
-    await page.wait_for_timeout(2000)
+    # Formular direkt per JS absenden (robuster als Klick)
+await page.evaluate("""
+    const form = document.querySelector("form");
+    if (form) { form.submit(); }
+""")
+await page.wait_for_load_state("networkidle")
 
     anchors = await page.locator("a[href*='/alldoc/']").all()
     results = []
