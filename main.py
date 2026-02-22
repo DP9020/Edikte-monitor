@@ -121,7 +121,10 @@ async def send_telegram(message: str) -> None:
 # =============================================================================
 
 def notion_find_page(notion: Client, db_id: str, edikt_id: str):
-    """Sucht ein bestehendes Notion-Page anhand der Edikt-ID (via search)."""
+    """
+    Sucht ein bestehendes Notion-Page anhand der Hash-ID / Vergleichs-ID (via search).
+    Nutzt das Feld 'Hash-ID / Vergleichs-ID' (rich_text) in der Datenbank.
+    """
     response = notion.search(
         query=edikt_id,
         filter={"value": "page", "property": "object"},
@@ -131,10 +134,10 @@ def notion_find_page(notion: Client, db_id: str, edikt_id: str):
         parent = page.get("parent", {})
         if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
             continue
-        # Edikt-ID Property prüfen
+        # Hash-ID / Vergleichs-ID prüfen
         props = page.get("properties", {})
-        edikt_prop = props.get("Edikt-ID", {})
-        rich_text = edikt_prop.get("rich_text", [])
+        hash_prop = props.get("Hash-ID / Vergleichs-ID", {})
+        rich_text = hash_prop.get("rich_text", [])
         if rich_text and rich_text[0].get("plain_text", "") == edikt_id:
             return page
     return None
@@ -164,13 +167,16 @@ def notion_create_versteigerung(notion: Client, db_id: str, data: dict) -> None:
         titel += f" | {beschreibung[:60]}"
 
     properties: dict = {
-        "Name": {
+        # Titel → echtes Property heißt "Liegenschaftsadresse" (title)
+        "Liegenschaftsadresse": {
             "title": [{"text": {"content": titel}}]
         },
-        "Edikt-ID": {
+        # Eindeutige ID zur Deduplizierung
+        "Hash-ID / Vergleichs-ID": {
             "rich_text": [{"text": {"content": edikt_id}}]
         },
-        "Edikt-Link": {
+        # Link zum Edikt → echtes Property heißt "Link" (url)
+        "Link": {
             "url": link
         },
         "Art des Edikts": {
@@ -188,21 +194,17 @@ def notion_create_versteigerung(notion: Client, db_id: str, data: dict) -> None:
         "Workflow-Phase": {
             "select": {"name": "🆕 Neu eingelangt"}
         },
-        "Import-Datum": {
-            "date": {"start": datetime.now().strftime("%Y-%m-%d")}
+        # Import-Datum → echtes Property ist "created_time" (automatisch)
+        # Objektart aus Beschreibung
+        "Objektart": {
+            "rich_text": [{"text": {"content": beschreibung[:200] if beschreibung else ""}}]
         },
     }
 
-    # Optionales Gerichts-Feld
+    # Optionales Verpflichtende Partei / Gericht
     if gericht:
-        properties["Gericht"] = {
+        properties["Verpflichtende Partei"] = {
             "rich_text": [{"text": {"content": gericht}}]
-        }
-
-    # Optionales Beschreibungs-Feld
-    if beschreibung:
-        properties["Beschreibung"] = {
-            "rich_text": [{"text": {"content": beschreibung[:2000]}}]
         }
 
     notion.pages.create(
