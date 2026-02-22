@@ -119,14 +119,15 @@ async def scrape_for_state(page, bundesland):
     await page.goto(EDIKTE_FORM_URL)
     await page.wait_for_timeout(1000)
 
-    # Bundesland auswählen
-    await page.locator("select").first.select_option(label=bundesland)
-    await page.locator("input[type=submit], button[type=submit]").first.click()
+    # Direkt das richtige Bundesland-Dropdown ansprechen
+    bundesland_select = page.locator('select[name="VBl"]')
+    await bundesland_select.select_option(label=bundesland)
 
+    # Suchen klicken
+    await page.locator('input[type="submit"], button[type="submit"]').first.click()
     await page.wait_for_timeout(2000)
 
     anchors = await page.locator("a[href*='/alldoc/']").all()
-
     results = []
 
     for anchor in anchors:
@@ -157,7 +158,6 @@ async def scrape_for_state(page, bundesland):
         })
 
     return results
-
 
 # =========================
 # MAIN LOGIK
