@@ -242,14 +242,13 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
 
 async def scrape_for_state(page, bundesland: str) -> list[dict]:
     """
-    Öffnet das Suchformular auf edikte.justiz.gv.at,
-    wählt das Bundesland aus und gibt alle relevanten Treffer zurück.
+    Scraper für edikte.justiz.gv.at – Gerichtliche Versteigerungen.
 
     Strategie:
-    - Alle <select>-Felder durchgehen
-    - Das Dropdown identifizieren das die meisten Bundesländer-Optionen enthält
-    - Kein hart codierter Feldname (robust gegen HTML-Änderungen)
-    - Formular via JavaScript submitten (kein physischer Klick nötig)
+    - Direkt das VEX-Formular (Versteigerungs-Suche) aufrufen (subf=vex)
+    - Bundesland per select[name='BL'] setzen
+    - Submit-Button per Name klicken
+    - IBM Domino macht JS-Redirect auf Ergebnisseite → auf URL mit 'alldoc' warten
     """
     print(f"\n[Scraper] 🔍 Suche für: {bundesland}")
 
@@ -257,87 +256,48 @@ async def scrape_for_state(page, bundesland: str) -> list[dict]:
     await page.wait_for_timeout(1500)
 
     # -------------------------------------------------------------------------
-    # Bundesland-Dropdown automatisch identifizieren
+    # Bundesland per name='BL' setzen (bekanntes Feld aus Form-Analyse)
     # -------------------------------------------------------------------------
-    target_states = {s.strip().lower() for s in BUNDESLAENDER}
-
-    selects   = page.locator("select")
-    count     = await selects.count()
-    best_select = None
-    best_score  = 0
-
-    for i in range(count):
-        s = selects.nth(i)
-
-        # "multiple"-Dropdowns (z.B. Objektkategorie) überspringen
-        multiple = await s.get_attribute("multiple")
-        if multiple is not None:
-            continue
-
-        option_texts = await s.evaluate(
-            "(el) => Array.from(el.options).map(o => (o.textContent || '').trim().toLowerCase())"
-        )
-        score = len(target_states.intersection(set(option_texts)))
-
-        if score > best_score:
-            best_score  = score
-            best_select = s
-
-    if best_select is None or best_score < 5:
-        print(
-            f"  [Scraper] ⚠️  Bundesland-Dropdown nicht gefunden "
-            f"(best_score={best_score}). Bundesland übersprungen: {bundesland}"
-        )
+    bl_select = page.locator('select[name="BL"]')
+    if await bl_select.count() == 0:
+        print(f"  [Scraper] ⚠️  BL-Dropdown nicht gefunden. Überspringe: {bundesland}")
         return []
 
-    # Bundesland auswählen
-    await best_select.select_option(label=bundesland)
-    print(f"  [Scraper] ✔️  Dropdown gefunden (Score {best_score}), ausgewählt: {bundesland}")
+    await bl_select.select_option(label=bundesland)
+    print(f"  [Scraper] ✔️  Bundesland gesetzt: {bundesland}")
 
     # -------------------------------------------------------------------------
-    # Formular per JavaScript abschicken (robuster als Klick)
+    # Submit-Button klicken (input[name='sebut'])
+    # IBM Domino verarbeitet das Formular server-seitig und macht dann
+    # einen JavaScript-Redirect auf die Ergebnisseite
     # -------------------------------------------------------------------------
-    await page.evaluate("""
-        const form = document.querySelector("form");
-        if (form) { form.submit(); }
-    """)
-    await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(2000)
+    submit_btn = page.locator('input[name="sebut"]')
+    if await submit_btn.count() > 0:
+        await submit_btn.evaluate("el => el.click()")
+        print(f"  [Scraper] 🖱️  Submit geklickt")
+    else:
+        await page.evaluate("document.querySelector('form').submit()")
+        print(f"  [Scraper] 📤 Formular per JS abgeschickt")
 
-    current_url = page.url
-    print(f"  [Scraper] 📍 URL nach Submit: {current_url}")
-
-    # IBM Domino: nach CreateDocument kommt oft ein Meta-Refresh oder JS-Redirect
-    # Wir folgen diesem explizit
-    meta_refresh = await page.evaluate("""
-        () => {
-            const meta = document.querySelector('meta[http-equiv="refresh"]');
-            if (meta) return meta.getAttribute('content');
-            return null;
-        }
-    """)
-    if meta_refresh:
-        print(f"  [Scraper] 🔄 Meta-Refresh: {meta_refresh}")
-        # URL aus Meta-Refresh extrahieren (Format: "0;URL=...")
-        import re as _re
-        url_match = _re.search(r'URL=(.+)', meta_refresh, _re.IGNORECASE)
-        if url_match:
-            redirect_url = url_match.group(1).strip()
-            if redirect_url.startswith('/'):
-                redirect_url = 'https://edikte.justiz.gv.at' + redirect_url
-            print(f"  [Scraper] ➡️  Folge Redirect: {redirect_url}")
-            await page.goto(redirect_url, wait_until="networkidle")
-            await page.wait_for_timeout(2000)
+    # Warten auf Navigation – IBM Domino: CreateDocument → JS-Redirect → Ergebnisseite
+    try:
+        await page.wait_for_url("**/alldoc/**", timeout=10000)
+        print(f"  [Scraper] ✅ Ergebnisseite geladen: {page.url}")
+    except Exception:
+        # Fallback: einfach warten
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(3000)
+        print(f"  [Scraper] 📍 URL nach Warten: {page.url}")
 
     # Seiteninhalt für Debugging
     page_text = await page.inner_text('body')
-    print(f"  [Scraper] 📄 Seiteninhalt (erste 200 Zeichen): {page_text[:200]}")
+    print(f"  [Scraper] 📄 Inhalt (erste 200): {page_text[:200]}")
 
     # -------------------------------------------------------------------------
     # Ergebnisse auslesen
     # -------------------------------------------------------------------------
     anchors = await page.locator("a[href*='/alldoc/']").all()
-    print(f"  [Scraper] 🔗 Gefundene alldoc-Links: {len(anchors)}")
+    print(f"  [Scraper] 🔗 alldoc-Links: {len(anchors)}")
     results = []
 
     for anchor in anchors:
