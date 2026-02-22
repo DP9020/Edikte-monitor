@@ -158,7 +158,78 @@ async def scrape_for_state(page, bundesland):
         })
 
     return results
+async def scrape_for_state(page, bundesland):
+    await page.goto(EDIKTE_FORM_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(1000)
 
+    # --- Bundesland-Dropdown automatisch finden ---
+    target_states = {s.strip().lower() for s in BUNDESLAENDER}
+
+    selects = page.locator("select")
+    best_select = None
+    best_score = 0
+
+    for i in range(await selects.count()):
+        s = selects.nth(i)
+
+        # Kategorien-Dropdown ist oft "multiple" -> das ignorieren wir
+        multiple = await s.get_attribute("multiple")
+        if multiple is not None:
+            continue
+
+        # Options-Texte auslesen
+        option_texts = await s.evaluate(
+            """(el) => Array.from(el.options).map(o => (o.textContent || '').trim().toLowerCase())"""
+        )
+
+        score = len(target_states.intersection(set(option_texts)))
+
+        if score > best_score:
+            best_score = score
+            best_select = s
+
+    if not best_select or best_score < 5:
+        raise RuntimeError(
+            f"Konnte das Bundesland-Dropdown nicht sicher finden (best_score={best_score})."
+        )
+
+    await best_select.select_option(label=bundesland)
+
+    # --- Suche auslösen ---
+    await page.locator('input[type="submit"], button[type="submit"]').first.click()
+    await page.wait_for_timeout(2000)
+
+    anchors = await page.locator("a[href*='/alldoc/']").all()
+    results = []
+
+    for anchor in anchors:
+        href = await anchor.get_attribute("href")
+        text = (await anchor.inner_text()).strip()
+
+        if not href or not text:
+            continue
+
+        if not any(text.startswith(t) for t in RELEVANT_TYPES):
+            continue
+
+        if any(keyword in text.lower() for keyword in EXCLUDE_KEYWORDS):
+            continue
+
+        match = ID_RE.search(href)
+        if not match:
+            continue
+
+        if href.startswith("/"):
+            href = "https://edikte.justiz.gv.at" + href
+
+        results.append({
+            "bundesland": bundesland,
+            "type": text,
+            "link": href,
+            "edikt_id": match.group(1).lower(),
+        })
+
+    return results
 # =========================
 # MAIN LOGIK
 # =========================
