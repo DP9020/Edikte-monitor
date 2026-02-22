@@ -47,25 +47,33 @@ def check_notion_properties():
 
     db = notion.databases.retrieve(database_id=db_id)
 
-    # Vollständige Antwort ausgeben falls 'properties' fehlt
+    # properties fehlt → über query einen Eintrag holen um Schema zu lesen
     if "properties" not in db:
-        print("⚠️  API-Antwort enthält kein 'properties'-Feld!")
-        print("   Mögliche Ursache: Notion Integration hat keinen Zugriff auf diese Datenbank.")
-        print("   → Lösung: In Notion die Datenbank öffnen → '...' → 'Connections' → Integration hinzufügen")
-        print(f"\n   API-Antwort Keys: {list(db.keys())}")
-        print(f"   object-Type: {db.get('object', 'unbekannt')}")
-        return
+        print("⚠️  retrieve() gibt kein 'properties' zurück – versuche query()...\n")
+        query_result = notion.databases.query(database_id=db_id, page_size=1)
+        pages = query_result.get("results", [])
+        if pages:
+            db = {"properties": pages[0].get("properties", {}), "title": []}
+            print("✅ Schema über query() geladen\n")
+        else:
+            print("❌ Datenbank ist leer oder Integration hat keinen Zugriff!")
+            print(f"   API-Antwort Keys: {list(db.keys())}")
+            return
 
     db_name = ""
     if db.get("title"):
-        db_name = db["title"][0]["plain_text"] if db["title"] else "Unbekannt"
+        try:
+            db_name = db["title"][0]["plain_text"]
+        except (IndexError, KeyError):
+            db_name = "Unbekannt"
     print(f"📋 Datenbank-Name: {db_name}")
     print(f"\n{'='*55}")
     print(f"{'Property Name':<35} {'Typ':<20}")
     print(f"{'='*55}")
 
     for name, prop in sorted(db["properties"].items()):
-        print(f"{name:<35} {prop['type']:<20}")
+        prop_type = prop.get("type", prop.get("id", "?")) if isinstance(prop, dict) else str(prop)
+        print(f"{name:<35} {prop_type:<20}")
 
     print(f"{'='*55}")
     print(f"\n✅ Gesamt: {len(db['properties'])} Properties gefunden\n")
@@ -91,13 +99,15 @@ def check_notion_properties():
     for name, expected_type in expected.items():
         actual = db["properties"].get(name)
         if actual is None:
-            print(f"  ❌ FEHLT:    '{name}' (erwartet: {expected_type})")
-            all_ok = False
-        elif actual["type"] != expected_type:
-            print(f"  ⚠️  FALSCHER TYP: '{name}' → ist '{actual['type']}', erwartet '{expected_type}'")
+            print(f"  ❌ FEHLT:        '{name}' (erwartet: {expected_type})")
             all_ok = False
         else:
-            print(f"  ✅ OK:       '{name}' ({actual['type']})")
+            actual_type = actual.get("type", "?") if isinstance(actual, dict) else "?"
+            if actual_type != expected_type:
+                print(f"  ⚠️  FALSCHER TYP: '{name}' → ist '{actual_type}', erwartet '{expected_type}'")
+                all_ok = False
+            else:
+                print(f"  ✅ OK:           '{name}' ({actual_type})")
 
     if all_ok:
         print("\n🎉 Alles passt! Keine Anpassungen nötig.")
