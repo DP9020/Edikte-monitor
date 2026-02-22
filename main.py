@@ -278,10 +278,16 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> None:
     }
 
     # ── Verkehrswert ─────────────────────────────────────────────────────────
+    # Notion-Feld "Verkehrswert" kann Number oder Rich-Text sein.
+    # Wir schreiben es als rich_text (String), damit es in jedem Fall funktioniert.
+    # Wenn du das Feld in Notion auf "Number" umstellst, ändere hier auf {"number": verkehrswert}.
     verkehrswert = detail.get("schaetzwert")
     if verkehrswert is not None:
-        properties["Verkehrswert"] = {"number": verkehrswert}
-        print(f"    [Detail] 💰 Verkehrswert: {verkehrswert:,.2f} €")
+        vk_str = f"{verkehrswert:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+        properties["Verkehrswert"] = {
+            "rich_text": [{"text": {"content": vk_str}}]
+        }
+        print(f"    [Detail] 💰 Verkehrswert: {vk_str}")
 
     # ── Versteigerungstermin ─────────────────────────────────────────────────
     termin_iso = detail.get("termin_iso")
@@ -300,6 +306,7 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> None:
         properties=properties,
     )
     print(f"  [Notion] ✅ Erstellt: {titel[:80]}")
+    return detail
 
 
 def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
@@ -602,7 +609,8 @@ async def main() -> None:
 
                 if item["type"] == "Versteigerung":
                     if not existing:
-                        notion_create_eintrag(notion, db_id, item)
+                        detail = notion_create_eintrag(notion, db_id, item)
+                        item["_detail"] = detail or {}
                         neue_eintraege.append(item)
                     else:
                         print(f"  [Notion] ⏭  Bereits vorhanden: {item['edikt_id']}")
@@ -651,7 +659,7 @@ async def main() -> None:
         lines.append(f"<b>🟢 Neue Versteigerungen: {len(neue_eintraege)}</b>")
         for item in neue_eintraege[:20]:
             detail = item.get("_detail", {})
-            vk = detail.get("schaetzwert")
+            vk = item.get("_detail", {}).get("schaetzwert")
             vk_str = f" | 💰 {vk:,.0f} €" if vk else ""
             lines.append(
                 f"• <b>{item['bundesland']}</b> – {item['beschreibung'][:70]}{vk_str}"
