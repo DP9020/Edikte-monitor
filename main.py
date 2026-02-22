@@ -125,11 +125,14 @@ async def scrape_for_state(page, bundesland):
 
     # Suchen klicken
     # Formular direkt per JS absenden (robuster als Klick)
-await page.evaluate("""
+    await page.evaluate("""
     const form = document.querySelector("form");
     if (form) { form.submit(); }
-""")
-await page.wait_for_load_state("networkidle")
+    """)
+    await page.wait_for_load_state("networkidle")
+
+    # warten bis Ergebnis-Links da sind (oder leer bleibt)
+    await page.wait_for_timeout(1000)
 
     anchors = await page.locator("a[href*='/alldoc/']").all()
     results = []
