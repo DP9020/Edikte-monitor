@@ -379,6 +379,16 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
             "rich_text": [{"text": {"content": gericht[:200]}}]
         }
 
+    # ── PLZ ───────────────────────────────────────────────────────────────────
+    plz_ort = detail.get("plz_ort", "")
+    if plz_ort:
+        # PLZ ist die führende Zahl, z.B. "1120 Wien" → "1120"
+        plz_m = re.match(r"(\d{4,5})", plz_ort.strip())
+        if plz_m:
+            properties["PLZ"] = {
+                "rich_text": [{"text": {"content": plz_m.group(1)}}]
+            }
+
     # ── Fläche ────────────────────────────────────────────────────────────────
     flaeche = detail.get("flaeche_objekt") or detail.get("flaeche_grundstueck")
     if flaeche is not None:
