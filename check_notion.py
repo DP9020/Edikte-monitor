@@ -42,12 +42,24 @@ def check_notion_properties():
     db_id  = clean_db_id(raw_id)
 
     print(f"\n🔍 Verbinde mit Notion-Datenbank...")
-    print(f"   Rohe ID:     {raw_id[:40]}...")
+    print(f"   Rohe ID:       {raw_id[:60]}")
     print(f"   Bereinigte ID: {db_id}\n")
 
     db = notion.databases.retrieve(database_id=db_id)
 
-    print(f"📋 Datenbank-Name: {db['title'][0]['text']['content'] if db.get('title') else 'Unbekannt'}")
+    # Vollständige Antwort ausgeben falls 'properties' fehlt
+    if "properties" not in db:
+        print("⚠️  API-Antwort enthält kein 'properties'-Feld!")
+        print("   Mögliche Ursache: Notion Integration hat keinen Zugriff auf diese Datenbank.")
+        print("   → Lösung: In Notion die Datenbank öffnen → '...' → 'Connections' → Integration hinzufügen")
+        print(f"\n   API-Antwort Keys: {list(db.keys())}")
+        print(f"   object-Type: {db.get('object', 'unbekannt')}")
+        return
+
+    db_name = ""
+    if db.get("title"):
+        db_name = db["title"][0]["plain_text"] if db["title"] else "Unbekannt"
+    print(f"📋 Datenbank-Name: {db_name}")
     print(f"\n{'='*55}")
     print(f"{'Property Name':<35} {'Typ':<20}")
     print(f"{'='*55}")
@@ -93,4 +105,13 @@ def check_notion_properties():
         print("\n⚠️  Einige Properties fehlen oder haben falschen Typ.")
 
 if __name__ == "__main__":
-    check_notion_properties()
+    try:
+        check_notion_properties()
+    except Exception as e:
+        print(f"\n❌ Fehler: {e}")
+        print("\n💡 Häufige Ursachen:")
+        print("   1. NOTION_TOKEN ist falsch oder abgelaufen")
+        print("   2. NOTION_DATABASE_ID ist falsch")
+        print("   3. Die Notion Integration hat keinen Zugriff auf die Datenbank")
+        print("      → In Notion: Datenbank öffnen → '...' → 'Connections' → Integration hinzufügen")
+        raise
