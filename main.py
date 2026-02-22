@@ -87,29 +87,43 @@ def is_excluded(text: str) -> bool:
     return any(kw in text.lower() for kw in EXCLUDE_KEYWORDS)
 
 
-def parse_schaetzwert(raw: str) -> float | None:
+def parse_euro(raw: str) -> float | None:
     """
-    Wandelt einen Schätzwert-String (z.B. '1.130.698,59') in einen float um.
-    Gibt None zurück wenn das Parsen scheitert.
+    Wandelt einen österreichischen Betragsstring in float um.
+    z.B. '180.000,00 EUR' → 180000.0
     """
     try:
-        # Tausendertrennzeichen (.) entfernen, Komma durch Punkt ersetzen
-        cleaned = raw.strip()
-        cleaned = re.sub(r"[€EUReur\s]", "", cleaned)
+        cleaned = re.sub(r"[€EUReur\s]", "", raw.strip())
         cleaned = cleaned.replace(".", "").replace(",", ".")
         return float(cleaned)
     except Exception:
         return None
 
 
+def parse_flaeche(raw: str) -> float | None:
+    """Wandelt '96,72 m²' in 96.72 um."""
+    try:
+        m = re.search(r"([\d.,]+)", raw)
+        if m:
+            return float(m.group(1).replace(".", "").replace(",", "."))
+    except Exception:
+        pass
+    return None
+
+
 def fetch_detail(link: str) -> dict:
     """
-    Lädt die Edikt-Detailseite und extrahiert:
-    - Schätzwert / Verkehrswert (als Zahl)
-    - Aktenzeichen
-    - Versteigerungstermin (Datum + Uhrzeit)
-    - Adresse (Liegenschaft / Versteigerungsort)
-    - Gericht / Dienststelle
+    Lädt die Edikt-Detailseite und extrahiert alle strukturierten Felder
+    direkt aus dem Bootstrap-Grid (span.col-sm-3 + p.col-sm-9).
+
+    Liefert ein Dict mit den Schlüsseln:
+      liegenschaftsadresse, plz_ort, adresse_voll   ← echte Immobilienadresse
+      gericht, aktenzeichen, wegen
+      termin, termin_iso
+      kategorie, grundbuch, ez
+      flaeche_objekt, flaeche_grundstueck
+      schaetzwert (float), schaetzwert_str
+      geringstes_gebot (float)
     """
     try:
         req = urllib.request.Request(
@@ -122,30 +136,54 @@ def fetch_detail(link: str) -> dict:
         print(f"    [Detail] ⚠️  Fehler beim Laden: {exc}")
         return {}
 
-    body = re.sub(r"<[^>]+>", " ", html)
-    body = " ".join(body.split())
-
-    result = {}
-
-    # --- Schätzwert / Verkehrswert ---
-    m = SCHAETZWERT_RE.search(body)
-    if m:
-        raw_val = m.group(1).strip()
-        result["schaetzwert_str"] = raw_val
-        parsed = parse_schaetzwert(raw_val)
-        if parsed is not None:
-            result["schaetzwert"] = parsed
-
-    # --- Aktenzeichen ---
-    m = re.search(r"Aktenzeichen:\s*([\w\s\/\.]+?)\s+wegen", body, re.IGNORECASE)
-    if m:
-        result["aktenzeichen"] = m.group(1).strip()
-
-    # --- Versteigerungstermin ---
-    m = re.search(
-        r"Versteigerungstermin:\s*am\s+([\d\.]+)\s+um\s+([\d:]+\s+Uhr)",
-        body, re.IGNORECASE
+    # ── Alle label→value Paare aus dem Bootstrap-Grid extrahieren ────────────
+    grid_re = re.compile(
+        r'<span[^>]*col-sm-3[^>]*>\s*([^<]+?)\s*</span>\s*<p[^>]*col-sm-9[^>]*>\s*(.*?)\s*</p>',
+        re.DOTALL | re.IGNORECASE
     )
+
+    def clean(html_fragment: str) -> str:
+        t = re.sub(r"<[^>]+>", " ", html_fragment)
+        t = t.replace("\xa0", " ").replace("&nbsp;", " ")
+        from html import unescape
+        t = unescape(t)
+        return " ".join(t.split()).strip()
+
+    fields: dict[str, str] = {}
+    for label, value in grid_re.findall(html):
+        key = label.strip().rstrip(":").strip()
+        fields[key] = clean(value)
+
+    result: dict = {}
+
+    # ── Liegenschaftsadresse (echte Immobilienadresse!) ──────────────────────
+    adresse    = fields.get("Liegenschaftsadresse", "")
+    plz_ort    = fields.get("PLZ/Ort", "")
+    if adresse:
+        result["liegenschaftsadresse"] = adresse
+        result["plz_ort"]              = plz_ort
+        result["adresse_voll"]         = f"{adresse}, {plz_ort}".strip(", ")
+        print(f"    [Detail] 📍 Adresse: {result['adresse_voll']}")
+
+    # ── Gericht / Dienststelle ────────────────────────────────────────────────
+    if "Dienststelle" in fields:
+        result["gericht"] = fields["Dienststelle"]
+    elif "Dienststelle:" in fields:
+        result["gericht"] = fields["Dienststelle:"]
+
+    # ── Aktenzeichen ──────────────────────────────────────────────────────────
+    for k in ("Aktenzeichen", "Aktenzeichen:"):
+        if k in fields:
+            result["aktenzeichen"] = fields[k]
+            break
+
+    # ── wegen ─────────────────────────────────────────────────────────────────
+    if "wegen" in fields:
+        result["wegen"] = fields["wegen"]
+
+    # ── Versteigerungstermin ──────────────────────────────────────────────────
+    termin_raw = fields.get("Versteigerungstermin", "")
+    m = re.search(r"(\d{1,2}\.\d{1,2}\.\d{4})\s+um\s+([\d:]+\s*Uhr)", termin_raw)
     if m:
         result["termin"] = f"{m.group(1)} {m.group(2)}"
         try:
@@ -154,18 +192,44 @@ def fetch_detail(link: str) -> dict:
         except Exception:
             pass
 
-    # --- Versteigerungsort ---
-    m = re.search(
-        r"Versteigerungsort:\s*([^;\n]+?)(?:;|Telefonkontakt|$)",
-        body, re.IGNORECASE
-    )
-    if m:
-        result["adresse"] = m.group(1).strip()
+    # ── Kategorie / Objektart ─────────────────────────────────────────────────
+    if "Kategorie(n)" in fields:
+        result["kategorie"] = fields["Kategorie(n)"]
 
-    # --- Dienststelle / Gericht ---
-    m = re.search(r"Dienststelle:\s*([^(]+)", body, re.IGNORECASE)
-    if m:
-        result["gericht"] = m.group(1).strip()
+    # ── Grundbuch / EZ ────────────────────────────────────────────────────────
+    if "Grundbuch" in fields:
+        result["grundbuch"] = fields["Grundbuch"]
+    if "EZ" in fields:
+        result["ez"] = fields["EZ"]
+
+    # ── Flächen ───────────────────────────────────────────────────────────────
+    fobj = fields.get("Objektgröße", "")
+    if fobj:
+        parsed = parse_flaeche(fobj)
+        if parsed:
+            result["flaeche_objekt"] = parsed
+
+    fgrst = fields.get("Grundstücksgröße", "")
+    if fgrst:
+        parsed = parse_flaeche(fgrst)
+        if parsed:
+            result["flaeche_grundstueck"] = parsed
+
+    # ── Schätzwert ────────────────────────────────────────────────────────────
+    sv_raw = fields.get("Schätzwert", "")
+    if sv_raw:
+        result["schaetzwert_str"] = sv_raw
+        parsed = parse_euro(sv_raw)
+        if parsed is not None:
+            result["schaetzwert"] = parsed
+            print(f"    [Detail] 💰 Schätzwert: {parsed:,.0f} €")
+
+    # ── Geringstes Gebot ──────────────────────────────────────────────────────
+    gg_raw = fields.get("Geringstes Gebot", "")
+    if gg_raw:
+        parsed = parse_euro(gg_raw)
+        if parsed is not None:
+            result["geringstes_gebot"] = parsed
 
     return result
 
@@ -241,10 +305,11 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     return known
 
 
-def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> None:
+def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
     """
     Legt einen neuen Eintrag in Notion an.
-    Ruft vorher die Detailseite ab, um Verkehrswert, Termin etc. zu befüllen.
+    Ruft die Detailseite ab und befüllt alle verfügbaren Felder.
+    Gibt den detail-Dict zurück (für Telegram-Anzeige).
     """
     bundesland   = data.get("bundesland", "Unbekannt")
     link         = data.get("link", "")
@@ -252,80 +317,75 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> None:
     beschreibung = data.get("beschreibung", "")
     typ          = data.get("type", "Versteigerung")
 
-    # ── Detail abrufen (Schätzwert, Termin, Gericht …) ──────────────────────
-    detail = {}
+    # ── Detailseite abrufen ──────────────────────────────────────────────────
+    detail: dict = {}
     if link:
         detail = fetch_detail(link)
 
-    # Datum aus Beschreibung oder Detail
-    datum_str = re.search(r"\((\d{2}\.\d{2}\.\d{4})\)", beschreibung)
-    datum_fmt = datum_str.group(1) if datum_str else detail.get("termin", "")
+    # ── Liegenschaftsadresse als Titel ───────────────────────────────────────
+    # Priorität: echte Adresse aus Detailseite > Fallback auf Beschreibung
+    adresse_voll = detail.get("adresse_voll", "")
+    if not adresse_voll:
+        # Fallback: Bundesland + Datum aus Beschreibung
+        datum_m = re.search(r"\((\d{2}\.\d{2}\.\d{4})\)", beschreibung)
+        adresse_voll = f"{bundesland} – {datum_m.group(1) if datum_m else beschreibung[:60]}"
 
-    # Titel
-    titel = f"{bundesland} – {typ}"
-    if datum_fmt:
-        termin_kurz = datum_fmt[:10]
-        titel += f" – {termin_kurz}"
-    if beschreibung:
-        titel += f" | {beschreibung[:50]}"
+    titel = adresse_voll  # Das wird der Notion-Seitentitel
 
-    # Adresse aus Detail überschreiben wenn sinnvoll
-    adresse = detail.get("adresse", "") or beschreibung[:100]
+    # ── Objektart: Kategorie aus Detail oder Beschreibung ────────────────────
+    objektart = detail.get("kategorie", "") or beschreibung[:200]
 
     properties: dict = {
+        # Titel = echte Liegenschaftsadresse
         "Liegenschaftsadresse": {
-            "title": [{"text": {"content": adresse[:200] or titel[:200]}}]
+            "title": [{"text": {"content": titel[:200]}}]
         },
         "Hash-ID / Vergleichs-ID": {
             "rich_text": [{"text": {"content": edikt_id}}]
         },
-        "Link": {
-            "url": link
-        },
+        "Link": {"url": link},
         "Art des Edikts": {
             "select": {
                 "name": typ if typ in ("Versteigerung", "Entfall des Termins") else "Versteigerung"
             }
         },
-        "Bundesland": {
-            "select": {"name": bundesland}
-        },
-        "Neu eingelangt": {
-            "checkbox": True
-        },
-        "Automatisch importiert?": {
-            "checkbox": True
-        },
-        "Workflow-Phase": {
-            "select": {"name": "🆕 Neu eingelangt"}
-        },
+        "Bundesland":            {"select": {"name": bundesland}},
+        "Neu eingelangt":        {"checkbox": True},
+        "Automatisch importiert?": {"checkbox": True},
+        "Workflow-Phase":        {"select": {"name": "🆕 Neu eingelangt"}},
         "Objektart": {
-            "rich_text": [{"text": {"content": beschreibung[:200]}}]
+            "rich_text": [{"text": {"content": objektart[:200]}}]
         },
     }
 
-    # ── Verkehrswert ─────────────────────────────────────────────────────────
-    # Notion-Feld "Verkehrswert" kann Number oder Rich-Text sein.
-    # Wir schreiben es als rich_text (String), damit es in jedem Fall funktioniert.
-    # Wenn du das Feld in Notion auf "Number" umstellst, ändere hier auf {"number": verkehrswert}.
+    # ── Verkehrswert / Schätzwert ─────────────────────────────────────────────
     verkehrswert = detail.get("schaetzwert")
     if verkehrswert is not None:
+        # Als formatierter Text (passt zu Text-Feld in Notion)
         vk_str = f"{verkehrswert:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
         properties["Verkehrswert"] = {
             "rich_text": [{"text": {"content": vk_str}}]
         }
-        print(f"    [Detail] 💰 Verkehrswert: {vk_str}")
 
-    # ── Versteigerungstermin ─────────────────────────────────────────────────
+    # ── Versteigerungstermin ──────────────────────────────────────────────────
     termin_iso = detail.get("termin_iso")
     if termin_iso:
         properties["Versteigerungstermin"] = {"date": {"start": termin_iso}}
 
-    # ── Gericht ──────────────────────────────────────────────────────────────
+    # ── Gericht / Dienststelle ────────────────────────────────────────────────
     gericht = detail.get("gericht", "")
     if gericht:
         properties["Verpflichtende Partei"] = {
             "rich_text": [{"text": {"content": gericht[:200]}}]
+        }
+
+    # ── Fläche ────────────────────────────────────────────────────────────────
+    flaeche = detail.get("flaeche_objekt") or detail.get("flaeche_grundstueck")
+    if flaeche is not None:
+        # Als Text "96,72 m²" – falls Notion-Feld Number ist, einfach {"number": flaeche}
+        flaeche_str = f"{flaeche:,.2f} m²".replace(",", "X").replace(".", ",").replace("X", ".")
+        properties["Fläche"] = {
+            "rich_text": [{"text": {"content": flaeche_str}}]
         }
 
     notion.pages.create(
@@ -694,12 +754,13 @@ async def main() -> None:
     if neue_eintraege:
         lines.append(f"<b>🟢 Neue Versteigerungen: {len(neue_eintraege)}</b>")
         for item in neue_eintraege[:20]:
-            detail = item.get("_detail", {})
-            vk = item.get("_detail", {}).get("schaetzwert")
-            vk_str = f" | 💰 {vk:,.0f} €" if vk else ""
-            lines.append(
-                f"• <b>{item['bundesland']}</b> – {item['beschreibung'][:70]}{vk_str}"
-            )
+            detail   = item.get("_detail", {})
+            adresse  = detail.get("adresse_voll") or item["beschreibung"][:70]
+            kategorie = detail.get("kategorie", "")
+            vk       = detail.get("schaetzwert")
+            vk_str   = f" | 💰 {vk:,.0f} €".replace(",", ".") if vk else ""
+            kat_str  = f" [{kategorie}]" if kategorie else ""
+            lines.append(f"• <b>{adresse}</b>{kat_str}{vk_str}")
             lines.append(f"  <a href=\"{item['link']}\">→ Edikt öffnen</a>")
         if len(neue_eintraege) > 20:
             lines.append(f"  ... und {len(neue_eintraege) - 20} weitere")
