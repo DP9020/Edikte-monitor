@@ -302,12 +302,42 @@ async def scrape_for_state(page, bundesland: str) -> list[dict]:
         if (form) { form.submit(); }
     """)
     await page.wait_for_load_state("networkidle")
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(2000)
+
+    current_url = page.url
+    print(f"  [Scraper] 📍 URL nach Submit: {current_url}")
+
+    # IBM Domino: nach CreateDocument kommt oft ein Meta-Refresh oder JS-Redirect
+    # Wir folgen diesem explizit
+    meta_refresh = await page.evaluate("""
+        () => {
+            const meta = document.querySelector('meta[http-equiv="refresh"]');
+            if (meta) return meta.getAttribute('content');
+            return null;
+        }
+    """)
+    if meta_refresh:
+        print(f"  [Scraper] 🔄 Meta-Refresh: {meta_refresh}")
+        # URL aus Meta-Refresh extrahieren (Format: "0;URL=...")
+        import re as _re
+        url_match = _re.search(r'URL=(.+)', meta_refresh, _re.IGNORECASE)
+        if url_match:
+            redirect_url = url_match.group(1).strip()
+            if redirect_url.startswith('/'):
+                redirect_url = 'https://edikte.justiz.gv.at' + redirect_url
+            print(f"  [Scraper] ➡️  Folge Redirect: {redirect_url}")
+            await page.goto(redirect_url, wait_until="networkidle")
+            await page.wait_for_timeout(2000)
+
+    # Seiteninhalt für Debugging
+    page_text = await page.inner_text('body')
+    print(f"  [Scraper] 📄 Seiteninhalt (erste 200 Zeichen): {page_text[:200]}")
 
     # -------------------------------------------------------------------------
     # Ergebnisse auslesen
     # -------------------------------------------------------------------------
     anchors = await page.locator("a[href*='/alldoc/']").all()
+    print(f"  [Scraper] 🔗 Gefundene alldoc-Links: {len(anchors)}")
     results = []
 
     for anchor in anchors:
