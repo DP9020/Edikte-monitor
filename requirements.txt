@@ -1,2 +1,2 @@
-notion-client
-playwright
+notion-client>=2.2.1
+playwright>=1.42.0
