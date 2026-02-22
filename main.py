@@ -196,22 +196,49 @@ async def send_telegram(message: str) -> None:
 # NOTION
 # =============================================================================
 
-def notion_find_page(notion: Client, db_id: str, edikt_id: str):
-    """Sucht ein bestehendes Notion-Page anhand der Hash-ID."""
-    response = notion.search(
-        query=edikt_id,
-        filter={"value": "page", "property": "object"},
-    )
-    for page in response.get("results", []):
-        parent = page.get("parent", {})
-        if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-            continue
-        props     = page.get("properties", {})
-        hash_prop = props.get("Hash-ID / Vergleichs-ID", {})
-        rich_text = hash_prop.get("rich_text", [])
-        if rich_text and rich_text[0].get("plain_text", "") == edikt_id:
-            return page
-    return None
+def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
+    """
+    Lädt ALLE bestehenden Einträge aus der Notion-DB und gibt ein Dict
+    {edikt_id -> page_id} zurück.
+
+    Wird einmalig beim Start aufgerufen – danach braucht kein einzelner
+    API-Call mehr zur Deduplizierung gemacht zu werden.
+    Paginierung: Notion liefert max. 100 Ergebnisse pro Anfrage.
+    """
+    print("[Notion] 📥 Lade alle bestehenden IDs aus der Datenbank …")
+    known: dict[str, str] = {}  # edikt_id -> page_id
+    has_more = True
+    cursor = None
+    page_count = 0
+
+    while has_more:
+        kwargs: dict = {"filter": {"value": "page", "property": "object"}, "page_size": 100}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Fehler beim Laden der IDs: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            # Nur Pages aus unserer DB
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+            props    = page.get("properties", {})
+            hash_rt  = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
+            if hash_rt:
+                eid = hash_rt[0].get("plain_text", "").strip().lower()
+                if eid:
+                    known[eid] = page["id"]
+            page_count += 1
+
+        has_more = resp.get("has_more", False)
+        cursor   = resp.get("next_cursor")
+
+    print(f"[Notion] ✅ {len(known)} bekannte IDs geladen ({page_count} Seiten geprüft)")
+    return known
 
 
 def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> None:
@@ -593,7 +620,14 @@ async def main() -> None:
     entfall_updates: list[dict] = []
     fehler:          list[str]  = []
 
-    # ── 1. Edikte scrapen + in Notion eintragen ───────────────────────────────
+    # ── 1. Alle bekannten IDs einmalig laden (schnelle lokale Deduplizierung) ─
+    try:
+        known_ids = notion_load_all_ids(notion, db_id)  # {edikt_id -> page_id}
+    except Exception as exc:
+        print(f"  [ERROR] Konnte IDs nicht laden: {exc}")
+        known_ids = {}
+
+    # ── 2. Edikte scrapen + in Notion eintragen ───────────────────────────────
     for bundesland, bl_value in BUNDESLAENDER.items():
         try:
             results = fetch_results_for_state(bundesland, bl_value)
@@ -605,22 +639,24 @@ async def main() -> None:
 
         for item in results:
             try:
-                existing = notion_find_page(notion, db_id, item["edikt_id"])
+                eid = item["edikt_id"].lower()
 
                 if item["type"] == "Versteigerung":
-                    if not existing:
+                    if eid not in known_ids:
                         detail = notion_create_eintrag(notion, db_id, item)
                         item["_detail"] = detail or {}
                         neue_eintraege.append(item)
+                        known_ids[eid] = "(neu)"  # sofort als bekannt markieren
                     else:
-                        print(f"  [Notion] ⏭  Bereits vorhanden: {item['edikt_id']}")
+                        print(f"  [Notion] ⏭  Bereits vorhanden: {eid}")
 
                 elif item["type"] in ("Entfall des Termins", "Verschiebung"):
-                    if existing:
-                        notion_mark_entfall(notion, existing["id"], item)
+                    page_id = known_ids.get(eid)
+                    if page_id and page_id != "(neu)":
+                        notion_mark_entfall(notion, page_id, item)
                         entfall_updates.append(item)
                     else:
-                        print(f"  [Notion] ℹ️  Entfall ohne DB-Eintrag: {item['edikt_id']}")
+                        print(f"  [Notion] ℹ️  Entfall ohne DB-Eintrag: {eid}")
 
             except Exception as exc:
                 msg = f"Notion-Fehler {item.get('edikt_id', '?')}: {exc}"
