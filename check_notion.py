@@ -12,11 +12,38 @@ def env(name: str) -> str:
         raise RuntimeError(f"Fehlende Umgebungsvariable: {name}")
     return value
 
+def clean_db_id(raw: str) -> str:
+    """
+    Bereinigt die Datenbank-ID:
+    - Entfernt URL-Parameter wie ?v=...&pvs=...
+    - Extrahiert nur die 32-stellige Hex-ID
+    Beispiel:
+      "5a18c99a02c84c9dbd56469d15a1a978?v=abc&pvs=13"  → "5a18c99a-02c8-4c9d-bd56-469d15a1a978"
+      "https://notion.so/Titel-5a18c99a02c84c9dbd56469d15a1a978" → "5a18c99a..."
+    """
+    import re
+    # Query-Parameter entfernen
+    raw = raw.split("?")[0].strip()
+    # Letzten Pfadteil nehmen (falls URL)
+    raw = raw.rstrip("/").split("/")[-1]
+    # Nur Hex-Zeichen und Bindestriche behalten
+    raw = re.sub(r"[^0-9a-fA-F\-]", "", raw)
+    # Bindestriche entfernen → 32 Hex-Zeichen
+    clean = raw.replace("-", "")
+    if len(clean) == 32:
+        # Standard UUID-Format: 8-4-4-4-12
+        return f"{clean[0:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:32]}"
+    return raw  # Fallback: unverändert zurückgeben
+
+
 def check_notion_properties():
     notion = Client(auth=env("NOTION_TOKEN"))
-    db_id  = env("NOTION_DATABASE_ID")
+    raw_id = env("NOTION_DATABASE_ID")
+    db_id  = clean_db_id(raw_id)
 
-    print(f"\n🔍 Verbinde mit Notion-Datenbank: {db_id}\n")
+    print(f"\n🔍 Verbinde mit Notion-Datenbank...")
+    print(f"   Rohe ID:     {raw_id[:40]}...")
+    print(f"   Bereinigte ID: {db_id}\n")
 
     db = notion.databases.retrieve(database_id=db_id)
 

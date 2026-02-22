@@ -65,6 +65,23 @@ def env(name: str) -> str:
     return value
 
 
+def clean_notion_db_id(raw: str) -> str:
+    """
+    Bereinigt die Notion Datenbank-ID.
+    Entfernt URL-Parameter (?v=...&pvs=...) und gibt nur die reine ID zurück.
+    Funktioniert auch wenn der User versehentlich die View-URL kopiert hat.
+    """
+    # Query-Parameter entfernen (z.B. ?v=abc&pvs=13)
+    raw = raw.split("?")[0].strip()
+    # Letzten Pfadteil nehmen (falls vollständige URL eingefügt)
+    raw = raw.rstrip("/").split("/")[-1]
+    # Nur Hex-Zeichen behalten
+    clean = re.sub(r"[^0-9a-fA-F]", "", raw)
+    if len(clean) == 32:
+        return f"{clean[0:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:32]}"
+    return raw
+
+
 def is_excluded(text: str) -> bool:
     """Prüft ob ein Objekt durch EXCLUDE_KEYWORDS ausgeschlossen werden soll."""
     text_lower = text.lower()
@@ -352,7 +369,7 @@ async def main() -> None:
     print("=" * 60)
 
     notion = Client(auth=env("NOTION_TOKEN"))
-    db_id  = env("NOTION_DATABASE_ID")
+    db_id  = clean_notion_db_id(env("NOTION_DATABASE_ID"))
 
     neue_versteigerungen: list[dict] = []
     entfall_updates:      list[dict] = []
