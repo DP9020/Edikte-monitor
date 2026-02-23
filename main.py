@@ -1752,7 +1752,7 @@ async def main() -> None:
     print(f"⚠️  Fehler:              {len(fehler)}")
     print("=" * 60)
 
-    if not neue_eintraege and not entfall_updates and not fehler:
+    if not neue_eintraege and not entfall_updates and not fehler and not gutachten_enriched:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
