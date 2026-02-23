@@ -1642,7 +1642,9 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
         start_cursor = resp.get("next_cursor")
 
     # Zweiter Pass: Einträge mit analysiert?=True aber OHNE Adresse → neu analysieren
-    # (verbesserter Parser kann jetzt auch ausländische Adressen erkennen)
+    # NUR einmalig: dieser Pass wird NICHT wiederholt wenn das PDF gescannt ist.
+    # Erkennungskriterium: Notizen enthält bereits "Kein PDF" oder "gescannt"
+    # → diese werden NICHT zurückgesetzt (sonst Endlosschleife)
     to_reanalyze: list[str] = []
     has_more     = True
     start_cursor = None
@@ -1670,9 +1672,14 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
             adr_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
             adr_text = "".join(t.get("text", {}).get("content", "") for t in adr_rt).strip()
             if not adr_text:
-                # Auch ohne Verpflichtende Partei → neu analysieren
-                vp_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-                vp_text = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
+                # STOPP: wenn Notizen bereits "Kein PDF" oder ähnliches enthalten
+                # → das PDF ist gescannt/nicht lesbar → NICHT nochmal versuchen
+                notiz_rt = props.get("Notizen", {}).get("rich_text", [])
+                notiz_text = "".join(t.get("text", {}).get("content", "") for t in notiz_rt).strip()
+                if any(marker in notiz_text for marker in (
+                    "Kein PDF", "gescannt", "nicht lesbar", "kein Eigentümer"
+                )):
+                    continue  # gescanntes Dokument → kein Reset, verhindert Endlosschleife
                 # Nur zurücksetzen wenn ein Link vorhanden (sonst kein PDF zum analysieren)
                 link_rt = props.get("Link", {}).get("url") or ""
                 if link_rt and page["id"] not in to_fix:
