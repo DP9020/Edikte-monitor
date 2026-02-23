@@ -715,7 +715,12 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                     # Erste brauchbare Zeile = Name
                     if len(line) > 3:
                         # BUG: Nur Punkte/Sonderzeichen ohne Buchstaben → kein Name
-                        if not any(c.isalnum() for c in line):
+                        # Auch ".......... 2" (Punkte + Ziffer) → kein Name
+                        if not any(c.isalpha() for c in line):
+                            break
+                        # BUG: Fragmente wie ") und Ma-" (PDF-Zeilenumbruch-Artefakt)
+                        # Erkennbar: beginnt mit ) oder endet mit -
+                        if re.match(r'^[)\]}>]', line) or line.rstrip().endswith('-'):
                             break
                         # BUG D: Hilfskraft/Mitarbeiter des SV nie als Name
                         # "- Frau Mag. Zuzana ..., Hilfskraft des Sachverständigen"
@@ -896,10 +901,21 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
             parts_gl = [p.strip() for p in gl.split("|")]
             parts_gl = [p.lstrip(": ").strip() for p in parts_gl]
             # BUG J: Gerichtsvollzieher, Rechtsanwalt o.ä. als alleinstehende Segmente filtern
-            parts_gl = [p for p in parts_gl if p and len(p) > 3
-                        and not re.match(
-                            r'^(&\s*)?(Gerichtsvollzieher|Rechtsanwalt|RA\s|im\s+Zuge)',
-                            p, re.IGNORECASE)]
+            # Auch Punkteketten (".......... 2") und Personen-mit-Datum-Segmente entfernen
+            def _gl_segment_ok(p: str) -> bool:
+                if not p or len(p) <= 3:
+                    return False
+                if re.match(r'^(&\s*)?(Gerichtsvollzieher|Rechtsanwalt|RA\s|im\s+Zuge)', p, re.IGNORECASE):
+                    return False
+                if not any(c.isalpha() for c in p):  # nur Punkte/Ziffern/Symbole
+                    return False
+                # Personen-Segment mit Geburtsdatum z.B. "Elisabeth Schmid geb 1954-01-18"
+                if re.search(r'\bgeb\s+\d{4}[-./]\d{2}[-./]\d{2}\b', p, re.IGNORECASE):
+                    return False
+                if re.search(r'\b(19|18)\d{2}[-./]\d{1,2}[-./]\d{1,2}\b', p):
+                    return False
+                return True
+            parts_gl = [p for p in parts_gl if _gl_segment_ok(p)]
             gl = " | ".join(parts_gl).strip(" |")
             if not gl or len(gl) < 3:
                 continue
@@ -907,17 +923,28 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
             # BUG 6: "EG der EZ XXXX KG XXXXX" mit vollständiger Katastralangabe weglassen
             if re.match(r'^EG\s+der\s+EZ\s+\d+\s+KG\s+\d+', gl, re.IGNORECASE):
                 continue
-            # Eigentümergemeinschaft mit EZ/GB-Nummer → kein Gläubiger
-            if re.match(r'^Eigent\u00fcmergemeinschaft\s+(EZ|der\s+EZ|\d)', gl, re.IGNORECASE):
+            # Eigentümergemeinschaft / Wohnungseigentumsgem. → kein Gläubiger
+            if re.match(r'^(Eigentümergemeinschaft|Wohnungseigentums?gem\.?)', gl, re.IGNORECASE):
                 continue
-            # WEG / EG als Gläubiger: nur wenn gefolgt von Hausverwaltungsname (Adresse)
-            # "WEG 1230 Wien, Dirmhirngasse 25" → WEG = Wohnungseigentümergemeinschaft → kein Gläubiger
-            # "EG Gentzgasse 144" → EG = Eigentümergemeinschaft → kein Gläubiger
-            # Ausnahme: falls ein echter Bankname erkennbar wäre (wird davor geprüft)
-            if re.match(r'^(WEG|EG)\b', gl, re.IGNORECASE):
+            # WEG / EG / EGT / EigG als Gläubiger filtern
+            # "WEG EZ 2392 KG ...", "EGT Gemeinschaft ...", "EigG Kitzbühel"
+            if re.match(r'^(WEG|EG[T]?|EigG)\b', gl, re.IGNORECASE):
                 continue
-            # BUG H: Personen mit Geburtsdatum (z.B. "Hermann Stöckl, 1920-03-29") filtern
-            if re.search(r'\b(19|18)\d{2}[-/]\d{2}[-/]\d{2}\b', gl):
+            # Aktenzeichen als Gläubiger filtern ("Gemäß Aktenzeichen: 3 E 3374/24f")
+            if re.match(r'^Gemäß\s+Aktenzeichen', gl, re.IGNORECASE):
+                continue
+            # Nur Punkte/Symbole ohne echte Buchstaben → kein Gläubiger
+            if not any(c.isalpha() for c in gl):
+                continue
+            # Personen mit Geburtsdatum filtern – verschiedene Formate:
+            # "Hermann Stöckl, 1920-03-29"  (ISO mit Bindestrichen)
+            # "Elisabeth Schmid geb 1954-01-18"  (mit 'geb' Marker)
+            # "Elisabeth Schmid geb. 25.3.1954"  (mit Punkt-Datum)
+            if re.search(r'\b(19|18)\d{2}[-./]\d{1,2}[-./]\d{1,2}\b', gl):
+                continue
+            if re.search(r'\bgeb\.?\s*\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}', gl, re.IGNORECASE):
+                continue
+            if re.search(r'\bgeb\s+\d{4}[-./]\d{2}[-./]\d{2}\b', gl, re.IGNORECASE):
                 continue
             # BUG H: Hotels/Gastronomiebetriebe ohne Bank-Charakter filtern
             if re.search(r'(Mountain Resort|Hotel|Gasthof|Pension|Wirtshaus|Betreiber\s+ROJ)',
@@ -998,7 +1025,7 @@ def gutachten_enrich_notion_page(
         return False
 
     # ── Notion-Properties aufbauen ───────────────────────────────────────────
-    has_owner = bool(info.get("eigentümer_name") or info.get("eigentümer_adresse"))
+    # has_owner wird nach Bereinigung gesetzt (weiter unten)
     properties: dict = {
         "Gutachten analysiert?": {"checkbox": True},
     }
@@ -1006,13 +1033,44 @@ def gutachten_enrich_notion_page(
     def _rt(text: str) -> dict:
         return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
 
-    if info.get("eigentümer_name"):
-        print(f"    [Gutachten] 👤 Eigentümer: {info['eigentümer_name']}")
-        properties["Verpflichtende Partei"] = _rt(info["eigentümer_name"])
+    # ── Nachbereinigung: Name + Adresse validieren ──────────────────────────
+    def _clean_extracted_name(name: str) -> str:
+        """Verwirft Parser-Artefakte die als Name durchgerutscht sind."""
+        if not name:
+            return ""
+        # Fragmente wie ") und Ma-" (PDF-Seitenumbruch-Artefakte)
+        if re.match(r'^[)\\]}>]', name) or name.rstrip().endswith('-'):
+            return ""
+        # Nur Punkte/Symbole ohne echte Buchstaben
+        if not any(c.isalpha() for c in name):
+            return ""
+        return name
 
-    if info.get("eigentümer_adresse"):
-        print(f"    [Gutachten] 🏠 Adresse: {info['eigentümer_adresse']}")
-        properties["Zustell Adresse"] = _rt(info["eigentümer_adresse"])
+    def _clean_extracted_adresse(adr: str) -> str:
+        """Bereinigt fehlerhafte Adressen."""
+        if not adr:
+            return ""
+        # "A-9063 Maria Saal, Trattenweg 6, Telefon" → Telefon-Teil abschneiden
+        adr = re.sub(r',?\s*Telefon.*$', '', adr, flags=re.IGNORECASE).strip().rstrip(',')
+        # "8042 Graz, Neue-Welt-Höhe 17a" oder "A-9063 Maria Saal, Trattenweg 6"
+        # → PLZ+Ort vor Straße → nur Straße nehmen
+        m_ort_vor_strasse = re.match(r'^(?:[A-Za-z]-?)?\d{4,5}\s+\S+.*?,\s*(.+)', adr)
+        if m_ort_vor_strasse:
+            adr = m_ort_vor_strasse.group(1).strip()
+        # "Pritzstraße 9 A, Linz" → Stadtname am Ende entfernen (keine PLZ → kein PLZ/Ort-Feld)
+        adr = re.sub(r',\s*[A-ZÄÖÜ][a-zäöüß]+$', '', adr).strip()
+        return adr
+
+    name_clean = _clean_extracted_name(info.get("eigentümer_name", ""))
+    adr_clean  = _clean_extracted_adresse(info.get("eigentümer_adresse", ""))
+
+    if name_clean:
+        print(f"    [Gutachten] 👤 Eigentümer: {name_clean}")
+        properties["Verpflichtende Partei"] = _rt(name_clean)
+
+    if adr_clean:
+        print(f"    [Gutachten] 🏠 Adresse: {adr_clean}")
+        properties["Zustell Adresse"] = _rt(adr_clean)
 
     if info.get("eigentümer_plz_ort"):
         properties["Zustell PLZ/Ort"] = _rt(info["eigentümer_plz_ort"])
@@ -1026,6 +1084,9 @@ def gutachten_enrich_notion_page(
     # ── Notizen: Forderungsbetrag + PDF-Link ────────────────────────────────
     # HINWEIS: 'Langgutachten (Datei)' ist ein Notion-File-Upload-Feld und kann
     # keine externen URLs speichern → PDF-Link bleibt in Notizen.
+    # has_owner basiert auf bereinigtem Name/Adresse
+    has_owner = bool(name_clean or adr_clean)
+
     notiz_parts = []
     if info.get("forderung_betrag"):
         notiz_parts.append("Forderung: " + info["forderung_betrag"])
