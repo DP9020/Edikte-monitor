@@ -677,13 +677,24 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                 # Letzter Teil: PLZ Ort?
                 plz, ort = _ist_plz_ort(parts[-1])
                 if plz and len(parts) >= 2:
-                    name_candidate = parts[0].rstrip(".")
-                    adr_candidate  = parts[-2].rstrip(".") if len(parts) >= 3 else ""
-                    plz_candidate  = ort
-                    result["eigentümer_name"]    = name_candidate
-                    result["eigentümer_adresse"] = adr_candidate
-                    result["eigentümer_plz_ort"] = plz_candidate
-                    break
+                    inline_name = parts[0].rstrip(".")
+                    # BUG D: Hilfskraft/Mitarbeiter auch im Inline-Pfad filtern
+                    # Prüfe sowohl den Namensteil als auch die gesamte Zeile
+                    if re.search(
+                            r'(Hilfskraft|Mitarbeiter[in]*)\s+(des|der)\s+(S[Vv]|Sachverst)',
+                            rest_of_line, re.IGNORECASE):
+                        pass  # nicht setzen, weiter zum nächsten vp_match
+                    # BUG: Nur Punkte / Sonderzeichen ohne Buchstaben/Ziffern → überspringen
+                    elif not any(c.isalnum() for c in inline_name):
+                        pass
+                    else:
+                        name_candidate = inline_name
+                        adr_candidate  = parts[-2].rstrip(".") if len(parts) >= 3 else ""
+                        plz_candidate  = ort
+                        result["eigentümer_name"]    = name_candidate
+                        result["eigentümer_adresse"] = adr_candidate
+                        result["eigentümer_plz_ort"] = plz_candidate
+                        break
 
             for idx, line in enumerate(lines_vp):
                 # Stopp: nächster Hauptabschnitt
@@ -703,7 +714,39 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                 if not name_candidate:
                     # Erste brauchbare Zeile = Name
                     if len(line) > 3:
-                        name_candidate = line.rstrip(",.")
+                        # BUG: Nur Punkte/Sonderzeichen ohne Buchstaben → kein Name
+                        if not any(c.isalnum() for c in line):
+                            break
+                        # BUG D: Hilfskraft/Mitarbeiter des SV nie als Name
+                        # "- Frau Mag. Zuzana ..., Hilfskraft des Sachverständigen"
+                        # "Frau Dipl.-Ing. ..., Mitarbeiterin des SV"
+                        if re.search(
+                                r'(Hilfskraft|Mitarbeiter[in]*)\s+(des|der)\s+(S[Vv]|Sachverst)',
+                                line, re.IGNORECASE):
+                            break
+                        # BUG E: Kontextzeilen wie "(Sohn der verpflichteten Partei)" überspringen
+                        if re.match(r'^\(', line) or re.search(
+                                r'(Sohn|Tochter|Ehemann|Ehefrau|Partner)\s+(der|des)\s+verpflicht',
+                                line, re.IGNORECASE):
+                            break
+                        # BUG C: Geburtsdatum aus Name entfernen (mit ODER ohne Komma)
+                        # "Christine KLEMENT, geb.29.12.1975" → "Christine KLEMENT"
+                        # "Dino Ceranic geb. 26.12.1995"      → "Dino Ceranic"
+                        name_clean = re.sub(
+                            r',?\s*geb\.?\s*\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}', '',
+                            line, flags=re.IGNORECASE).strip().rstrip(",.")
+                        # Auch "geb. DD.MM.YYYY" ohne Komma davor entfernen
+                        name_clean = re.sub(
+                            r'\s+geb\.?\s+\d{1,2}[.\-]\d{1,2}[.\-]\d{2,4}', '',
+                            name_clean, flags=re.IGNORECASE).strip().rstrip(",.")
+                        # BUG I: Name enthält komplette Adresse (Komma + PLZ/Straße)
+                        # "AJ GmbH, Ragnitzstraße 91, 8047 Graz" → nur erster Teil
+                        if "," in name_clean:
+                            parts_n = [p.strip() for p in name_clean.split(",")]
+                            plz_t, _ = _ist_plz_ort(parts_n[-1])
+                            if plz_t or _ist_adresszeile(parts_n[-1]):
+                                name_clean = parts_n[0].strip()
+                        name_candidate = name_clean
                     continue
 
                 # Nach dem Namen: Adresse + PLZ/Ort suchen
@@ -719,6 +762,12 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                             plz_candidate = inline_ort
                             break
                 # Zeile könnte reine Straße sein (ohne PLZ)
+                # BUG F: Firmenbuchnummer nie als Adresse
+                if re.match(r'^Firmenbuch', line, re.IGNORECASE):
+                    break
+                # BUG G: Geburtsdatum nie als Adresse ("Geb. 24. 9. 1967")
+                if re.match(r'^[Gg]eb\.?\s*\d', line):
+                    break
                 if not adr_candidate and _ist_adresszeile(line):
                     adr_candidate = line.rstrip(".,")
                     continue
@@ -764,6 +813,11 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                     continue
                 if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|\d+\.)', line,
                             re.IGNORECASE):
+                    break
+                # BUG F+G auch im Fallback: Firmenbuch/Geburtsdatum nie als Adresse
+                if re.match(r'^Firmenbuch', line, re.IGNORECASE):
+                    break
+                if re.match(r'^[Gg]eb\.?\s*\d', line):
                     break
                 plz, ort = _ist_plz_ort(line)
                 if plz:
@@ -831,11 +885,45 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
         gl_seen_norm: set = set()
         gl_final: list[str] = []
         for gl in gl_kandidaten:
-            # BUG 6: Eigentümergemeinschaft / WEG ist kein Gläubiger im eigentlichen Sinne
-            # (EG der EZ …, WEG Reumannplatz …) – trotzdem eintragen, da manchmal relevant
-            # Nur "EG der EZ XXXX KG XXXXX" mit vollständiger Katastralangabe weglassen
+            # BUG A: führende ': ' entfernen (": Sparkasse Pöllau AG")
+            gl = gl.lstrip(": ").strip()
+            # BUG B: trailing ' |' und leere Segmente entfernen ("... AG |")
+            gl = gl.rstrip(" |").strip()
+            # Nach Bereinigung nochmal prüfen ob noch was übrig
+            if not gl or len(gl) < 3:
+                continue
+            # Leere Pipe-Segmente entfernen ("| | & Gerichtsvollzieher" → weg)
+            parts_gl = [p.strip() for p in gl.split("|")]
+            parts_gl = [p.lstrip(": ").strip() for p in parts_gl]
+            # BUG J: Gerichtsvollzieher, Rechtsanwalt o.ä. als alleinstehende Segmente filtern
+            parts_gl = [p for p in parts_gl if p and len(p) > 3
+                        and not re.match(
+                            r'^(&\s*)?(Gerichtsvollzieher|Rechtsanwalt|RA\s|im\s+Zuge)',
+                            p, re.IGNORECASE)]
+            gl = " | ".join(parts_gl).strip(" |")
+            if not gl or len(gl) < 3:
+                continue
+
+            # BUG 6: "EG der EZ XXXX KG XXXXX" mit vollständiger Katastralangabe weglassen
             if re.match(r'^EG\s+der\s+EZ\s+\d+\s+KG\s+\d+', gl, re.IGNORECASE):
                 continue
+            # Eigentümergemeinschaft mit EZ/GB-Nummer → kein Gläubiger
+            if re.match(r'^Eigent\u00fcmergemeinschaft\s+(EZ|der\s+EZ|\d)', gl, re.IGNORECASE):
+                continue
+            # WEG / EG als Gläubiger: nur wenn gefolgt von Hausverwaltungsname (Adresse)
+            # "WEG 1230 Wien, Dirmhirngasse 25" → WEG = Wohnungseigentümergemeinschaft → kein Gläubiger
+            # "EG Gentzgasse 144" → EG = Eigentümergemeinschaft → kein Gläubiger
+            # Ausnahme: falls ein echter Bankname erkennbar wäre (wird davor geprüft)
+            if re.match(r'^(WEG|EG)\b', gl, re.IGNORECASE):
+                continue
+            # BUG H: Personen mit Geburtsdatum (z.B. "Hermann Stöckl, 1920-03-29") filtern
+            if re.search(r'\b(19|18)\d{2}[-/]\d{2}[-/]\d{2}\b', gl):
+                continue
+            # BUG H: Hotels/Gastronomiebetriebe ohne Bank-Charakter filtern
+            if re.search(r'(Mountain Resort|Hotel|Gasthof|Pension|Wirtshaus|Betreiber\s+ROJ)',
+                         gl, re.IGNORECASE):
+                continue
+
             norm = _gl_normalize(gl)
             if norm not in gl_seen_norm:
                 gl_seen_norm.add(norm)
