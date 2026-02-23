@@ -606,72 +606,184 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
     # Vorkommen:
     #   Format A (eine Zeile):  "Verpflichtete Partei: Name GmbH"
     #   Format B (nächste Zeile): "Verpflichtete Partei\n \nIng. Alfred ... GmbH"
+    #
+    # Adress-Extraktion: direkt aus dem Verpflichtete-Partei-Block, NICHT durch
+    # spätere Namensuche – so wird die Wohnadresse des Eigentümers gefunden
+    # (inkl. Deutschland D-XXXXX oder andere 5-stellige PLZ).
+
+    # Hilfsfunktion: prüft ob eine Zeile eine Adresszeile ist
+    # (Straße + Nummer) oder eine PLZ/Ort-Zeile
+    def _ist_adresszeile(line: str) -> bool:
+        """True wenn die Zeile wie eine Straße/Hausnummer aussieht."""
+        return bool(re.search(
+            r'(straße|gasse|weg|platz|allee|ring|zeile|gürtel|promenade|str\.|'
+            r'strasse|gasse|graben|markt|anger|hof|aue|berg|dorf|'
+            r'\d+[a-z]?\s*[/,]\s*\d|\s\d+[a-z]?$)',
+            line, re.IGNORECASE))
+
+    def _ist_plz_ort(line: str) -> tuple:
+        """
+        Gibt (plz, ort) zurück wenn die Zeile eine PLZ/Ort-Kombination ist.
+        Unterstützt:
+          - AT:  '1234 Wien'  oder  '1234'
+          - DE:  'D-12345 Berlin'  oder  '12345 München'
+          - Kombination in einer Zeile: 'Musterstraße 5, 1234 Wien'
+        """
+        # Deutsches Präfix: D-XXXXX
+        m = re.search(r'\bD[-–]\s*(\d{5})\s+(.+)', line)
+        if m:
+            return m.group(1), f"D-{m.group(1)} {m.group(2).strip()}"
+        # 5-stellige PLZ (Deutschland/Liechtenstein etc.)
+        # Ortsname kann Bindestriche enthalten (z.B. Titisee-Neustadt, Baden-Baden)
+        m = re.search(r'\b(\d{5})\s+([A-ZÄÖÜ][\w\-\s]+)', line)
+        if m:
+            plz = m.group(1)
+            if not re.match(r'^(19|20)\d{3}$', plz):  # keine Jahreszahl
+                ort = m.group(2).strip().rstrip('.,')   # trailing Satzzeichen weg
+                return plz, f"{plz} {ort}"
+        # 4-stellige PLZ (Österreich/Schweiz)
+        m = re.search(r'\b(\d{4})\s+([A-ZÄÖÜ][\w\-\s]+)', line)
+        if m:
+            plz = m.group(1)
+            if not re.match(r'^(19|20)\d{2}$', plz):
+                ort = m.group(2).strip().rstrip('.,')   # trailing Satzzeichen weg
+                return plz, f"{plz} {ort}"
+        # Nur PLZ (4 oder 5 Stellen) ohne Ortsname
+        m = re.search(r'\b(\d{4,5})\b', line)
+        if m:
+            plz = m.group(1)
+            if not re.match(r'^(19|20)\d{2,3}$', plz):
+                return plz, plz
+        return "", ""
+
     if not result["eigentümer_name"]:
-        # Alle Vorkommen von "Verpflichtete Partei" finden und den Namen danach lesen
+        # Alle Vorkommen von "Verpflichtete Partei" finden
+        # Name + Adresse werden direkt aus diesem Block gelesen
         for vp_match in re.finditer(r'Verpflichtete\s+Partei', full_text, re.IGNORECASE):
-            block = full_text[vp_match.end():vp_match.end() + 300]
-            # Erste nicht-leere Zeile nach "Verpflichtete Partei" = Name
-            candidate = ""
-            for line in block.split("\n"):
-                # BUG 7: führende ':' und Leerzeichen entfernen
-                line_stripped = line.strip().lstrip(":").strip()
-                if not line_stripped:
-                    continue
-                # Stopp: nächster Abschnitt
-                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|Gericht|\d+\.)',
-                            line_stripped, re.IGNORECASE):
+            # Inline-Name direkt nach "Verpflichtete Partei: Name, Straße, PLZ Ort"
+            # z.B. "Verpflichtete Partei: Firma XY GmbH, Kirchgasse 3, 6900 Bregenz"
+            rest_of_line = full_text[vp_match.end():].split("\n")[0].strip().lstrip(":").strip()
+            block = full_text[vp_match.end():vp_match.end() + 500]
+            lines_vp = [l.strip().lstrip(":").strip() for l in block.split("\n")]
+            lines_vp = [l for l in lines_vp if l]  # Leerzeilen raus
+
+            name_candidate = ""
+            adr_candidate  = ""
+            plz_candidate  = ""
+
+            # Sonderfall: alles in einer Zeile "Name, Straße, PLZ Ort"
+            if rest_of_line and len(rest_of_line) > 3 and "," in rest_of_line:
+                parts = [p.strip() for p in rest_of_line.split(",")]
+                # Letzter Teil: PLZ Ort?
+                plz, ort = _ist_plz_ort(parts[-1])
+                if plz and len(parts) >= 2:
+                    name_candidate = parts[0].rstrip(".")
+                    adr_candidate  = parts[-2].rstrip(".") if len(parts) >= 3 else ""
+                    plz_candidate  = ort
+                    result["eigentümer_name"]    = name_candidate
+                    result["eigentümer_adresse"] = adr_candidate
+                    result["eigentümer_plz_ort"] = plz_candidate
                     break
-                # BUG 2: Anwalts-/Vertreter-Zeilen sind kein Eigentümername
+
+            for idx, line in enumerate(lines_vp):
+                # Stopp: nächster Hauptabschnitt
+                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|Gericht|Betreibende|\d+\.)',
+                            line, re.IGNORECASE):
+                    break
+                # Vertreter-Zeilen nie als Name nehmen
                 if re.match(r'^(vertreten|durch:|RA\s|Rechtsanwalt)',
-                            line_stripped, re.IGNORECASE):
+                            line, re.IGNORECASE):
                     break
-                candidate = line_stripped
-                break
-
-            if candidate and len(candidate) > 3:
-                result["eigentümer_name"] = candidate.rstrip(",.")
-                break
-
-    # Adresse direkt nach dem Namen suchen
-    # Sucht Straße + PLZ/Ort nach dem Eigentümernamen
-    if result["eigentümer_name"] and not result["eigentümer_adresse"]:
-        name_start = re.escape(result["eigentümer_name"][:40])
-        # Letztes Vorkommen des Namens nehmen (vollständigster Block)
-        all_matches = list(re.finditer(name_start, full_text, re.IGNORECASE))
-        match_pos = all_matches[-1] if all_matches else None
-        if match_pos:
-            search_block = full_text[match_pos.start():match_pos.start() + 400]
-            lines_adr = [l.strip() for l in search_block.split("\n") if l.strip()]
-            prev_line = ""
-            for line in lines_adr[1:]:  # erste Zeile = Name selbst, überspringen
-                # BUG 3: Dateiname-artige Zeilen überspringen (z.B. "GA 1230 Nuschingg. 12")
+                # Grundbuch-Anteil / Dateiname überspringen
                 if re.match(r'^GA\s+\d', line, re.IGNORECASE):
                     continue
-                # BUG 4: Grundbuch-Anteil-Zeilen überspringen (z.B. "48/1830 Anteil")
                 if re.match(r'^\d+/\d+\s+(Anteil|EZ|KG)', line, re.IGNORECASE):
                     continue
-                plz_m = re.search(r'\b(\d{4})\b', line)
-                if plz_m and len(line) > 3:
-                    plz = plz_m.group(1)
-                    # Keine Jahreszahl (1900–2099)
-                    if re.match(r'^(19|20)\d{2}$', plz):
-                        prev_line = line
-                        continue
-                    # Wenn vorherige Zeile eine Straße war → Straße + PLZ/Ort kombinieren
-                    if prev_line and re.search(
-                            r'(straße|gasse|weg|platz|allee|ring|zeile|gürtel|promenade'
-                            r'|taborstraße|haberlgasse)',
-                            prev_line, re.IGNORECASE):
+
+                if not name_candidate:
+                    # Erste brauchbare Zeile = Name
+                    if len(line) > 3:
+                        name_candidate = line.rstrip(",.")
+                    continue
+
+                # Nach dem Namen: Adresse + PLZ/Ort suchen
+                # Zeile könnte Straße + PLZ/Ort in einer Zeile sein
+                # z.B. "Kirchweg 3, 6900 Bregenz"
+                if not adr_candidate:
+                    inline_plz, inline_ort = _ist_plz_ort(line)
+                    if inline_plz and _ist_adresszeile(line):
+                        # Alles vor der PLZ = Straße
+                        sm = re.match(r'^(.+?),?\s+(?:D[-–]\s*)?\d{4,5}\s+', line)
+                        if sm:
+                            adr_candidate = sm.group(1).strip().rstrip(".,")
+                            plz_candidate = inline_ort
+                            break
+                # Zeile könnte reine Straße sein (ohne PLZ)
+                if not adr_candidate and _ist_adresszeile(line):
+                    adr_candidate = line.rstrip(".,")
+                    continue
+
+                # Zeile könnte PLZ/Ort sein
+                plz, ort = _ist_plz_ort(line)
+                if plz:
+                    plz_candidate = ort
+                    # Falls noch keine Straße: schauen ob PLZ+Ort in einer Zeile mit Straße
+                    if not adr_candidate:
+                        # Versuche Straße aus derselben Zeile zu lesen
+                        # z.B. "Musterstraße 5, 6900 Bregenz"
+                        street_m = re.match(
+                            r'^(.+?),?\s+(?:D[-–]\s*)?\d{4,5}\s+', line)
+                        if street_m and _ist_adresszeile(street_m.group(1)):
+                            adr_candidate = street_m.group(1).strip().rstrip(".,")
+                    break
+
+                # Stopp wenn nächster Abschnitt beginnt
+                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|\d+\.)', line,
+                            re.IGNORECASE):
+                    break
+
+            if name_candidate and len(name_candidate) > 3:
+                result["eigentümer_name"]    = name_candidate
+                result["eigentümer_adresse"] = adr_candidate
+                result["eigentümer_plz_ort"] = plz_candidate
+                break
+
+    # Falls Name bekannt aber Adresse fehlt noch → nochmal im gesamten Text suchen
+    # (Fallback für Fälle wo Adresse nicht direkt nach "Verpflichtete Partei" steht)
+    if result["eigentümer_name"] and not result["eigentümer_adresse"]:
+        name_start = re.escape(result["eigentümer_name"][:40])
+        all_matches = list(re.finditer(name_start, full_text, re.IGNORECASE))
+        for match_pos in reversed(all_matches):  # letztes Vorkommen zuerst
+            search_block = full_text[match_pos.start():match_pos.start() + 500]
+            lines_adr = [l.strip() for l in search_block.split("\n") if l.strip()]
+            prev_line = ""
+            for line in lines_adr[1:]:
+                if re.match(r'^GA\s+\d', line, re.IGNORECASE):
+                    continue
+                if re.match(r'^\d+/\d+\s+(Anteil|EZ|KG)', line, re.IGNORECASE):
+                    continue
+                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|\d+\.)', line,
+                            re.IGNORECASE):
+                    break
+                plz, ort = _ist_plz_ort(line)
+                if plz:
+                    if prev_line and _ist_adresszeile(prev_line):
                         result["eigentümer_adresse"] = prev_line.rstrip(".,")
-                        result["eigentümer_plz_ort"] = line.rstrip(".")
-                    else:
-                        result["eigentümer_adresse"] = line.rstrip(".")
-                        result["eigentümer_plz_ort"] = plz
+                    elif not prev_line or not _ist_adresszeile(prev_line):
+                        # PLZ+Ort vielleicht in derselben Zeile wie Straße
+                        street_m = re.match(
+                            r'^(.+?),?\s+(?:D[-–]\s*)?\d{4,5}\s+', line)
+                        if street_m and _ist_adresszeile(street_m.group(1)):
+                            result["eigentümer_adresse"] = \
+                                street_m.group(1).strip().rstrip(".,")
+                    result["eigentümer_plz_ort"] = ort
                     break
-                # Stopp: nächster Abschnitt
-                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|\d+\.)', line, re.IGNORECASE):
-                    break
-                prev_line = line
+                if _ist_adresszeile(line):
+                    prev_line = line
+                else:
+                    prev_line = line
+            if result["eigentümer_adresse"]:
+                break
 
     # Gläubiger / Betreibende Partei – ebenfalls im gesamten Text suchen
     if not result["gläubiger"]:
@@ -1529,7 +1641,58 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
         has_more     = resp.get("has_more", False)
         start_cursor = resp.get("next_cursor")
 
-    if not to_fix:
+    # Zweiter Pass: Einträge mit analysiert?=True aber OHNE Adresse → neu analysieren
+    # (verbesserter Parser kann jetzt auch ausländische Adressen erkennen)
+    to_reanalyze: list[str] = []
+    has_more     = True
+    start_cursor = None
+    while has_more:
+        kwargs2: dict = {"filter": {"value": "page", "property": "object"}, "page_size": 100}
+        if start_cursor:
+            kwargs2["start_cursor"] = start_cursor
+        try:
+            resp2 = notion.search(**kwargs2)
+        except Exception:
+            break
+        for page in resp2.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+            props = page.get("properties", {})
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in GESCHUETZT_PHASEN:
+                continue
+            # Nur Einträge die bereits als analysiert markiert sind
+            analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
+            if not analysiert:
+                continue
+            # Aber OHNE Zustelladresse
+            adr_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
+            adr_text = "".join(t.get("text", {}).get("content", "") for t in adr_rt).strip()
+            if not adr_text:
+                # Auch ohne Verpflichtende Partei → neu analysieren
+                vp_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+                vp_text = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
+                # Nur zurücksetzen wenn ein Link vorhanden (sonst kein PDF zum analysieren)
+                link_rt = props.get("Link", {}).get("url") or ""
+                if link_rt and page["id"] not in to_fix:
+                    to_reanalyze.append(page["id"])
+        has_more     = resp2.get("has_more", False)
+        start_cursor = resp2.get("next_cursor")
+
+    if to_reanalyze:
+        print(f"  [Bereinigung] 🔄 {len(to_reanalyze)} analysierte Einträge ohne Adresse → werden neu analysiert …")
+        for page_id in to_reanalyze:
+            try:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={"Gutachten analysiert?": {"checkbox": False}}
+                )
+            except Exception as exc:
+                print(f"  [Bereinigung] ⚠️  Fehler für {page_id[:8]}…: {exc}")
+            time.sleep(0.2)
+
+    if not to_fix and not to_reanalyze:
         print("  [Bereinigung] ✅ Keine falschen Einträge gefunden – alles in Ordnung")
         return 0
 
@@ -1550,8 +1713,8 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
             print(f"  [Bereinigung] ⚠️  Fehler für {page_id[:8]}…: {exc}")
         time.sleep(0.2)
 
-    print(f"[Bereinigung] ✅ {fixed} Einträge bereinigt – werden beim nächsten Run neu analysiert")
-    return fixed
+    print(f"[Bereinigung] ✅ {fixed} Gerichtsname-Einträge + {len(to_reanalyze)} adresslose Einträge zurückgesetzt")
+    return fixed + len(to_reanalyze)
 
 
 # =============================================================================
