@@ -15,6 +15,13 @@ import urllib.parse
 from datetime import datetime
 from notion_client import Client
 
+try:
+    import fitz          # PyMuPDF – optionale Abhängigkeit
+    FITZ_AVAILABLE = True
+except ImportError:
+    fitz = None
+    FITZ_AVAILABLE = False
+
 # =============================================================================
 # KONFIGURATION
 # =============================================================================
@@ -351,6 +358,339 @@ async def send_telegram(message: str) -> None:
 
 
 # =============================================================================
+# GUTACHTEN – PDF-DOWNLOAD & PARSING
+# =============================================================================
+
+def gutachten_fetch_attachment_links(edikt_url: str) -> dict:
+    """
+    Öffnet die Edikt-Detailseite und gibt alle Anhang-Links zurück.
+    Rückgabe: {"pdfs": [...], "images": [...]}
+    """
+    req = urllib.request.Request(
+        edikt_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", errors="replace")
+
+    pattern = re.compile(
+        r'href="(/edikte/ex/exedi3\.nsf/0/[^"]+\$file/([^"]+))"',
+        re.IGNORECASE
+    )
+    pdfs   = []
+    images = []
+    for path, raw_fname in pattern.findall(html):
+        fname = urllib.parse.unquote(raw_fname)
+        full  = f"{BASE_URL}{path}"
+        if fname.lower().endswith(".pdf"):
+            pdfs.append({"url": full, "filename": fname})
+        elif fname.lower().endswith((".jpg", ".jpeg", ".png")):
+            images.append({"url": full, "filename": fname})
+    return {"pdfs": pdfs, "images": images}
+
+
+def gutachten_pick_best_pdf(pdfs: list) -> dict | None:
+    """Wählt das wahrscheinlichste Gutachten-PDF aus der Liste."""
+    preferred = ["gutachten", " g ", "sachverst", "sv-", "/g-", "g "]
+    for pdf in pdfs:
+        if any(kw in pdf["filename"].lower() for kw in preferred):
+            return pdf
+    for pdf in pdfs:
+        if "anlagen" not in pdf["filename"].lower():
+            return pdf
+    return pdfs[0] if pdfs else None
+
+
+def gutachten_download_pdf(url: str) -> bytes:
+    """Lädt ein PDF herunter und gibt die Bytes zurück."""
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def _gb_extract_section(text: str, start_marker: str, end_marker: str) -> str:
+    """Extrahiert Text zwischen zwei Markierungen."""
+    start = text.lower().find(start_marker.lower())
+    if start == -1:
+        return ""
+    end = text.lower().find(end_marker.lower(), start + len(start_marker))
+    if end == -1:
+        return text[start:]
+    return text[start:end]
+
+
+def _gb_parse_owner(section_b: str) -> dict:
+    """Parst Namen und Adresse aus Section B des Grundbuchs."""
+    result = {
+        "eigentümer_name":    "",
+        "eigentümer_adresse": "",
+        "eigentümer_plz_ort": "",
+        "eigentümer_geb":     "",
+    }
+    adr_pattern  = re.compile(
+        r'GEB:\s*(\d{4}-\d{2}-\d{2})\s+ADR:\s*(.+?)\s{2,}(\d{4,5})\s*$',
+        re.IGNORECASE
+    )
+    adr_no_geb   = re.compile(r'ADR:\s*(.+?)\s{2,}(\d{4,5})\s*$', re.IGNORECASE)
+    adr_simple   = re.compile(r'ADR:\s*(.+)', re.IGNORECASE)
+
+    lines = section_b.splitlines()
+    for i, line in enumerate(lines):
+        if "ANTEIL:" not in line.upper():
+            continue
+        for j in range(i + 1, min(i + 8, len(lines))):
+            candidate = lines[j]
+            stripped  = candidate.strip()
+            if not stripped:
+                continue
+            if re.match(r'^\d', stripped):          continue
+            if re.match(r'^[a-z]\s+\d', stripped):  continue
+            if "GEB:" in stripped.upper():           continue
+            if "ADR:" in stripped.upper():           continue
+            if re.match(r'^\*+', stripped):          continue
+            result["eigentümer_name"] = stripped
+            for k in range(j + 1, min(j + 4, len(lines))):
+                adr_line = lines[k].strip()
+                if not adr_line:
+                    continue
+                m = adr_pattern.search(adr_line)
+                if m:
+                    result["eigentümer_geb"]     = m.group(1)
+                    result["eigentümer_adresse"] = m.group(2).strip().rstrip(",")
+                    result["eigentümer_plz_ort"] = m.group(3)
+                    break
+                m2 = adr_no_geb.search(adr_line)
+                if m2:
+                    result["eigentümer_adresse"] = m2.group(1).strip().rstrip(",")
+                    result["eigentümer_plz_ort"] = m2.group(2)
+                    break
+                m3 = adr_simple.search(adr_line)
+                if m3:
+                    adr_raw = m3.group(1).strip()
+                    plz_m = re.search(r'\s+(\d{4,5})\s*$', adr_raw)
+                    if plz_m:
+                        result["eigentümer_plz_ort"] = plz_m.group(1)
+                        result["eigentümer_adresse"] = adr_raw[:plz_m.start()].strip().rstrip(",")
+                    else:
+                        result["eigentümer_adresse"] = adr_raw
+                    break
+            break
+        break
+    return result
+
+
+def _gb_parse_creditors(section_c: str) -> tuple:
+    """Parst Pfandrechtsgläubiger und Forderungsbeträge aus Section C."""
+    gläubiger = []
+    betrag    = ""
+    lines = [l.strip() for l in section_c.splitlines() if l.strip()]
+    fuer_pattern   = re.compile(r'^für\s+(.+)', re.IGNORECASE)
+    betrag_pattern = re.compile(r'Hereinbringung von\s+(EUR\s+[\d\.,]+)', re.IGNORECASE)
+    pfand_pattern  = re.compile(r'PFANDRECHT\s+Höchstbetrag\s+(EUR\s+[\d\.,]+)', re.IGNORECASE)
+    seen = set()
+    for line in lines:
+        m = fuer_pattern.match(line)
+        if m:
+            name = m.group(1).strip().rstrip(".")
+            if len(name) > 5 and name not in seen:
+                gläubiger.append(name)
+                seen.add(name)
+        if not betrag:
+            mb = betrag_pattern.search(line)
+            if mb:
+                betrag = mb.group(1).strip()
+    if not betrag:
+        for line in lines:
+            mp = pfand_pattern.search(line)
+            if mp:
+                betrag = mp.group(1).strip()
+                break
+    return gläubiger, betrag
+
+
+def gutachten_extract_info(pdf_bytes: bytes) -> dict:
+    """
+    Extrahiert Eigentümer, Adresse, Gläubiger und Forderungsbetrag aus dem PDF.
+    Unterstützt Grundbuchauszug-Format (Kärnten-Stil) und professionelle
+    Gutachten mit 'Verpflichtete Partei:'-Angabe (Wien-Stil).
+    Gibt leeres Dict zurück wenn fitz nicht verfügbar ist.
+    """
+    if not FITZ_AVAILABLE:
+        return {}
+
+    doc      = fitz.open(stream=pdf_bytes, filetype="pdf")
+    all_text = [p.get_text() for p in doc if p.get_text().strip()]
+    full_text = "\n".join(all_text)
+
+    result = {
+        "eigentümer_name":    "",
+        "eigentümer_adresse": "",
+        "eigentümer_plz_ort": "",
+        "eigentümer_geb":     "",
+        "gläubiger":          [],
+        "forderung_betrag":   "",
+    }
+
+    # ── Format 1: Grundbuchauszug Sektionen B / C ────────────────────────────
+    sec_b = _gb_extract_section(full_text, "** B ***", "** C ***")
+    if not sec_b:
+        sec_b = _gb_extract_section(full_text, "** B **", "** C **")
+    if sec_b:
+        result.update(_gb_parse_owner(sec_b))
+
+    sec_c = _gb_extract_section(full_text, "** C ***", "** HINWEIS ***")
+    if not sec_c:
+        sec_c = _gb_extract_section(full_text, "** C **", "HINWEIS")
+    if sec_c:
+        gl, bt = _gb_parse_creditors(sec_c)
+        result["gläubiger"]        = gl
+        result["forderung_betrag"] = bt
+
+    # ── Format 2: Professionelles Gutachten (Verpflichtete Partei) ───────────
+    if not result["eigentümer_name"]:
+        vp = re.search(
+            r'Verpflichtete(?:\s+Partei)?:\s*(.+?)(?:\n|Betreibende|Auftraggeber)',
+            full_text[:3000], re.IGNORECASE | re.DOTALL
+        )
+        if vp:
+            result["eigentümer_name"] = vp.group(1).strip().split("\n")[0].strip()
+
+    if result["eigentümer_name"] and not result["eigentümer_adresse"]:
+        name_esc = re.escape(result["eigentümer_name"][:30])
+        adr_after = re.search(
+            name_esc + r'[^\n]*\n\s*([A-ZÄÖÜ][^\n]{5,60})\s*\n',
+            full_text[:3000], re.IGNORECASE
+        )
+        if adr_after:
+            adr_raw = adr_after.group(1).strip()
+            plz_m = re.search(r'\b(\d{4,5})\b', adr_raw)
+            if plz_m:
+                result["eigentümer_plz_ort"] = plz_m.group(1)
+                result["eigentümer_adresse"] = adr_raw
+
+    if not result["gläubiger"]:
+        bp = re.search(
+            r'Betreibende(?:\s+Partei)?:\s*(.+?)(?:\n|Verpflichtete)',
+            full_text[:3000], re.IGNORECASE | re.DOTALL
+        )
+        if bp:
+            g = bp.group(1).strip().split("\n")[0].strip()
+            if g:
+                result["gläubiger"] = [g]
+
+    return result
+
+
+def gutachten_enrich_notion_page(
+    notion: Client,
+    page_id: str,
+    edikt_url: str,
+) -> bool:
+    """
+    Hauptfunktion: Lädt das Gutachten-PDF von der Edikt-Seite,
+    extrahiert Eigentümer/Gläubiger und schreibt sie in die Notion-Seite.
+
+    Gibt True zurück wenn erfolgreich, False bei Fehler oder fehlendem PDF.
+    Das Flag 'Gutachten analysiert?' wird immer gesetzt (True/False).
+    """
+    if not FITZ_AVAILABLE:
+        print("    [Gutachten] ⚠️  PyMuPDF nicht verfügbar – überspringe PDF-Analyse")
+        return False
+
+    try:
+        attachments = gutachten_fetch_attachment_links(edikt_url)
+        pdfs = attachments["pdfs"]
+    except Exception as exc:
+        print(f"    [Gutachten] ⚠️  Fehler beim Laden der Edikt-Seite: {exc}")
+        notion.pages.update(
+            page_id=page_id,
+            properties={"Gutachten analysiert?": {"checkbox": False}}
+        )
+        return False
+
+    if not pdfs:
+        print("    [Gutachten] ℹ️  Kein PDF-Anhang gefunden")
+        notion.pages.update(
+            page_id=page_id,
+            properties={"Gutachten analysiert?": {"checkbox": False}}
+        )
+        return False
+
+    gutachten = gutachten_pick_best_pdf(pdfs)
+    print(f"    [Gutachten] 📄 {gutachten['filename']}")
+
+    try:
+        pdf_bytes = gutachten_download_pdf(gutachten["url"])
+    except Exception as exc:
+        print(f"    [Gutachten] ⚠️  Download-Fehler: {exc}")
+        notion.pages.update(
+            page_id=page_id,
+            properties={"Gutachten analysiert?": {"checkbox": False}}
+        )
+        return False
+
+    try:
+        info = gutachten_extract_info(pdf_bytes)
+    except Exception as exc:
+        print(f"    [Gutachten] ⚠️  Parse-Fehler: {exc}")
+        notion.pages.update(
+            page_id=page_id,
+            properties={"Gutachten analysiert?": {"checkbox": False}}
+        )
+        return False
+
+    # ── Notion-Properties aufbauen ───────────────────────────────────────────
+    has_owner = bool(info.get("eigentümer_name") or info.get("eigentümer_adresse"))
+    properties: dict = {
+        "Gutachten analysiert?": {"checkbox": True},
+    }
+
+    def _rt(text: str) -> dict:
+        return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
+
+    if info.get("eigentümer_name"):
+        print(f"    [Gutachten] 👤 Eigentümer: {info['eigentümer_name']}")
+        properties["Verpflichtende Partei"] = _rt(info["eigentümer_name"])
+
+    if info.get("eigentümer_adresse"):
+        print(f"    [Gutachten] 🏠 Adresse: {info['eigentümer_adresse']}")
+        properties["Zustell Adresse"] = _rt(info["eigentümer_adresse"])
+
+    if info.get("eigentümer_plz_ort"):
+        properties["Zustell PLZ/Ort"] = _rt(info["eigentümer_plz_ort"])
+
+    # Notizen: Gläubiger + Forderung + PDF-Link
+    notiz_parts = []
+    if info.get("gläubiger"):
+        print(f"    [Gutachten] 🏦 Gläubiger: {' | '.join(info['gläubiger'][:2])}")
+        notiz_parts.append("Gläubiger: " + " | ".join(info["gläubiger"]))
+    if info.get("forderung_betrag"):
+        notiz_parts.append("Forderung: " + info["forderung_betrag"])
+    notiz_parts.append(f"Gutachten-PDF: {gutachten['url']}")
+    properties["Notizen"] = _rt("\n".join(notiz_parts))
+
+    if not has_owner:
+        # Gescanntes Dokument – trotzdem als analysiert markieren
+        properties["Notizen"] = _rt(
+            f"Gutachten-PDF: {gutachten['url']}\n"
+            "(Kein Grundbuch-Text lesbar – möglicherweise gescanntes Dokument)"
+        )
+        print("    [Gutachten] ⚠️  Kein Eigentümer gefunden (gescanntes Dokument?)")
+
+    try:
+        notion.pages.update(page_id=page_id, properties=properties)
+        print("    [Gutachten] ✅ Notion aktualisiert")
+    except Exception as exc:
+        print(f"    [Gutachten] ⚠️  Notion-Update-Fehler: {exc}")
+        return False
+
+    return True
+
+
+# =============================================================================
 # NOTION
 # =============================================================================
 
@@ -528,8 +868,9 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
     # ── Seite anlegen – erst Kern, dann optionale Felder einzeln ─────────────
     # Strategie: Kern-Properties zuerst. Falls optionale Felder nicht existieren,
     # werden sie weggelassen und der Eintrag trotzdem angelegt.
+    created_page = None
     try:
-        notion.pages.create(parent={"database_id": db_id}, properties=properties)
+        created_page = notion.pages.create(parent={"database_id": db_id}, properties=properties)
         print(f"  [Notion] ✅ Erstellt: {titel[:80]}")
     except Exception as e:
         err_str = str(e)
@@ -545,14 +886,16 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
         if removed:
             print(f"  [Notion] ⚠️  Felder nicht gefunden, übersprungen: {removed}")
             try:
-                notion.pages.create(parent={"database_id": db_id}, properties=properties)
+                created_page = notion.pages.create(parent={"database_id": db_id}, properties=properties)
                 print(f"  [Notion] ✅ Erstellt (ohne {removed}): {titel[:80]}")
             except Exception as e2:
                 raise e2  # Wirklicher Fehler → nach oben weitergeben
         else:
             raise  # Kein bekanntes optionales Feld → nach oben weitergeben
 
-    return detail
+    # Gibt (detail, page_id) zurück damit der Aufrufer das Gutachten anreichern kann
+    new_page_id = created_page["id"] if created_page else None
+    return detail, new_page_id
 
 
 def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
@@ -743,6 +1086,90 @@ def _search_edikt_by_keyword(bl_value: str, keyword: str) -> list[dict]:
     return results
 
 
+def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
+    """
+    Findet alle Notion-Einträge die:
+      - eine URL (Link) haben, UND
+      - 'Gutachten analysiert?' = False / nicht gesetzt haben, UND
+      - NICHT in einer geschützten Workflow-Phase sind
+
+    Für jeden solchen Eintrag wird das Gutachten-PDF heruntergeladen
+    und die Properties (Eigentümer, Adresse, Gläubiger, Forderung) befüllt.
+
+    Das ist der Weg für manuell eingetragene Immobilien:
+    Sobald die URL gesetzt wird (entweder vom Nutzer oder durch URL-Anreicherung),
+    wird das Gutachten automatisch beim nächsten Lauf analysiert.
+
+    Gibt die Anzahl der erfolgreich angereicherten Einträge zurück.
+    """
+    GESCHUETZT_PHASEN = {
+        "📨 Angeschrieben", "🤝 Angebot",
+        "📋 Due Diligence", "✅ Gekauft", "❌ Abgelehnt",
+    }
+
+    print("\n[Gutachten-Anreicherung] 📄 Suche nach Einträgen ohne Gutachten-Analyse …")
+
+    to_enrich: list[dict] = []
+    has_more     = True
+    start_cursor = None
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Gutachten-Anreicherung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+
+            props = page.get("properties", {})
+
+            # Nur Einträge in nicht-geschützter Phase
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in GESCHUETZT_PHASEN:
+                continue
+
+            # Muss eine URL haben
+            link_val = props.get("Link", {}).get("url")
+            if not link_val:
+                continue
+
+            # Noch nicht analysiert
+            analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
+            if analysiert:
+                continue
+
+            to_enrich.append({"page_id": page["id"], "link": link_val})
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    print(f"  [Gutachten-Anreicherung] 📋 {len(to_enrich)} Einträge zur Analyse gefunden")
+
+    enriched = 0
+    for entry in to_enrich:
+        try:
+            ok = gutachten_enrich_notion_page(notion, entry["page_id"], entry["link"])
+            if ok:
+                enriched += 1
+        except Exception as exc:
+            print(f"  [Gutachten-Anreicherung] ❌ Fehler für {entry['page_id'][:8]}…: {exc}")
+        time.sleep(0.3)   # kurze Pause um API-Limits zu schonen
+
+    print(f"[Gutachten-Anreicherung] ✅ {enriched} Gutachten analysiert")
+    return enriched
+
+
 # =============================================================================
 # SCRAPING – direkte HTTP-Requests (kein Browser nötig!)
 # =============================================================================
@@ -864,14 +1291,23 @@ async def main() -> None:
                     if known_ids.get(eid) == "(geschuetzt)":
                         print(f"  [Notion] 🔒 Geschützt (bereits bearbeitet): {eid}")
                     elif eid not in known_ids:
-                        detail = notion_create_eintrag(notion, db_id, item)
-                        if detail is None:
+                        result_tuple = notion_create_eintrag(notion, db_id, item)
+                        if result_tuple is None:
                             # Kategorie-Filter hat das Objekt ausgeschlossen
                             known_ids[eid] = "(gefiltert)"
                         else:
+                            detail, new_page_id = result_tuple
                             item["_detail"] = detail
                             neue_eintraege.append(item)
                             known_ids[eid] = "(neu)"  # sofort als bekannt markieren
+                            # ── Gutachten sofort anreichern ──────────────────
+                            if new_page_id and item.get("link") and FITZ_AVAILABLE:
+                                try:
+                                    gutachten_enrich_notion_page(
+                                        notion, new_page_id, item["link"]
+                                    )
+                                except Exception as ge:
+                                    print(f"    [Gutachten] ⚠️  Anreicherung fehlgeschlagen: {ge}")
                     else:
                         print(f"  [Notion] ⏭  Bereits vorhanden: {eid}")
 
@@ -888,7 +1324,7 @@ async def main() -> None:
                 print(f"  [ERROR] {msg}")
                 fehler.append(msg)
 
-    # ── 2. URL-Anreicherung für manuell angelegte Einträge ────────────────────
+    # ── 3. URL-Anreicherung für manuell angelegte Einträge ────────────────────
     try:
         enriched_count = notion_enrich_urls(notion, db_id)
     except Exception as exc:
@@ -897,11 +1333,26 @@ async def main() -> None:
         fehler.append(msg)
         enriched_count = 0
 
-    # ── 3. Zusammenfassung ────────────────────────────────────────────────────
+    # ── 4. Gutachten-Anreicherung für manuell angelegte Einträge ─────────────
+    # Betrifft: Einträge die bereits eine URL haben aber noch nicht analysiert wurden.
+    # Das sind Immobilien die ihr selbst eingetragen habt (mit oder ohne Hash-ID).
+    gutachten_enriched = 0
+    if FITZ_AVAILABLE:
+        try:
+            gutachten_enriched = notion_enrich_gutachten(notion, db_id)
+        except Exception as exc:
+            msg = f"Gutachten-Anreicherung fehlgeschlagen: {exc}"
+            print(f"  [ERROR] {msg}")
+            fehler.append(msg)
+    else:
+        print("[Gutachten] ℹ️  PyMuPDF nicht verfügbar – überspringe Gutachten-Anreicherung")
+
+    # ── 5. Zusammenfassung ────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print(f"✅ Neue Einträge:       {len(neue_eintraege)}")
     print(f"🔴 Entfall-Updates:     {len(entfall_updates)}")
     print(f"🔗 URLs ergänzt:        {enriched_count}")
+    print(f"📄 Gutachten analysiert:{gutachten_enriched}")
     print(f"⚠️  Fehler:              {len(fehler)}")
     print("=" * 60)
 
@@ -939,6 +1390,10 @@ async def main() -> None:
 
     if enriched_count:
         lines.append(f"<b>🔗 URLs nachgetragen: {enriched_count}</b>")
+        lines.append("")
+
+    if gutachten_enriched:
+        lines.append(f"<b>📄 Gutachten analysiert: {gutachten_enriched}</b>")
         lines.append("")
 
     if fehler:
