@@ -589,37 +589,109 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
         result["gläubiger"]        = gl
         result["forderung_betrag"] = bt
 
-    # ── Format 2: Professionelles Gutachten (Verpflichtete Partei) ───────────
+    # ── Format 2: Professionelles Gutachten (Verpflichtete Partei) ──────────
+    # Suche im GESAMTEN Text – "Verpflichtete Partei" kann auf Seite 1, 5 oder
+    # später stehen (nach Deckblatt/Inhaltsverzeichnis des Sachverständigen).
+    #
+    # Vorkommen:
+    #   Format A (eine Zeile):  "Verpflichtete Partei: Name GmbH"
+    #   Format B (nächste Zeile): "Verpflichtete Partei\n \nIng. Alfred ... GmbH"
     if not result["eigentümer_name"]:
-        vp = re.search(
-            r'Verpflichtete(?:\s+Partei)?:\s*(.+?)(?:\n|Betreibende|Auftraggeber)',
-            full_text[:3000], re.IGNORECASE | re.DOTALL
-        )
-        if vp:
-            result["eigentümer_name"] = vp.group(1).strip().split("\n")[0].strip()
+        # Alle Vorkommen von "Verpflichtete Partei" finden und den Namen danach lesen
+        for vp_match in re.finditer(r'Verpflichtete\s+Partei', full_text, re.IGNORECASE):
+            block = full_text[vp_match.end():vp_match.end() + 300]
+            # Erste nicht-leere Zeile nach "Verpflichtete Partei" = Name
+            candidate = ""
+            for line in block.split("\n"):
+                line_stripped = line.strip()
+                if not line_stripped:
+                    continue
+                # Stopp: nächster Abschnitt
+                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|Gericht|\d+\.)',
+                            line_stripped, re.IGNORECASE):
+                    break
+                # Stopp: nur Doppelpunkt oder Leerzeile-Ersatz
+                if line_stripped in (":", ""):
+                    continue
+                candidate = line_stripped
+                break
 
+            if candidate and len(candidate) > 3:
+                result["eigentümer_name"] = candidate.rstrip(",.")
+                break
+
+    # Adresse direkt nach dem Namen suchen
+    # Sucht Straße + PLZ/Ort nach dem Eigentümernamen
     if result["eigentümer_name"] and not result["eigentümer_adresse"]:
-        name_esc = re.escape(result["eigentümer_name"][:30])
-        adr_after = re.search(
-            name_esc + r'[^\n]*\n\s*([A-ZÄÖÜ][^\n]{5,60})\s*\n',
-            full_text[:3000], re.IGNORECASE
-        )
-        if adr_after:
-            adr_raw = adr_after.group(1).strip()
-            plz_m = re.search(r'\b(\d{4,5})\b', adr_raw)
-            if plz_m:
-                result["eigentümer_plz_ort"] = plz_m.group(1)
-                result["eigentümer_adresse"] = adr_raw
+        name_start = re.escape(result["eigentümer_name"][:40])
+        # Letztes Vorkommen des Namens nehmen (vollständigster Block)
+        all_matches = list(re.finditer(name_start, full_text, re.IGNORECASE))
+        match_pos = all_matches[-1] if all_matches else None
+        if match_pos:
+            search_block = full_text[match_pos.start():match_pos.start() + 400]
+            lines_adr = [l.strip() for l in search_block.split("\n") if l.strip()]
+            prev_line = ""
+            for line in lines_adr[1:]:  # erste Zeile = Name selbst, überspringen
+                plz_m = re.search(r'\b(\d{4})\b', line)
+                if plz_m and len(line) > 3:
+                    plz = plz_m.group(1)
+                    # Keine Jahreszahl (1900–2099)
+                    if re.match(r'^(19|20)\d{2}$', plz):
+                        prev_line = line
+                        continue
+                    # Wenn vorherige Zeile eine Straße war → Straße + PLZ/Ort kombinieren
+                    if prev_line and re.search(
+                            r'(straße|gasse|weg|platz|allee|ring|zeile|gürtel|promenade'
+                            r'|taborstraße|haberlgasse)',
+                            prev_line, re.IGNORECASE):
+                        result["eigentümer_adresse"] = prev_line.rstrip(".,")
+                        result["eigentümer_plz_ort"] = line.rstrip(".")
+                    else:
+                        result["eigentümer_adresse"] = line.rstrip(".")
+                        result["eigentümer_plz_ort"] = plz
+                    break
+                # Stopp: nächster Abschnitt
+                if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|\d+\.)', line, re.IGNORECASE):
+                    break
+                prev_line = line
 
+    # Gläubiger / Betreibende Partei – ebenfalls im gesamten Text suchen
     if not result["gläubiger"]:
-        bp = re.search(
-            r'Betreibende(?:\s+Partei)?:\s*(.+?)(?:\n|Verpflichtete)',
-            full_text[:3000], re.IGNORECASE | re.DOTALL
-        )
-        if bp:
-            g = bp.group(1).strip().split("\n")[0].strip()
-            if g:
-                result["gläubiger"] = [g]
+        for bp_match in re.finditer(r'Betreibende\s+Partei', full_text, re.IGNORECASE):
+            block = full_text[bp_match.end():bp_match.end() + 400]
+            lines_block = [l.strip() for l in block.split("\n")]
+            candidate = ""
+            i = 0
+            while i < len(lines_block):
+                line_stripped = lines_block[i]
+                if not line_stripped:
+                    i += 1
+                    continue
+                # "vertreten durch:" → echter Name kommt DANACH (überspringen)
+                if re.match(r'^vertreten\s+durch|^durch:', line_stripped, re.IGNORECASE):
+                    # nächste nicht-leere Zeile ist der echte Gläubiger
+                    for j in range(i + 1, min(i + 4, len(lines_block))):
+                        next_line = lines_block[j].strip()
+                        if next_line and not re.match(
+                                r'^(gegen|Verpflichtete|wegen|Aktenzahl|\d+\.)',
+                                next_line, re.IGNORECASE):
+                            candidate = next_line
+                            break
+                    break
+                # Nächster Abschnitt → stoppen
+                if re.match(r'^(gegen\s+die|Verpflichtete|wegen|Aktenzahl)',
+                            line_stripped, re.IGNORECASE):
+                    break
+                if line_stripped in (":", ""):
+                    i += 1
+                    continue
+                candidate = line_stripped
+                break
+                i += 1
+
+            if candidate and len(candidate) > 3:
+                result["gläubiger"] = [candidate.rstrip(",.")]
+                break
 
     return result
 
