@@ -1,0 +1,21 @@
+name: Gutachten Enricher
+
+on:
+  workflow_dispatch:
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    name: Gutachten herunterladen & auswerten
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Abhängigkeiten installieren
+        run: pip install notion-client pymupdf
+      - name: Gutachten-Enricher ausführen
+        env:
+          NOTION_TOKEN:       ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: python enricher.py
