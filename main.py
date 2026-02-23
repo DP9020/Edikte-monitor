@@ -909,13 +909,14 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             phase = phase_sel.get("name", "")
 
             # Status-Feld prüfen:
+            # 🔴 Rot              → IMMER echte page_id speichern (Entfall archiviert immer)
+            #                       Rot hat Vorrang vor jeder Phase
             # 🟢 Grün / 🟡 Gelb  → komplett geschützt (kein Überschreiben, kein Auto-Archiv)
-            # 🔴 Rot              → vor Neuanlage geschützt, ABER Entfall darf archivieren
-            #                       (deshalb echte page_id speichern, nicht Sentinel)
             status_sel = props.get("Status", {}).get("select") or {}
             status = status_sel.get("name", "")
             ist_rot        = (status == "🔴 Rot")
-            ist_geschuetzt = phase in GESCHUETZT_PHASEN or status in ("🟢 Grün", "🟡 Gelb")
+            # Rot hat Vorrang: auch wenn Phase geschützt wäre, zählt Rot
+            ist_geschuetzt = (not ist_rot) and (phase in GESCHUETZT_PHASEN or status in ("🟢 Grün", "🟡 Gelb"))
 
             # Hash-ID auslesen
             hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
@@ -943,9 +944,11 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
                 title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
                 title = title_rt[0].get("plain_text", "").strip().lower() if title_rt else ""
                 if title:
-                    # Grün/Gelb/Phase → Sentinel; Rot → echte ID damit Entfall greift
+                    # Grün/Gelb/Phase → Sentinel; Rot → echte ID damit Entfall immer greift
                     known[f"__titel__{title}"] = "(geschuetzt)" if ist_geschuetzt else page["id"]
                     geschuetzt_count += 1
+                    # (Rot: echte ID gespeichert → Duplikat-Schutz trotzdem aktiv,
+                    #  da 'elif eid not in known_ids' bei bekannter UUID nicht greift)
 
             page_count += 1
 
@@ -1084,16 +1087,18 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
     🟢 Grün / 🟡 Gelb  → Entfall nur vermerken, NICHT archivieren
                           (Immobilie ist relevant / gekauft / in Bearbeitung)
 
-    🔴 Rot              → Archivieren (bereits als nicht relevant markiert)
+    🔴 Rot              → IMMER archivieren, egal welche Phase
+                          (Rot = manuell abgelehnt/abgebrochen, auch in späteren Phasen)
 
     Bereits archiviert  → Nur Art des Edikts aktualisieren (bleibt im Archiv)
 
     Fortgeschrittene    → Nur Entfall vermerken, Phase bleibt erhalten
-    Workflow-Phase
+    Workflow-Phase      (gilt nur wenn Status NICHT Rot ist)
 
     Unbearbeitet        → Normal archivieren
     """
     # Phasen die NICHT auto-archiviert werden (manuell in Bearbeitung)
+    # Gilt NUR wenn Status != 🔴 Rot
     SCHUTZ_PHASEN = {
         "🔎 In Prüfung",
         "✅ Relevant – Brief vorbereiten",
@@ -1125,7 +1130,24 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
         print(f"  [Notion] 🗄  Entfall im Archiv vermerkt: {eid}")
         return
 
-    # Fall 2: Status Grün oder Gelb → relevant/in Bearbeitung → NUR vermerken
+    # Fall 2: Status Rot → IMMER archivieren (egal welche Phase)
+    # Rot = manuell abgelehnt/abgebrochen; Phase bleibt erhalten damit
+    # man später sehen kann in welcher Phase der Abbruch erfolgte.
+    if status == "🔴 Rot":
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
+                "Archiviert":     {"checkbox": True},
+                # Workflow-Phase NICHT überschreiben → bleibt erhalten,
+                # damit sichtbar ist in welcher Phase der Abbruch erfolgte
+                "Neu eingelangt": {"checkbox": False},
+            },
+        )
+        print(f"  [Notion] 🔴 Entfall archiviert (Status Rot, Phase '{phase}' bleibt erhalten): {eid}")
+        return
+
+    # Fall 3: Status Grün oder Gelb → relevant/aktiv in Bearbeitung → NUR vermerken
     if status in ("🟢 Grün", "🟡 Gelb"):
         notion.pages.update(
             page_id=page_id,
@@ -1135,20 +1157,6 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
             },
         )
         print(f"  [Notion] 🔒 Entfall vermerkt (Status {status} – kein Auto-Archiv): {eid}")
-        return
-
-    # Fall 3: Status Rot → bereits abgelehnt → archivieren
-    if status == "🔴 Rot":
-        notion.pages.update(
-            page_id=page_id,
-            properties={
-                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
-                "Archiviert":     {"checkbox": True},
-                "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
-                "Neu eingelangt": {"checkbox": False},
-            },
-        )
-        print(f"  [Notion] 🔴 Entfall archiviert (Status Rot): {eid}")
         return
 
     # Fall 4: Fortgeschrittene Phase ohne Status → nur vermerken
