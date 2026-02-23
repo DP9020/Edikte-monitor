@@ -907,7 +907,13 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             # Workflow-Phase prüfen
             phase_sel = props.get("Workflow-Phase", {}).get("select") or {}
             phase = phase_sel.get("name", "")
-            ist_geschuetzt = phase in GESCHUETZT_PHASEN
+
+            # Status-Feld prüfen (🟢/🟡/🔴 = manuell bewertet → immer geschützt)
+            status_sel = props.get("Status", {}).get("select") or {}
+            status = status_sel.get("name", "")
+            hat_manuellen_status = status in ("🟢 Grün", "🟡 Gelb", "🔴 Rot")
+
+            ist_geschuetzt = phase in GESCHUETZT_PHASEN or hat_manuellen_status
 
             # Hash-ID auslesen
             hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
@@ -1061,7 +1067,62 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
 
 
 def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
-    """Markiert ein bestehendes Notion-Objekt als 'Termin entfallen'."""
+    """
+    Markiert ein bestehendes Notion-Objekt als 'Termin entfallen'.
+
+    Schutzlogik: Einträge mit manuellem Status (🟢/🟡/🔴) oder einer
+    fortgeschrittenen Workflow-Phase werden NICHT archiviert – der Termin-
+    entfall wird nur als 'Art des Edikts' vermerkt, alles andere bleibt.
+    """
+    # Geschützte Phasen (kein Auto-Archivieren)
+    GESCHUETZT_PHASEN = {
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "📊 Gutachten analysiert",
+        "🗄 Archiviert",
+    }
+
+    # Aktuellen Zustand der Seite lesen
+    try:
+        page = notion.pages.retrieve(page_id=page_id)
+        props = page.get("properties", {})
+        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        status = (props.get("Status", {}).get("select") or {}).get("name", "")
+        archiviert = props.get("Archiviert", {}).get("checkbox", False)
+    except Exception as exc:
+        print(f"  [Notion] ⚠️  Entfall: Seite konnte nicht gelesen werden: {exc}")
+        return
+
+    eid = item.get('edikt_id', '?')
+
+    # Schutzcheck 1: Manueller Status gesetzt (Gelb/Grün/Rot)
+    if status in ("🟡 Gelb", "🟢 Grün", "🔴 Rot"):
+        # Nur Art des Edikts vermerken – NICHT archivieren
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
+                "Neu eingelangt": {"checkbox": False},
+            },
+        )
+        print(f"  [Notion] 🔒 Entfall vermerkt (Status {status} – kein Auto-Archiv): {eid}")
+        return
+
+    # Schutzcheck 2: Fortgeschrittene Workflow-Phase
+    if phase in GESCHUETZT_PHASEN and not archiviert:
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
+                "Neu eingelangt": {"checkbox": False},
+            },
+        )
+        print(f"  [Notion] 🔒 Entfall vermerkt (Phase '{phase}' – kein Auto-Archiv): {eid}")
+        return
+
+    # Normaler Fall: noch nicht manuell bearbeitet → archivieren
     notion.pages.update(
         page_id=page_id,
         properties={
@@ -1071,7 +1132,7 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
             "Neu eingelangt": {"checkbox": False},
         },
     )
-    print(f"  [Notion] 🔴 Entfall markiert: {item.get('edikt_id', '?')}")
+    print(f"  [Notion] 🔴 Entfall archiviert: {eid}")
 
 
 def notion_enrich_urls(notion: Client, db_id: str) -> int:
