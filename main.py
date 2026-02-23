@@ -1587,9 +1587,11 @@ async def main() -> None:
 
                 elif item["type"] in ("Entfall des Termins", "Verschiebung"):
                     page_id = known_ids.get(eid)
-                    if page_id and page_id != "(neu)":
+                    if page_id and page_id not in ("(neu)", "(geschuetzt)", "(gefiltert)"):
                         notion_mark_entfall(notion, page_id, item)
                         entfall_updates.append(item)
+                    elif page_id == "(geschuetzt)":
+                        print(f"  [Notion] 🔒 Entfall übersprungen (geschützte Phase): {eid}")
                     else:
                         print(f"  [Notion] ℹ️  Entfall ohne DB-Eintrag: {eid}")
 
