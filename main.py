@@ -422,64 +422,104 @@ def _gb_extract_section(text: str, start_marker: str, end_marker: str) -> str:
     return text[start:end]
 
 
-def _gb_parse_owner(section_b: str) -> dict:
-    """Parst Namen und Adresse aus Section B des Grundbuchs."""
-    result = {
-        "eigentümer_name":    "",
-        "eigentümer_adresse": "",
-        "eigentümer_plz_ort": "",
-        "eigentümer_geb":     "",
-    }
-    adr_pattern  = re.compile(
+def _gb_parse_single_owner(lines: list, anteil_idx: int) -> dict:
+    """
+    Hilfsfunktion: Parst einen einzelnen Eigentümer ab einer ANTEIL:-Zeile.
+    Gibt dict mit name, adresse, plz_ort, geb zurück.
+    """
+    adr_pattern = re.compile(
         r'GEB:\s*(\d{4}-\d{2}-\d{2})\s+ADR:\s*(.+?)\s{2,}(\d{4,5})\s*$',
         re.IGNORECASE
     )
-    adr_no_geb   = re.compile(r'ADR:\s*(.+?)\s{2,}(\d{4,5})\s*$', re.IGNORECASE)
-    adr_simple   = re.compile(r'ADR:\s*(.+)', re.IGNORECASE)
+    adr_no_geb  = re.compile(r'ADR:\s*(.+?)\s{2,}(\d{4,5})\s*$', re.IGNORECASE)
+    adr_simple  = re.compile(r'ADR:\s*(.+)', re.IGNORECASE)
 
-    lines = section_b.splitlines()
+    owner = {"name": "", "adresse": "", "plz_ort": "", "geb": ""}
+
+    for j in range(anteil_idx + 1, min(anteil_idx + 8, len(lines))):
+        stripped = lines[j].strip()
+        if not stripped:
+            continue
+        if re.match(r'^\d', stripped):         continue  # nächste ANTEIL-Zeile
+        if re.match(r'^[a-z]\s+\d', stripped): continue  # "a 7321/2006 ..."
+        if "GEB:" in stripped.upper():         continue
+        if "ADR:" in stripped.upper():         continue
+        if re.match(r'^\*+', stripped):        continue  # Trennlinie
+
+        owner["name"] = stripped
+
+        # ADR-Zeile suchen (nächste Zeilen nach dem Namen)
+        for k in range(j + 1, min(j + 4, len(lines))):
+            adr_line = lines[k].strip()
+            if not adr_line:
+                continue
+            m = adr_pattern.search(adr_line)
+            if m:
+                owner["geb"]     = m.group(1)
+                owner["adresse"] = m.group(2).strip().rstrip(",")
+                owner["plz_ort"] = m.group(3)
+                break
+            m2 = adr_no_geb.search(adr_line)
+            if m2:
+                owner["adresse"] = m2.group(1).strip().rstrip(",")
+                owner["plz_ort"] = m2.group(2)
+                break
+            m3 = adr_simple.search(adr_line)
+            if m3:
+                adr_raw = m3.group(1).strip()
+                plz_m   = re.search(r'\s+(\d{4,5})\s*$', adr_raw)
+                if plz_m:
+                    owner["plz_ort"] = plz_m.group(1)
+                    owner["adresse"] = adr_raw[:plz_m.start()].strip().rstrip(",")
+                else:
+                    owner["adresse"] = adr_raw
+                break
+        break  # Name gefunden – fertig mit diesem Eigentümer
+
+    return owner
+
+
+def _gb_parse_owner(section_b: str) -> dict:
+    """
+    Parst ALLE Eigentümer aus Section B des Grundbuchs (Miteigentum möglich).
+
+    Bei Miteigentum werden alle Namen mit ' | ' getrennt eingetragen.
+    Adresse und PLZ/Ort kommen vom ersten Eigentümer (Haupteigentümer).
+
+    Rückgabe:
+      eigentümer_name    – alle Namen, z.B. "Hans Muster | Maria Muster"
+      eigentümer_adresse – Adresse des ersten Eigentümers
+      eigentümer_plz_ort – PLZ/Ort des ersten Eigentümers
+      eigentümer_geb     – Geburtsdatum des ersten Eigentümers
+    """
+    lines   = section_b.splitlines()
+    owners  = []
+
     for i, line in enumerate(lines):
         if "ANTEIL:" not in line.upper():
             continue
-        for j in range(i + 1, min(i + 8, len(lines))):
-            candidate = lines[j]
-            stripped  = candidate.strip()
-            if not stripped:
-                continue
-            if re.match(r'^\d', stripped):          continue
-            if re.match(r'^[a-z]\s+\d', stripped):  continue
-            if "GEB:" in stripped.upper():           continue
-            if "ADR:" in stripped.upper():           continue
-            if re.match(r'^\*+', stripped):          continue
-            result["eigentümer_name"] = stripped
-            for k in range(j + 1, min(j + 4, len(lines))):
-                adr_line = lines[k].strip()
-                if not adr_line:
-                    continue
-                m = adr_pattern.search(adr_line)
-                if m:
-                    result["eigentümer_geb"]     = m.group(1)
-                    result["eigentümer_adresse"] = m.group(2).strip().rstrip(",")
-                    result["eigentümer_plz_ort"] = m.group(3)
-                    break
-                m2 = adr_no_geb.search(adr_line)
-                if m2:
-                    result["eigentümer_adresse"] = m2.group(1).strip().rstrip(",")
-                    result["eigentümer_plz_ort"] = m2.group(2)
-                    break
-                m3 = adr_simple.search(adr_line)
-                if m3:
-                    adr_raw = m3.group(1).strip()
-                    plz_m = re.search(r'\s+(\d{4,5})\s*$', adr_raw)
-                    if plz_m:
-                        result["eigentümer_plz_ort"] = plz_m.group(1)
-                        result["eigentümer_adresse"] = adr_raw[:plz_m.start()].strip().rstrip(",")
-                    else:
-                        result["eigentümer_adresse"] = adr_raw
-                    break
-            break
-        break
-    return result
+        owner = _gb_parse_single_owner(lines, i)
+        if owner["name"]:
+            owners.append(owner)
+
+    if not owners:
+        return {
+            "eigentümer_name":    "",
+            "eigentümer_adresse": "",
+            "eigentümer_plz_ort": "",
+            "eigentümer_geb":     "",
+        }
+
+    # Alle Namen zusammenführen, Adresse vom ersten Eigentümer
+    alle_namen = " | ".join(o["name"] for o in owners)
+    erster     = owners[0]
+
+    return {
+        "eigentümer_name":    alle_namen,
+        "eigentümer_adresse": erster["adresse"],
+        "eigentümer_plz_ort": erster["plz_ort"],
+        "eigentümer_geb":     erster["geb"],
+    }
 
 
 def _gb_parse_creditors(section_c: str) -> tuple:
