@@ -959,11 +959,10 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
     if termin_iso:
         properties["Versteigerungstermin"] = {"date": {"start": termin_iso}}
 
-    gericht = detail.get("gericht", "")
-    if gericht:
-        properties["Verpflichtende Partei"] = {
-            "rich_text": [{"text": {"content": gericht[:200]}}]
-        }
+    # HINWEIS: "Verpflichtende Partei" wird NICHT hier befüllt –
+    # der Gerichtsname (gericht) ist NICHT der Eigentümer.
+    # Dieses Feld wird ausschließlich durch gutachten_enrich_notion_page
+    # aus dem Gutachten-PDF extrahiert und eingetragen.
 
     plz_ort = detail.get("plz_ort", "")
     if plz_ort:
@@ -1291,6 +1290,101 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
     return enriched
 
 
+def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
+    """
+    Einmalige Bereinigung: Findet Einträge deren 'Verpflichtende Partei'
+    einen Gerichtsnamen enthält (z.B. "BG Schwaz (870)", "BG Innere Stadt Wien (001)").
+
+    Diese Einträge wurden irrtümlich mit dem Gericht statt dem Eigentümer befüllt.
+
+    Aktion:
+      - 'Verpflichtende Partei' → leer
+      - 'Gutachten analysiert?'  → False  (damit der nächste Run sie neu verarbeitet)
+
+    Gibt die Anzahl der bereinigten Einträge zurück.
+    """
+    GESCHUETZT_PHASEN = {
+        "📨 Angeschrieben", "🤝 Angebot",
+        "📋 Due Diligence", "✅ Gekauft", "❌ Abgelehnt",
+    }
+
+    # Gerichts-Muster: "BG Irgendwas (123)" oder "BG Irgendwas"
+    GERICHT_RE = re.compile(
+        r'^(BG |Bezirksgericht |LG |Landesgericht |HG |Handelsgericht )',
+        re.IGNORECASE
+    )
+
+    print("\n[Bereinigung] 🔧 Suche nach Einträgen mit falschem Gericht in 'Verpflichtende Partei' …")
+
+    to_fix: list[str] = []
+    has_more     = True
+    start_cursor = None
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Bereinigung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+
+            props = page.get("properties", {})
+
+            # Geschützte Phasen auslassen
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in GESCHUETZT_PHASEN:
+                continue
+
+            # 'Verpflichtende Partei' lesen
+            vp_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+            vp_text = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
+
+            if not vp_text:
+                continue
+
+            # Enthält der Wert einen Gerichtsnamen?
+            if GERICHT_RE.match(vp_text):
+                to_fix.append(page["id"])
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    if not to_fix:
+        print("  [Bereinigung] ✅ Keine falschen Einträge gefunden – alles in Ordnung")
+        return 0
+
+    print(f"  [Bereinigung] 🔧 {len(to_fix)} Einträge mit Gerichtsname gefunden – werden bereinigt …")
+
+    fixed = 0
+    for page_id in to_fix:
+        try:
+            notion.pages.update(
+                page_id=page_id,
+                properties={
+                    "Verpflichtende Partei": {"rich_text": []},
+                    "Gutachten analysiert?": {"checkbox": False},
+                }
+            )
+            fixed += 1
+        except Exception as exc:
+            print(f"  [Bereinigung] ⚠️  Fehler für {page_id[:8]}…: {exc}")
+        time.sleep(0.2)
+
+    print(f"[Bereinigung] ✅ {fixed} Einträge bereinigt – werden beim nächsten Run neu analysiert")
+    return fixed
+
+
 # =============================================================================
 # SCRAPING – direkte HTTP-Requests (kein Browser nötig!)
 # =============================================================================
@@ -1453,6 +1547,16 @@ async def main() -> None:
         print(f"  [ERROR] {msg}")
         fehler.append(msg)
         enriched_count = 0
+
+    # ── 3b. Einmalige Bereinigung: falsche Gerichtsnamen in 'Verpflichtende Partei' ──
+    # Frühere Script-Versionen haben irrtümlich den Gerichtsnamen (z.B. "BG Schwaz (870)")
+    # in das Feld 'Verpflichtende Partei' geschrieben. Diese Einträge werden hier
+    # erkannt, das Feld geleert und 'Gutachten analysiert?' zurückgesetzt,
+    # damit der nächste Schritt (4) sie neu verarbeitet.
+    try:
+        notion_reset_falsche_verpflichtende(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Bereinigung fehlgeschlagen (nicht kritisch): {exc}")
 
     # ── 4. Gutachten-Anreicherung für manuell angelegte Einträge ─────────────
     # Betrifft: Einträge die bereits eine URL haben aber noch nicht analysiert wurden.
