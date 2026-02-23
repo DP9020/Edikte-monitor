@@ -36,7 +36,8 @@ BUNDESLAENDER = {
 # Nur diese Link-Texte werden verarbeitet
 RELEVANT_TYPES = ("Versteigerung", "Entfall des Termins", "Verschiebung")
 
-# Schlüsselwörter → Objekt wird NICHT importiert
+# Schlüsselwörter im Link-Text → Objekt wird NICHT importiert
+# (greift auf Ergebnisseite, wo der Text oft nur "Versteigerung (Datum)" ist)
 EXCLUDE_KEYWORDS = [
     "landwirtschaft",
     "land- und forst",
@@ -49,6 +50,19 @@ EXCLUDE_KEYWORDS = [
     "hotel",
     "pension",
 ]
+
+# Kategorien aus der Detailseite → Objekt wird NICHT importiert
+# Entspricht den Werten im Feld "Kategorie(n)" auf edikte.justiz.gv.at
+EXCLUDE_KATEGORIEN = {
+    "land- und forstwirtschaftlich genutzte liegenschaft",  # LF
+    "gewerbliche liegenschaft",                             # GL
+    "betriebsobjekt",
+    "superädifikat",                                        # SE – nur wenn gewerblich
+}
+
+# Notion-Feldname für PLZ (exakt so wie in der Datenbank angelegt)
+# Falls das Feld anders heißt, hier anpassen:
+NOTION_PLZ_FIELD = "PLZ"  # ← bei Fehler: exakten Namen aus Notion eintragen
 
 # Edikt-ID aus dem Link extrahieren
 ID_RE = re.compile(r"alldoc/([0-9a-f]+)!OpenDocument", re.IGNORECASE)
@@ -83,8 +97,13 @@ def clean_notion_db_id(raw: str) -> str:
 
 
 def is_excluded(text: str) -> bool:
-    """Prüft ob ein Objekt durch EXCLUDE_KEYWORDS ausgeschlossen werden soll."""
+    """Prüft ob ein Objekt anhand des Link-Texts ausgeschlossen werden soll."""
     return any(kw in text.lower() for kw in EXCLUDE_KEYWORDS)
+
+
+def is_excluded_by_kategorie(kategorie: str) -> bool:
+    """Prüft ob ein Objekt anhand der Detailseiten-Kategorie ausgeschlossen werden soll."""
+    return kategorie.lower().strip() in EXCLUDE_KATEGORIEN
 
 
 def parse_euro(raw: str) -> float | None:
@@ -348,8 +367,9 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
 def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
     """
     Legt einen neuen Eintrag in Notion an.
-    Ruft die Detailseite ab und befüllt alle verfügbaren Felder.
-    Gibt den detail-Dict zurück (für Telegram-Anzeige).
+    Ruft die Detailseite ab, filtert nach Kategorie und befüllt alle Felder.
+    Gibt den detail-Dict zurück (oder {} wenn Objekt gefiltert wurde).
+    Rückgabe None bedeutet: Objekt wurde durch Kategorie-Filter ausgeschlossen.
     """
     bundesland   = data.get("bundesland", "Unbekannt")
     link         = data.get("link", "")
@@ -362,21 +382,23 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
     if link:
         detail = fetch_detail(link)
 
+    # ── Kategorie-Filter (auf Detailseite, zuverlässiger als Link-Text) ──────
+    kategorie = detail.get("kategorie", "")
+    if kategorie and is_excluded_by_kategorie(kategorie):
+        print(f"  [Filter] ⛔ Kategorie ausgeschlossen: '{kategorie}' ({edikt_id[:8]}…)")
+        return None  # Signalisiert: nicht importieren
+
     # ── Liegenschaftsadresse als Titel ───────────────────────────────────────
-    # Priorität: echte Adresse aus Detailseite > Fallback auf Beschreibung
     adresse_voll = detail.get("adresse_voll", "")
     if not adresse_voll:
-        # Fallback: Bundesland + Datum aus Beschreibung
         datum_m = re.search(r"\((\d{2}\.\d{2}\.\d{4})\)", beschreibung)
         adresse_voll = f"{bundesland} – {datum_m.group(1) if datum_m else beschreibung[:60]}"
 
-    titel = adresse_voll  # Das wird der Notion-Seitentitel
+    titel    = adresse_voll
+    objektart = kategorie or beschreibung[:200]
 
-    # ── Objektart: Kategorie aus Detail oder Beschreibung ────────────────────
-    objektart = detail.get("kategorie", "") or beschreibung[:200]
-
+    # ── Kern-Properties (existieren garantiert in jeder Notion-DB) ───────────
     properties: dict = {
-        # Titel = echte Liegenschaftsadresse
         "Liegenschaftsadresse": {
             "title": [{"text": {"content": titel[:200]}}]
         },
@@ -389,60 +411,73 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
                 "name": typ if typ in ("Versteigerung", "Entfall des Termins") else "Versteigerung"
             }
         },
-        "Bundesland":            {"select": {"name": bundesland}},
-        "Neu eingelangt":        {"checkbox": True},
+        "Bundesland":              {"select": {"name": bundesland}},
+        "Neu eingelangt":          {"checkbox": True},
         "Automatisch importiert?": {"checkbox": True},
-        "Workflow-Phase":        {"select": {"name": "🆕 Neu eingelangt"}},
+        "Workflow-Phase":          {"select": {"name": "🆕 Neu eingelangt"}},
         "Objektart": {
             "rich_text": [{"text": {"content": objektart[:200]}}]
         },
     }
 
-    # ── Verkehrswert / Schätzwert ─────────────────────────────────────────────
+    # ── Optionale Properties – werden einzeln hinzugefügt ────────────────────
+    # Schlägt ein Feld fehl, wird nur dieses Feld übersprungen, nicht der ganze Eintrag.
+
     verkehrswert = detail.get("schaetzwert")
     if verkehrswert is not None:
-        # Als formatierter Text (passt zu Text-Feld in Notion)
         vk_str = f"{verkehrswert:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
-        properties["Verkehrswert"] = {
-            "rich_text": [{"text": {"content": vk_str}}]
-        }
+        properties["Verkehrswert"] = {"rich_text": [{"text": {"content": vk_str}}]}
 
-    # ── Versteigerungstermin ──────────────────────────────────────────────────
     termin_iso = detail.get("termin_iso")
     if termin_iso:
         properties["Versteigerungstermin"] = {"date": {"start": termin_iso}}
 
-    # ── Gericht / Dienststelle ────────────────────────────────────────────────
     gericht = detail.get("gericht", "")
     if gericht:
         properties["Verpflichtende Partei"] = {
             "rich_text": [{"text": {"content": gericht[:200]}}]
         }
 
-    # ── PLZ ───────────────────────────────────────────────────────────────────
     plz_ort = detail.get("plz_ort", "")
     if plz_ort:
-        # PLZ ist die führende Zahl, z.B. "1120 Wien" → "1120"
         plz_m = re.match(r"(\d{4,5})", plz_ort.strip())
         if plz_m:
-            properties["PLZ"] = {
+            properties[NOTION_PLZ_FIELD] = {
                 "rich_text": [{"text": {"content": plz_m.group(1)}}]
             }
 
-    # ── Fläche ────────────────────────────────────────────────────────────────
     flaeche = detail.get("flaeche_objekt") or detail.get("flaeche_grundstueck")
     if flaeche is not None:
-        # Als Text "96,72 m²" – falls Notion-Feld Number ist, einfach {"number": flaeche}
         flaeche_str = f"{flaeche:,.2f} m²".replace(",", "X").replace(".", ",").replace("X", ".")
-        properties["Fläche"] = {
-            "rich_text": [{"text": {"content": flaeche_str}}]
-        }
+        properties["Fläche"] = {"rich_text": [{"text": {"content": flaeche_str}}]}
 
-    notion.pages.create(
-        parent={"database_id": db_id},
-        properties=properties,
-    )
-    print(f"  [Notion] ✅ Erstellt: {titel[:80]}")
+    # ── Seite anlegen – erst Kern, dann optionale Felder einzeln ─────────────
+    # Strategie: Kern-Properties zuerst. Falls optionale Felder nicht existieren,
+    # werden sie weggelassen und der Eintrag trotzdem angelegt.
+    try:
+        notion.pages.create(parent={"database_id": db_id}, properties=properties)
+        print(f"  [Notion] ✅ Erstellt: {titel[:80]}")
+    except Exception as e:
+        err_str = str(e)
+        # Herausfinden welches Feld das Problem ist und es entfernen
+        optional_fields = [NOTION_PLZ_FIELD, "Fläche", "Verkehrswert",
+                           "Versteigerungstermin", "Verpflichtende Partei"]
+        removed = []
+        for field in optional_fields:
+            if field in err_str and field in properties:
+                del properties[field]
+                removed.append(field)
+
+        if removed:
+            print(f"  [Notion] ⚠️  Felder nicht gefunden, übersprungen: {removed}")
+            try:
+                notion.pages.create(parent={"database_id": db_id}, properties=properties)
+                print(f"  [Notion] ✅ Erstellt (ohne {removed}): {titel[:80]}")
+            except Exception as e2:
+                raise e2  # Wirklicher Fehler → nach oben weitergeben
+        else:
+            raise  # Kein bekanntes optionales Feld → nach oben weitergeben
+
     return detail
 
 
@@ -756,9 +791,13 @@ async def main() -> None:
                         print(f"  [Notion] 🔒 Geschützt (bereits bearbeitet): {eid}")
                     elif eid not in known_ids:
                         detail = notion_create_eintrag(notion, db_id, item)
-                        item["_detail"] = detail or {}
-                        neue_eintraege.append(item)
-                        known_ids[eid] = "(neu)"  # sofort als bekannt markieren
+                        if detail is None:
+                            # Kategorie-Filter hat das Objekt ausgeschlossen
+                            known_ids[eid] = "(gefiltert)"
+                        else:
+                            item["_detail"] = detail
+                            neue_eintraege.append(item)
+                            known_ids[eid] = "(neu)"  # sofort als bekannt markieren
                     else:
                         print(f"  [Notion] ⏭  Bereits vorhanden: {eid}")
 
