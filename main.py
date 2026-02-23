@@ -817,11 +817,16 @@ def gutachten_enrich_notion_page(
     if info.get("eigentümer_plz_ort"):
         properties["Zustell PLZ/Ort"] = _rt(info["eigentümer_plz_ort"])
 
-    # Notizen: Gläubiger + Forderung + PDF-Link
-    notiz_parts = []
+    # ── Betreibende Partei (Gläubiger / Bank) ──────────────────────────────
     if info.get("gläubiger"):
+        gl_text = " | ".join(info["gläubiger"])
         print(f"    [Gutachten] 🏦 Gläubiger: {' | '.join(info['gläubiger'][:2])}")
-        notiz_parts.append("Gläubiger: " + " | ".join(info["gläubiger"]))
+        properties["Betreibende Partei"] = _rt(gl_text)
+
+    # ── Notizen: Forderungsbetrag + PDF-Link ────────────────────────────────
+    # HINWEIS: 'Langgutachten (Datei)' ist ein Notion-File-Upload-Feld und kann
+    # keine externen URLs speichern → PDF-Link bleibt in Notizen.
+    notiz_parts = []
     if info.get("forderung_betrag"):
         notiz_parts.append("Forderung: " + info["forderung_betrag"])
     notiz_parts.append(f"Gutachten-PDF: {gutachten['url']}")
@@ -831,7 +836,7 @@ def gutachten_enrich_notion_page(
         # Gescanntes Dokument – trotzdem als analysiert markieren
         properties["Notizen"] = _rt(
             f"Gutachten-PDF: {gutachten['url']}\n"
-            "(Kein Grundbuch-Text lesbar – möglicherweise gescanntes Dokument)"
+            "(Kein Text lesbar – gescanntes Dokument)"
         )
         print("    [Gutachten] ⚠️  Kein Eigentümer gefunden (gescanntes Dokument?)")
 
@@ -863,12 +868,15 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     Paginierung: Notion liefert max. 100 Ergebnisse pro Anfrage.
     """
     # Workflow-Phasen die NICHT überschrieben werden dürfen
+    # Phasen die vom Scraper NICHT überschrieben werden dürfen
+    # (Einträge die bereits manuell bearbeitet wurden)
     GESCHUETZT_PHASEN = {
-        "📨 Angeschrieben",
-        "🤝 Angebot",
-        "📋 Due Diligence",
-        "✅ Gekauft",
-        "❌ Abgelehnt",
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "📊 Gutachten analysiert",
+        "🗄 Archiviert",
     }
 
     print("[Notion] 📥 Lade alle bestehenden IDs aus der Datenbank …")
@@ -1257,8 +1265,12 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
     Gibt die Anzahl der erfolgreich angereicherten Einträge zurück.
     """
     GESCHUETZT_PHASEN = {
-        "📨 Angeschrieben", "🤝 Angebot",
-        "📋 Due Diligence", "✅ Gekauft", "❌ Abgelehnt",
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "📊 Gutachten analysiert",
+        "🗄 Archiviert",
     }
 
     print("\n[Gutachten-Anreicherung] 📄 Suche nach Einträgen ohne Gutachten-Analyse …")
@@ -1347,8 +1359,12 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
     Gibt die Anzahl der bereinigten Einträge zurück.
     """
     GESCHUETZT_PHASEN = {
-        "📨 Angeschrieben", "🤝 Angebot",
-        "📋 Due Diligence", "✅ Gekauft", "❌ Abgelehnt",
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "📊 Gutachten analysiert",
+        "🗄 Archiviert",
     }
 
     # Gerichts-Muster: "BG Irgendwas (123)" oder "BG Irgendwas"
