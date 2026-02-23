@@ -1542,7 +1542,7 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
         has_more     = resp.get("has_more", False)
         start_cursor = resp.get("next_cursor")
 
-    MAX_PER_RUN = 15   # Begrenzung: max. 15 PDFs pro Run (~2–3 Min. Laufzeit)
+    MAX_PER_RUN = 100  # Begrenzung: max. 100 PDFs pro Run (~15–20 Min. Laufzeit)
     total_found = len(to_enrich)
     if total_found > MAX_PER_RUN:
         print(f"  [Gutachten-Anreicherung] ⚠️  {total_found} gefunden – verarbeite nur die ersten {MAX_PER_RUN} (Rest beim nächsten Run)")
