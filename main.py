@@ -265,47 +265,89 @@ def html_escape(text: str) -> str:
             .replace(">", "&gt;"))
 
 
+def _telegram_send_raw(url: str, payload_dict: dict) -> None:
+    """Interne Hilfsfunktion: sendet einen JSON-Payload an die Telegram API."""
+    payload = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        r.read()
+
+
+def _truncate_plain(text: str, limit: int = 4096) -> str:
+    """Kürzt Plain-Text sicher auf das Zeichenlimit."""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 6] + "\n[...]"
+
+
+def _strip_html_tags(text: str) -> str:
+    """Entfernt alle HTML-Tags und dekodiert HTML-Entities."""
+    plain = re.sub(r"<[^>]+>", "", text)
+    plain = plain.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return plain
+
+
 async def send_telegram(message: str) -> None:
     """
-    Sendet eine Nachricht via Telegram Bot.
-    Verwendet POST + JSON (stabiler als GET mit URL-Encoding).
-    Bei Fehler: Fallback auf reinen Text ohne HTML.
+    Sendet eine Nachricht via Telegram Bot (HTML-Modus).
+    - Wenn die Nachricht > 4096 Zeichen: wird in mehrere Teile aufgeteilt,
+      wobei jeder Teil an einer Zeilengrenze getrennt wird (kein halber HTML-Tag).
+    - Bei HTML-Fehler (400): Fallback auf reinen Text ohne parse_mode.
     """
     token   = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
+    url     = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    if len(message) > 4096:
-        message = message[:4090] + "\n[...]"
+    def split_message(text: str, limit: int = 4000) -> list[str]:
+        """Teilt eine Nachricht an Zeilengrenzen auf, sodass kein HTML-Tag zerrissen wird."""
+        if len(text) <= limit:
+            return [text]
+        parts = []
+        current = []
+        current_len = 0
+        for line in text.split("\n"):
+            line_len = len(line) + 1  # +1 für \n
+            if current_len + line_len > limit and current:
+                parts.append("\n".join(current))
+                current = [line]
+                current_len = line_len
+            else:
+                current.append(line)
+                current_len += line_len
+        if current:
+            parts.append("\n".join(current))
+        return parts
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    parts = split_message(message)
+    total = len(parts)
 
-    def do_send(text: str, parse_mode: str) -> None:
-        payload = json.dumps({
-            "chat_id":    chat_id,
-            "text":       text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=15) as r:
-            r.read()
-
-    try:
-        do_send(message, "HTML")
-        print(f"[Telegram] ✅ Nachricht gesendet ({len(message)} Zeichen)")
-    except Exception as e:
-        print(f"[Telegram] ⚠️  HTML-Modus fehlgeschlagen ({e}), versuche Plain Text …")
-        # Fallback: alle HTML-Tags entfernen und als reinen Text senden
-        plain = re.sub(r"<[^>]+>", "", message)
+    for i, part in enumerate(parts, 1):
+        label = f" ({i}/{total})" if total > 1 else ""
         try:
-            do_send(plain, "")
-            print(f"[Telegram] ✅ Nachricht (Plain Text) gesendet ({len(plain)} Zeichen)")
-        except Exception as e2:
-            raise RuntimeError(f"Telegram komplett fehlgeschlagen: {e2}") from e2
+            _telegram_send_raw(url, {
+                "chat_id":                  chat_id,
+                "text":                     part,
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": True,
+            })
+            print(f"[Telegram] ✅ Nachricht{label} gesendet ({len(part)} Zeichen)")
+        except Exception as e:
+            print(f"[Telegram] ⚠️  HTML-Modus fehlgeschlagen{label} ({e}), versuche Plain Text …")
+            # Fallback: HTML-Tags entfernen, kein parse_mode senden
+            plain = _truncate_plain(_strip_html_tags(part))
+            try:
+                _telegram_send_raw(url, {
+                    "chat_id":                  chat_id,
+                    "text":                     plain,
+                    "disable_web_page_preview": True,
+                })
+                print(f"[Telegram] ✅ Plain-Text{label} gesendet ({len(plain)} Zeichen)")
+            except Exception as e2:
+                raise RuntimeError(f"Telegram komplett fehlgeschlagen{label}: {e2}") from e2
 
 
 # =============================================================================
