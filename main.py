@@ -7,6 +7,7 @@ Alle Bundesländer | HTTP-Request (kein Browser nötig) | Notion | Telegram
 
 import os
 import re
+import json
 import time
 import asyncio
 import urllib.request
@@ -256,22 +257,55 @@ def fetch_detail(link: str) -> dict:
 # TELEGRAM
 # =============================================================================
 
+def html_escape(text: str) -> str:
+    """Escapt Sonderzeichen für Telegram HTML-Modus."""
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
 async def send_telegram(message: str) -> None:
-    """Sendet eine Nachricht via Telegram Bot."""
+    """
+    Sendet eine Nachricht via Telegram Bot.
+    Verwendet POST + JSON (stabiler als GET mit URL-Encoding).
+    Bei Fehler: Fallback auf reinen Text ohne HTML.
+    """
     token   = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
 
     if len(message) > 4096:
         message = message[:4090] + "\n[...]"
 
-    text = urllib.parse.quote(message)
-    url  = (
-        f"https://api.telegram.org/bot{token}/sendMessage"
-        f"?chat_id={chat_id}&text={text}&parse_mode=HTML"
-    )
-    with urllib.request.urlopen(url, timeout=15) as r:
-        r.read()
-    print(f"[Telegram] ✅ Nachricht gesendet ({len(message)} Zeichen)")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    def do_send(text: str, parse_mode: str) -> None:
+        payload = json.dumps({
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            r.read()
+
+    try:
+        do_send(message, "HTML")
+        print(f"[Telegram] ✅ Nachricht gesendet ({len(message)} Zeichen)")
+    except Exception as e:
+        print(f"[Telegram] ⚠️  HTML-Modus fehlgeschlagen ({e}), versuche Plain Text …")
+        # Fallback: alle HTML-Tags entfernen und als reinen Text senden
+        plain = re.sub(r"<[^>]+>", "", message)
+        try:
+            do_send(plain, "")
+            print(f"[Telegram] ✅ Nachricht (Plain Text) gesendet ({len(plain)} Zeichen)")
+        except Exception as e2:
+            raise RuntimeError(f"Telegram komplett fehlgeschlagen: {e2}") from e2
 
 
 # =============================================================================
@@ -843,12 +877,12 @@ async def main() -> None:
     if neue_eintraege:
         lines.append(f"<b>🟢 Neue Versteigerungen: {len(neue_eintraege)}</b>")
         for item in neue_eintraege[:20]:
-            detail   = item.get("_detail", {})
-            adresse  = detail.get("adresse_voll") or item["beschreibung"][:70]
-            kategorie = detail.get("kategorie", "")
-            vk       = detail.get("schaetzwert")
-            vk_str   = f" | 💰 {vk:,.0f} €".replace(",", ".") if vk else ""
-            kat_str  = f" [{kategorie}]" if kategorie else ""
+            detail    = item.get("_detail", {})
+            adresse   = html_escape(detail.get("adresse_voll") or item["beschreibung"][:70])
+            kategorie = html_escape(detail.get("kategorie", ""))
+            vk        = detail.get("schaetzwert")
+            vk_str    = f" | 💰 {vk:,.0f} €".replace(",", ".") if vk else ""
+            kat_str   = f" [{kategorie}]" if kategorie else ""
             lines.append(f"• <b>{adresse}</b>{kat_str}{vk_str}")
             lines.append(f"  <a href=\"{item['link']}\">→ Edikt öffnen</a>")
         if len(neue_eintraege) > 20:
@@ -858,7 +892,7 @@ async def main() -> None:
     if entfall_updates:
         lines.append(f"<b>🔴 Termin entfallen/verschoben: {len(entfall_updates)}</b>")
         for item in entfall_updates[:10]:
-            lines.append(f"• {item['bundesland']} – {item['beschreibung'][:60]}")
+            lines.append(f"• {html_escape(item['bundesland'])} – {html_escape(item['beschreibung'][:60])}")
         lines.append("")
 
     if enriched_count:
