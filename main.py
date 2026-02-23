@@ -61,8 +61,7 @@ EXCLUDE_KATEGORIEN = {
 }
 
 # Notion-Feldname für PLZ (exakt so wie in der Datenbank angelegt)
-# Falls das Feld anders heißt, hier anpassen:
-NOTION_PLZ_FIELD = "PLZ"  # ← bei Fehler: exakten Namen aus Notion eintragen
+NOTION_PLZ_FIELD = "Liegenschafts PLZ"
 
 # Edikt-ID aus dem Link extrahieren
 ID_RE = re.compile(r"alldoc/([0-9a-f]+)!OpenDocument", re.IGNORECASE)
@@ -440,11 +439,10 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
 
     plz_ort = detail.get("plz_ort", "")
     if plz_ort:
-        plz_m = re.match(r"(\d{4,5})", plz_ort.strip())
-        if plz_m:
-            properties[NOTION_PLZ_FIELD] = {
-                "rich_text": [{"text": {"content": plz_m.group(1)}}]
-            }
+        # Vollständig: "1120 Wien" → "1120 Wien"
+        properties[NOTION_PLZ_FIELD] = {
+            "rich_text": [{"text": {"content": plz_ort.strip()[:100]}}]
+        }
 
     flaeche = detail.get("flaeche_objekt") or detail.get("flaeche_grundstueck")
     if flaeche is not None:
