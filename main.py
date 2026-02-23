@@ -445,6 +445,7 @@ def _gb_parse_single_owner(lines: list, anteil_idx: int) -> dict:
         if "GEB:" in stripped.upper():         continue
         if "ADR:" in stripped.upper():         continue
         if re.match(r'^\*+', stripped):        continue  # Trennlinie
+        if re.match(r'^Seite\s+\d+\s+von\s+\d+', stripped, re.IGNORECASE): continue  # BUG 1: Seitenangabe
 
         owner["name"] = stripped
 
@@ -510,7 +511,16 @@ def _gb_parse_owner(section_b: str) -> dict:
             "eigentümer_geb":     "",
         }
 
-    # Alle Namen zusammenführen, Adresse vom ersten Eigentümer
+    # BUG 1: Duplikate entfernen (z.B. GmbH die 22x in Grundbuch erscheint), Reihenfolge behalten
+    seen_names: set = set()
+    unique_owners = []
+    for o in owners:
+        if o["name"] not in seen_names:
+            seen_names.add(o["name"])
+            unique_owners.append(o)
+    owners = unique_owners
+
+    # Alle Namen zusammenführen ("Seite X von Y" wird durch seen_names-Filter bereits verhindert)
     alle_namen = " | ".join(o["name"] for o in owners)
     erster     = owners[0]
 
@@ -603,16 +613,18 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
             # Erste nicht-leere Zeile nach "Verpflichtete Partei" = Name
             candidate = ""
             for line in block.split("\n"):
-                line_stripped = line.strip()
+                # BUG 7: führende ':' und Leerzeichen entfernen
+                line_stripped = line.strip().lstrip(":").strip()
                 if not line_stripped:
                     continue
                 # Stopp: nächster Abschnitt
                 if re.match(r'^(wegen|gegen|Aktenzahl|Auftrag|Gericht|\d+\.)',
                             line_stripped, re.IGNORECASE):
                     break
-                # Stopp: nur Doppelpunkt oder Leerzeile-Ersatz
-                if line_stripped in (":", ""):
-                    continue
+                # BUG 2: Anwalts-/Vertreter-Zeilen sind kein Eigentümername
+                if re.match(r'^(vertreten|durch:|RA\s|Rechtsanwalt)',
+                            line_stripped, re.IGNORECASE):
+                    break
                 candidate = line_stripped
                 break
 
@@ -632,6 +644,12 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
             lines_adr = [l.strip() for l in search_block.split("\n") if l.strip()]
             prev_line = ""
             for line in lines_adr[1:]:  # erste Zeile = Name selbst, überspringen
+                # BUG 3: Dateiname-artige Zeilen überspringen (z.B. "GA 1230 Nuschingg. 12")
+                if re.match(r'^GA\s+\d', line, re.IGNORECASE):
+                    continue
+                # BUG 4: Grundbuch-Anteil-Zeilen überspringen (z.B. "48/1830 Anteil")
+                if re.match(r'^\d+/\d+\s+(Anteil|EZ|KG)', line, re.IGNORECASE):
+                    continue
                 plz_m = re.search(r'\b(\d{4})\b', line)
                 if plz_m and len(line) > 3:
                     plz = plz_m.group(1)
@@ -657,6 +675,8 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
 
     # Gläubiger / Betreibende Partei – ebenfalls im gesamten Text suchen
     if not result["gläubiger"]:
+        # Alle Betreibende-Partei-Blöcke sammeln (kann mehrere geben)
+        gl_kandidaten: list[str] = []
         for bp_match in re.finditer(r'Betreibende\s+Partei', full_text, re.IGNORECASE):
             block = full_text[bp_match.end():bp_match.end() + 400]
             lines_block = [l.strip() for l in block.split("\n")]
@@ -687,11 +707,30 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                     continue
                 candidate = line_stripped
                 break
-                i += 1
 
             if candidate and len(candidate) > 3:
-                result["gläubiger"] = [candidate.rstrip(",.")]
-                break
+                gl_kandidaten.append(candidate.rstrip(",."))
+
+        # BUG 5+6: Gläubiger deduplicieren und EG/WEG-Hausverwaltungen filtern
+        def _gl_normalize(name: str) -> str:
+            """Entfernt FN-Nummern etc. für Duplikat-Vergleich."""
+            return re.sub(r'\s*\(FN\s*\d+\w*\)', '', name, flags=re.IGNORECASE).strip()
+
+        gl_seen_norm: set = set()
+        gl_final: list[str] = []
+        for gl in gl_kandidaten:
+            # BUG 6: Eigentümergemeinschaft / WEG ist kein Gläubiger im eigentlichen Sinne
+            # (EG der EZ …, WEG Reumannplatz …) – trotzdem eintragen, da manchmal relevant
+            # Nur "EG der EZ XXXX KG XXXXX" mit vollständiger Katastralangabe weglassen
+            if re.match(r'^EG\s+der\s+EZ\s+\d+\s+KG\s+\d+', gl, re.IGNORECASE):
+                continue
+            norm = _gl_normalize(gl)
+            if norm not in gl_seen_norm:
+                gl_seen_norm.add(norm)
+                gl_final.append(gl)
+
+        if gl_final:
+            result["gläubiger"] = gl_final
 
     return result
 
@@ -724,10 +763,14 @@ def gutachten_enrich_notion_page(
         return False
 
     if not pdfs:
-        print("    [Gutachten] ℹ️  Kein PDF-Anhang gefunden")
+        # BUG 9: analysiert?=True setzen damit dieser Eintrag nicht endlos wiederholt wird
+        print("    [Gutachten] ℹ️  Kein PDF-Anhang gefunden – markiere als abgeschlossen")
         notion.pages.update(
             page_id=page_id,
-            properties={"Gutachten analysiert?": {"checkbox": False}}
+            properties={
+                "Gutachten analysiert?": {"checkbox": True},
+                "Notizen": {"rich_text": [{"text": {"content": "Kein PDF auf Edikt-Seite verfügbar"}}]},
+            }
         )
         return False
 
