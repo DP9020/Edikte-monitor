@@ -908,12 +908,14 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             phase_sel = props.get("Workflow-Phase", {}).get("select") or {}
             phase = phase_sel.get("name", "")
 
-            # Status-Feld prüfen (🟢/🟡/🔴 = manuell bewertet → immer geschützt)
+            # Status-Feld prüfen:
+            # 🟢 Grün / 🟡 Gelb  → komplett geschützt (kein Überschreiben, kein Auto-Archiv)
+            # 🔴 Rot              → vor Neuanlage geschützt, ABER Entfall darf archivieren
+            #                       (deshalb echte page_id speichern, nicht Sentinel)
             status_sel = props.get("Status", {}).get("select") or {}
             status = status_sel.get("name", "")
-            hat_manuellen_status = status in ("🟢 Grün", "🟡 Gelb", "🔴 Rot")
-
-            ist_geschuetzt = phase in GESCHUETZT_PHASEN or hat_manuellen_status
+            ist_rot        = (status == "🔴 Rot")
+            ist_geschuetzt = phase in GESCHUETZT_PHASEN or status in ("🟢 Grün", "🟡 Gelb")
 
             # Hash-ID auslesen
             hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
@@ -925,17 +927,24 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
                 if ist_geschuetzt:
                     known[eid] = "(geschuetzt)"
                     geschuetzt_count += 1
+                elif ist_rot:
+                    # Rot: Scraper legt keinen neuen Eintrag an (Duplikat-Schutz),
+                    # aber die echte page_id bleibt gespeichert damit ein
+                    # Entfall-Edikt die Seite archivieren kann.
+                    known[eid] = page["id"]
+                    geschuetzt_count += 1
                 else:
                     known[eid] = page["id"]
 
             # Einträge OHNE Hash-ID aber MIT fortgeschrittener Phase:
             # Titel als Ersatz-Fingerprint speichern (verhindert Doppelanlage
             # bei manuell eingetragenen Immobilien ohne Hash-ID)
-            elif ist_geschuetzt:
+            elif ist_geschuetzt or ist_rot:
                 title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
                 title = title_rt[0].get("plain_text", "").strip().lower() if title_rt else ""
                 if title:
-                    known[f"__titel__{title}"] = "(geschuetzt)"
+                    # Grün/Gelb/Phase → Sentinel; Rot → echte ID damit Entfall greift
+                    known[f"__titel__{title}"] = "(geschuetzt)" if ist_geschuetzt else page["id"]
                     geschuetzt_count += 1
 
             page_count += 1
@@ -1070,26 +1079,34 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
     """
     Markiert ein bestehendes Notion-Objekt als 'Termin entfallen'.
 
-    Schutzlogik: Einträge mit manuellem Status (🟢/🟡/🔴) oder einer
-    fortgeschrittenen Workflow-Phase werden NICHT archiviert – der Termin-
-    entfall wird nur als 'Art des Edikts' vermerkt, alles andere bleibt.
+    Verhalten je nach aktuellem Status/Phase:
+
+    🟢 Grün / 🟡 Gelb  → Entfall nur vermerken, NICHT archivieren
+                          (Immobilie ist relevant / gekauft / in Bearbeitung)
+
+    🔴 Rot              → Archivieren (bereits als nicht relevant markiert)
+
+    Bereits archiviert  → Nur Art des Edikts aktualisieren (bleibt im Archiv)
+
+    Fortgeschrittene    → Nur Entfall vermerken, Phase bleibt erhalten
+    Workflow-Phase
+
+    Unbearbeitet        → Normal archivieren
     """
-    # Geschützte Phasen (kein Auto-Archivieren)
-    GESCHUETZT_PHASEN = {
+    # Phasen die NICHT auto-archiviert werden (manuell in Bearbeitung)
+    SCHUTZ_PHASEN = {
         "🔎 In Prüfung",
-        "❌ Nicht relevant",
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
         "📊 Gutachten analysiert",
-        "🗄 Archiviert",
     }
 
     # Aktuellen Zustand der Seite lesen
     try:
         page = notion.pages.retrieve(page_id=page_id)
         props = page.get("properties", {})
-        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-        status = (props.get("Status", {}).get("select") or {}).get("name", "")
+        phase    = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        status   = (props.get("Status", {}).get("select") or {}).get("name", "")
         archiviert = props.get("Archiviert", {}).get("checkbox", False)
     except Exception as exc:
         print(f"  [Notion] ⚠️  Entfall: Seite konnte nicht gelesen werden: {exc}")
@@ -1097,9 +1114,19 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
 
     eid = item.get('edikt_id', '?')
 
-    # Schutzcheck 1: Manueller Status gesetzt (Gelb/Grün/Rot)
-    if status in ("🟡 Gelb", "🟢 Grün", "🔴 Rot"):
-        # Nur Art des Edikts vermerken – NICHT archivieren
+    # Fall 1: Bereits archiviert → nur Art des Edikts anpassen, sonst nichts
+    if archiviert:
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
+            },
+        )
+        print(f"  [Notion] 🗄  Entfall im Archiv vermerkt: {eid}")
+        return
+
+    # Fall 2: Status Grün oder Gelb → relevant/in Bearbeitung → NUR vermerken
+    if status in ("🟢 Grün", "🟡 Gelb"):
         notion.pages.update(
             page_id=page_id,
             properties={
@@ -1110,8 +1137,22 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
         print(f"  [Notion] 🔒 Entfall vermerkt (Status {status} – kein Auto-Archiv): {eid}")
         return
 
-    # Schutzcheck 2: Fortgeschrittene Workflow-Phase
-    if phase in GESCHUETZT_PHASEN and not archiviert:
+    # Fall 3: Status Rot → bereits abgelehnt → archivieren
+    if status == "🔴 Rot":
+        notion.pages.update(
+            page_id=page_id,
+            properties={
+                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
+                "Archiviert":     {"checkbox": True},
+                "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
+                "Neu eingelangt": {"checkbox": False},
+            },
+        )
+        print(f"  [Notion] 🔴 Entfall archiviert (Status Rot): {eid}")
+        return
+
+    # Fall 4: Fortgeschrittene Phase ohne Status → nur vermerken
+    if phase in SCHUTZ_PHASEN:
         notion.pages.update(
             page_id=page_id,
             properties={
@@ -1122,7 +1163,7 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
         print(f"  [Notion] 🔒 Entfall vermerkt (Phase '{phase}' – kein Auto-Archiv): {eid}")
         return
 
-    # Normaler Fall: noch nicht manuell bearbeitet → archivieren
+    # Fall 5: Unbearbeitet (Neu eingelangt / kein Status) → normal archivieren
     notion.pages.update(
         page_id=page_id,
         properties={
