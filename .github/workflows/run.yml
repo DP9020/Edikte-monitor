@@ -1,9 +1,11 @@
 name: Edikte Monitor
 
 on:
-  schedule:
-    - cron: "30 6 * * *"
-    - cron: "30 16 * * *"
+   schedule:
+    - cron: "30 7 * * 1-5"   # 08:30 AT (Mo–Fr)
+    - cron: "0 9 * * 1-5"    # 10:00 AT (Mo–Fr)
+    - cron: "0 12 * * 1-5"   # 13:00 AT (Mo–Fr)
+    - cron: "0 15 * * 1-5"   # 16:00 AT (Mo–Fr)
   workflow_dispatch:
 
 jobs:
