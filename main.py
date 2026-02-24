@@ -1984,6 +1984,114 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
 
 
 # =============================================================================
+# STATUS-SYNC – Status (Rot/Gelb/Grün) → Phase + Checkboxen automatisch setzen
+# =============================================================================
+
+def notion_status_sync(notion: Client, db_id: str) -> int:
+    """
+    Synchronisiert Status-Farbe → Workflow-Phase + Checkboxen.
+
+    Regeln (gelten für ALLE Einträge, egal welche Phase aktuell):
+      🔴 Rot  → Phase: '❌ Nicht relevant'
+                Neu eingelangt: False
+                Relevanz geprüft: True
+
+      🟡 Gelb → Phase: '🔎 In Prüfung'
+                Neu eingelangt: False
+
+      🟢 Grün → Phase: '✅ Gekauft'
+                Neu eingelangt: False
+
+    Einträge werden nur angefasst wenn Phase und Status NICHT bereits
+    übereinstimmen (kein unnötiges API-Spam).
+    Gibt die Anzahl aktualisierter Einträge zurück.
+    """
+
+    # Erwartete Phase je Status
+    SOLL_PHASE = {
+        "🔴 Rot":  "❌ Nicht relevant",
+        "🟡 Gelb": "🔎 In Prüfung",
+        "🟢 Grün": "✅ Gekauft",
+    }
+
+    print("\n[Status-Sync] 🔄 Prüfe Status → Phase …")
+
+    to_update: list[dict] = []
+    has_more     = True
+    start_cursor = None
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Status-Sync] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+
+            props  = page.get("properties", {})
+            status = (props.get("Status", {}).get("select") or {}).get("name", "")
+
+            # Nur bekannte Farb-Status verarbeiten
+            if status not in SOLL_PHASE:
+                continue
+
+            phase_ist  = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            phase_soll = SOLL_PHASE[status]
+
+            # Bereits korrekt gesetzt → überspringen
+            if phase_ist == phase_soll:
+                continue
+
+            neu_eingelangt = props.get("Neu eingelangt", {}).get("checkbox", False)
+
+            to_update.append({
+                "page_id":       page["id"],
+                "status":        status,
+                "phase_soll":    phase_soll,
+                "neu_eingelangt": neu_eingelangt,
+            })
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    print(f"  [Status-Sync] 📋 {len(to_update)} Einträge werden synchronisiert")
+
+    updated = 0
+    for entry in to_update:
+        properties: dict = {
+            "Workflow-Phase": {"select": {"name": entry["phase_soll"]}},
+            "Neu eingelangt": {"checkbox": False},
+        }
+
+        # Nur bei Rot: Relevanz geprüft anhaken
+        if entry["status"] == "🔴 Rot":
+            properties["Relevanz geprüft"] = {"checkbox": True}
+
+        try:
+            notion.pages.update(page_id=entry["page_id"], properties=properties)
+            print(f"  [Status-Sync] ✅ {entry['status']} → {entry['phase_soll']}")
+            updated += 1
+        except Exception as exc:
+            print(f"  [Status-Sync] ⚠️  Update fehlgeschlagen: {exc}")
+
+        time.sleep(0.2)
+
+    print(f"[Status-Sync] ✅ {updated} Einträge synchronisiert")
+    return updated
+
+
+# =============================================================================
 # SCHRITT 1: QUALITÄTS-CHECK – alle analysierten Einträge auf Vollständigkeit
 # =============================================================================
 
@@ -2788,6 +2896,14 @@ async def main() -> None:
         print(f"  [ERROR] {msg}")
         fehler.append(msg)
         enriched_count = 0
+
+    # ── 3a. Status-Sync: Status-Farbe → Phase + Checkboxen ───────────────────
+    # Wenn ein Kollege manuell 🔴/🟡/🟢 setzt, werden Phase und Checkboxen
+    # automatisch angepasst (kein manuelles Ankreuzen nötig).
+    try:
+        notion_status_sync(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
 
     # ── 3b. Einmalige Bereinigung: falsche Gerichtsnamen in 'Verpflichtende Partei' ──
     # Frühere Script-Versionen haben irrtümlich den Gerichtsnamen (z.B. "BG Schwaz (870)")
