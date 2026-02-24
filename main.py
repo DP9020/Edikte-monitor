@@ -2156,20 +2156,24 @@ def gutachten_extract_info_vision(pdf_bytes: bytes, pdf_url: str) -> dict:
         return {}
 
     prompt = """Du analysierst Bilder aus österreichischen Gerichts-Gutachten für Zwangsversteigerungen.
+Es gibt zwei Dokumenttypen – analysiere BEIDE:
+
+1. Professionelles Gutachten (Wien-Stil): Enthält Abschnitte 'Verpflichtete Partei' (= Eigentümer) und 'Betreibende Partei' (= Gläubiger).
+2. Grundbuchauszug (Kärnten-Stil): Enthält Abschnitte '** B **' oder 'B-Blatt' (= Eigentümer mit Anteilen) und '** C **' oder 'C-Blatt' (= Pfandrechte/Gläubiger). Der Eigentümer steht nach 'Eigentumsrecht' oder 'Anteil' in Sektion B.
 
 Extrahiere genau diese Felder und antworte NUR mit validem JSON, ohne Erklärungen:
 
 {
-  "eigentümer_name": "Vollständiger Name der verpflichteten Partei (Immobilieneigentümer). Nur der Name, keine Adresse, kein Geburtsdatum. Mehrere Eigentümer mit ' | ' trennen.",
-  "eigentümer_adresse": "Straße und Hausnummer der verpflichteten Partei (Wohnadresse für Briefversand, NICHT die Liegenschaftsadresse)",
-  "eigentümer_plz_ort": "PLZ und Ort der verpflichteten Partei, z.B. '1010 Wien'",
-  "gläubiger": ["Liste der betreibenden Banken/Gläubiger. Nur echte Kreditgeber. KEINE Anwälte, Gerichte, WEG/EG/Hausverwaltungen."],
+  "eigentümer_name": "Vollständiger Name des Immobilieneigentümers. Nur der Name, keine Adresse, kein Geburtsdatum. Mehrere Eigentümer mit ' | ' trennen.",
+  "eigentümer_adresse": "Straße und Hausnummer des Eigentümers (Wohnadresse für Briefversand, NICHT die Liegenschaftsadresse)",
+  "eigentümer_plz_ort": "PLZ und Ort des Eigentümers, z.B. '1010 Wien'",
+  "gläubiger": ["Liste der betreibenden Banken/Gläubiger. Nur echte Kreditgeber (Banken, Sparkassen, Raiffeisen etc.). KEINE Anwälte, Gerichte, WEG/EG/Hausverwaltungen."],
   "forderung_betrag": "Forderungshöhe falls angegeben, z.B. 'EUR 150.000'"
 }
 
 Wichtige Regeln:
-- 'Verpflichtete Partei' = Eigentümer/Schuldner
-- 'Betreibende Partei' = Gläubiger/Bank
+- Sachverständige, Hilfskräfte des SV, Anwälte sind KEINE Eigentümer
+- WEG, EG, EGT, Eigentümergemeinschaft sind KEINE Gläubiger
 - Wenn ein Feld nicht gefunden wird: null"""
 
     # Nachricht mit allen Seiten-Bildern zusammenbauen
@@ -2294,7 +2298,14 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
             notizen_text = "".join(
                 (b.get("text") or {}).get("content", "") for b in notizen_rt
             )
-            if "gescannt" not in notizen_text.lower() and "kein text lesbar" not in notizen_text.lower():
+            # Marker für gescannte Dokumente (original oder nach Vision-Versuch)
+            ist_gescannt = (
+                "gescannt" in notizen_text.lower()
+                or "kein text lesbar" in notizen_text.lower()
+                or "via gpt-4o vision" in notizen_text.lower()
+                or "unleserlich" in notizen_text.lower()
+            )
+            if not ist_gescannt:
                 continue
 
             # PDF-URL aus Notizen extrahieren
@@ -2352,7 +2363,24 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
             info = gutachten_extract_info_vision(pdf_bytes, pdf_url)
 
             if not info.get("eigentümer_name") and not info.get("eigentümer_adresse"):
-                print(f"    [Vision] ℹ️  Kein Eigentümer gefunden (unleserlich?) – überspringe")
+                # Als endgültig unleserlich markieren → nie wieder versuchen
+                try:
+                    notizen_alt = entry["notizen"].strip()
+                    # Alten gescannt-Vermerk durch finalen ersetzen
+                    notizen_neu = re.sub(
+                        r'\(Kein Text lesbar[^)]*\)|\(Via GPT-4o Vision[^)]*\)',
+                        '', notizen_alt
+                    ).strip()
+                    notizen_neu += "\n(Endgültig unleserlich – kein Eigentümer auffindbar)"
+                    notion.pages.update(
+                        page_id=entry["page_id"],
+                        properties={
+                            "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]}
+                        }
+                    )
+                except Exception:
+                    pass
+                print(f"    [Vision] ℹ️  Kein Eigentümer gefunden → als unleserlich markiert")
                 continue
 
             # Notion-Properties aufbauen
@@ -2404,7 +2432,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
             if info.get("forderung_betrag"):
                 notiz_parts.append("Forderung: " + info["forderung_betrag"])
             notiz_parts.append(f"Gutachten-PDF: {pdf_url}")
-            notiz_parts.append("(Via GPT-4o Vision analysiert)")
+            notiz_parts.append("(Via GPT-4o Vision analysiert – gescanntes Dokument)")
             properties["Notizen"] = _rt("\n".join(notiz_parts))
 
             notion.pages.update(page_id=entry["page_id"], properties=properties)
