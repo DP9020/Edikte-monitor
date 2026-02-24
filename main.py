@@ -2138,14 +2138,15 @@ def gutachten_extract_info_vision(pdf_bytes: bytes, pdf_url: str) -> dict:
         print(f"    [Vision] ⚠️  PDF öffnen fehlgeschlagen: {exc}")
         return {}
 
-    # Erste 3 Seiten als Bilder rendern (reicht für Eigentümer-Info)
+    # Erste 8 Seiten als Bilder rendern – Eigentümer steht oft erst auf Seite 4–8
+    # 2.5x Zoom = ~190 DPI → bessere Lesbarkeit für gescannte Dokumente
     images_b64: list[str] = []
-    for page_num in range(min(3, len(doc))):
+    for page_num in range(min(8, len(doc))):
         try:
             page = doc[page_num]
-            mat  = fitz.Matrix(2.0, 2.0)   # 2x Zoom = ~150 DPI → gut lesbar, nicht zu groß
+            mat  = fitz.Matrix(2.5, 2.5)   # 2.5x Zoom = ~190 DPI
             pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-            img_bytes = pix.tobytes("jpeg", jpg_quality=75)
+            img_bytes = pix.tobytes("jpeg", jpg_quality=80)
             images_b64.append(base64.b64encode(img_bytes).decode("utf-8"))
         except Exception as exc:
             print(f"    [Vision] ⚠️  Seite {page_num+1} konnte nicht gerendert werden: {exc}")
@@ -2202,8 +2203,6 @@ Wichtige Regeln:
         raw  = response.choices[0].message.content.strip()
         data = json.loads(raw)
         print(f"    [Vision] 🔭 GPT-4o Vision analysiert ({len(images_b64)} Seiten)")
-        # DEBUG: zeige was GPT-4o zurückgibt (wird nach Diagnose entfernt)
-        print(f"    [Vision] 🔍 DEBUG Antwort: {raw[:300]}")
     except Exception as exc:
         print(f"    [Vision] ⚠️  OpenAI Vision-Fehler: {exc}")
         return {}
