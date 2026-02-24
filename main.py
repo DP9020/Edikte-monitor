@@ -2202,6 +2202,8 @@ Wichtige Regeln:
         raw  = response.choices[0].message.content.strip()
         data = json.loads(raw)
         print(f"    [Vision] 🔭 GPT-4o Vision analysiert ({len(images_b64)} Seiten)")
+        # DEBUG: zeige was GPT-4o zurückgibt (wird nach Diagnose entfernt)
+        print(f"    [Vision] 🔍 DEBUG Antwort: {raw[:300]}")
     except Exception as exc:
         print(f"    [Vision] ⚠️  OpenAI Vision-Fehler: {exc}")
         return {}
