@@ -2452,30 +2452,28 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
 # SCHRITT 3: TOTE URLs – HTTP 404 → automatisch archivieren
 # =============================================================================
 
-def notion_archiviere_tote_urls(notion: Client, db_id: str) -> int:
+def notion_archiviere_tote_urls(notion: Client, db_id: str) -> tuple[int, list[str]]:
     """
-    Prüft alle Einträge die:
-      - NICHT in einer geschützten Workflow-Phase sind
-      - NICHT archiviert sind
-      - Eine URL haben
-      - Noch keinen manuellen Status gesetzt haben (Status = leer / grau)
+    Prüft ALLE Einträge (außer bereits archivierte) auf HTTP 404.
 
-    Für jeden solchen Eintrag wird die URL aufgerufen.
-    Bei HTTP 404 → Eintrag wird archiviert (Archiviert=True, Phase='🗄 Archiviert',
-    Notizen ergänzt mit 'Edikt-Seite nicht mehr verfügbar').
+    Archivierungs-Logik basierend auf Status und Phase:
 
-    Gibt die Anzahl archivierter Einträge zurück.
+    ┌─────────────────────────────────────┬──────────────────────────────────────┐
+    │ Status = 🟢 Grün oder 🟡 Gelb       │ Nur Telegram-Alarm, KEIN Archivieren │
+    │ (egal welche Phase)                 │ (aktive Bearbeitung läuft noch)       │
+    ├─────────────────────────────────────┼──────────────────────────────────────┤
+    │ Status leer / grau                  │ → 🗄 Archiviert                       │
+    │ Phase = 📩 Brief versendet          │ → 🗄 Archiviert + Telegram-Alarm      │
+    │ Alle anderen                        │ → 🗄 Archiviert (still)               │
+    └─────────────────────────────────────┴──────────────────────────────────────┘
+
+    Gibt (Anzahl archivierter Einträge, Liste der Telegram-Alarm-Texte) zurück.
     """
-    GESCHUETZT_PHASEN = {
-        "🔎 In Prüfung",
-        "❌ Nicht relevant",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "🗄 Archiviert",
-    }
-    # Nur Einträge ohne manuellen Status (unbearbeitet) archivieren
-    MANUELL_GESETZT = {"🟢 Grün", "🟡 Gelb", "🔴 Rot"}
+    # Nur wirklich fertig archivierte überspringen
+    SKIP_PHASEN = {"🗄 Archiviert"}
+
+    # Schutz-Status: bei diesen wird NUR alarmiert, nicht archiviert
+    SCHUTZ_STATUS = {"🟢 Grün", "🟡 Gelb"}
 
     print("\n[Tote-URLs] 🔗 Prüfe URLs auf 404 …")
 
@@ -2504,18 +2502,11 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str) -> int:
 
             props = page.get("properties", {})
 
-            # Geschützte Phasen überspringen
-            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-            if phase in GESCHUETZT_PHASEN:
-                continue
-
             # Bereits archivierte überspringen
-            if props.get("Archiviert", {}).get("checkbox", False):
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in SKIP_PHASEN:
                 continue
-
-            # Einträge mit manuellem Status überspringen (nicht auto-archivieren)
-            status_val = (props.get("Status", {}).get("select") or {}).get("name", "")
-            if status_val in MANUELL_GESETZT:
+            if props.get("Archiviert", {}).get("checkbox", False):
                 continue
 
             # Muss eine URL haben
@@ -2523,57 +2514,114 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str) -> int:
             if not link_val:
                 continue
 
-            to_check.append({"page_id": page["id"], "link": link_val})
+            status_val = (props.get("Status", {}).get("select") or {}).get("name", "")
+
+            # Titel für Alarm
+            titel_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
+            titel = "".join(
+                (b.get("text") or {}).get("content", "") for b in titel_rt
+            ).strip() or page["id"][:8]
+
+            to_check.append({
+                "page_id":  page["id"],
+                "link":     link_val,
+                "phase":    phase,
+                "status":   status_val,
+                "titel":    titel,
+            })
 
         has_more     = resp.get("has_more", False)
         start_cursor = resp.get("next_cursor")
 
-    MAX_CHECK = 50   # max 50 URL-Checks pro Run (schnell, aber schont das Netz)
+    MAX_CHECK = 50   # max 50 URL-Checks pro Run (schont das Netz)
     if len(to_check) > MAX_CHECK:
         to_check = to_check[:MAX_CHECK]
 
     print(f"  [Tote-URLs] 📋 {len(to_check)} Einträge werden geprüft")
 
-    archived = 0
+    archived      = 0
+    alarm_lines: list[str] = []   # Telegram-Alarme für geschützte Einträge
+
     for entry in to_check:
+        is_404 = False
         try:
             req = urllib.request.Request(
                 entry["link"],
                 headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
             )
             with urllib.request.urlopen(req, timeout=10) as r:
-                _ = r.read(1)   # nur Header laden, nicht ganzen Body
-            # URL erreichbar → kein Problem
+                _ = r.read(1)   # nur Header laden
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                print(f"  [Tote-URLs] 🗑  HTTP 404 → archiviere: {entry['link'][-60:]}")
-                try:
-                    # Bestehende Notizen lesen
-                    page_data  = notion.pages.retrieve(page_id=entry["page_id"])
-                    notizen_rt = page_data["properties"].get("Notizen", {}).get("rich_text", [])
-                    notizen_alt = "".join(
-                        (b.get("text") or {}).get("content", "") for b in notizen_rt
-                    ).strip()
-                    notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
-                                  "Edikt-Seite nicht mehr verfügbar (HTTP 404)"
-
-                    notion.pages.update(
-                        page_id=entry["page_id"],
-                        properties={
-                            "Archiviert": {"checkbox": True},
-                            "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
-                            "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
-                        }
-                    )
-                    archived += 1
-                except Exception as exc2:
-                    print(f"  [Tote-URLs] ⚠️  Archivierung fehlgeschlagen: {exc2}")
+                is_404 = True
         except Exception:
-            pass  # Netzwerkfehler, Timeout etc. → überspringen (kein 404)
+            pass  # Netzwerkfehler / Timeout → kein 404
+
+        if not is_404:
+            time.sleep(0.2)
+            continue
+
+        print(f"  [Tote-URLs] 🗑  HTTP 404: {entry['titel'][:60]} (Phase: {entry['phase']}, Status: {entry['status'] or '–'})")
+
+        # ── Schutz-Status: nur alarmieren, NICHT archivieren ──────────────
+        if entry["status"] in SCHUTZ_STATUS:
+            alarm_lines.append(
+                f"⚠️ Edikt verschwunden (Status {entry['status']}): "
+                f"<b>{entry['titel'][:80]}</b>"
+            )
+            # Notiz in Notion setzen ohne Phase zu ändern
+            try:
+                page_data   = notion.pages.retrieve(page_id=entry["page_id"])
+                notizen_rt  = page_data["properties"].get("Notizen", {}).get("rich_text", [])
+                notizen_alt = "".join(
+                    (b.get("text") or {}).get("content", "") for b in notizen_rt
+                ).strip()
+                notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
+                              "⚠️ Edikt-Seite nicht mehr verfügbar (HTTP 404) – bitte manuell prüfen"
+                notion.pages.update(
+                    page_id=entry["page_id"],
+                    properties={
+                        "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
+                    }
+                )
+            except Exception as exc2:
+                print(f"  [Tote-URLs] ⚠️  Notiz-Update fehlgeschlagen: {exc2}")
+            time.sleep(0.2)
+            continue
+
+        # ── Alle anderen: archivieren ──────────────────────────────────────
+        # Bei "Brief versendet" zusätzlich Telegram-Alarm
+        if entry["phase"] == "📩 Brief versendet":
+            alarm_lines.append(
+                f"📬 Brief bereits versendet – Edikt jetzt weg: "
+                f"<b>{entry['titel'][:80]}</b> → archiviert"
+            )
+
+        try:
+            page_data   = notion.pages.retrieve(page_id=entry["page_id"])
+            notizen_rt  = page_data["properties"].get("Notizen", {}).get("rich_text", [])
+            notizen_alt = "".join(
+                (b.get("text") or {}).get("content", "") for b in notizen_rt
+            ).strip()
+            notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
+                          "Edikt-Seite nicht mehr verfügbar (HTTP 404) – automatisch archiviert"
+
+            notion.pages.update(
+                page_id=entry["page_id"],
+                properties={
+                    "Archiviert":    {"checkbox": True},
+                    "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
+                    "Notizen":       {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
+                }
+            )
+            archived += 1
+        except Exception as exc2:
+            print(f"  [Tote-URLs] ⚠️  Archivierung fehlgeschlagen: {exc2}")
+
         time.sleep(0.2)
 
     print(f"[Tote-URLs] ✅ {archived} tote URLs archiviert")
-    return archived
+    return archived, alarm_lines
 
 
 # =============================================================================
@@ -2753,8 +2801,9 @@ async def main() -> None:
 
     # ── 3c. Tote URLs archivieren (HTTP 404) ─────────────────────────────────
     tote_urls_archiviert = 0
+    tote_urls_alarme: list[str] = []
     try:
-        tote_urls_archiviert = notion_archiviere_tote_urls(notion, db_id)
+        tote_urls_archiviert, tote_urls_alarme = notion_archiviere_tote_urls(notion, db_id)
     except Exception as exc:
         print(f"  [WARN] Tote-URLs-Check fehlgeschlagen (nicht kritisch): {exc}")
 
@@ -2799,7 +2848,7 @@ async def main() -> None:
 
     if not neue_eintraege and not entfall_updates and not fehler \
             and not gutachten_enriched and not vision_enriched \
-            and not tote_urls_archiviert:
+            and not tote_urls_archiviert and not tote_urls_alarme:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
@@ -2837,6 +2886,12 @@ async def main() -> None:
 
     if tote_urls_archiviert:
         lines.append(f"<b>🗑 Tote Edikte archiviert: {tote_urls_archiviert}</b>")
+        lines.append("")
+
+    if tote_urls_alarme:
+        lines.append("<b>🚨 Achtung – Edikt verschwunden (manuelle Prüfung!):</b>")
+        for alarm in tote_urls_alarme:
+            lines.append(f"• {alarm}")
         lines.append("")
 
     if gutachten_enriched:
