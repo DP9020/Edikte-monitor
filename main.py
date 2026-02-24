@@ -22,6 +22,13 @@ except ImportError:
     fitz = None
     FITZ_AVAILABLE = False
 
+try:
+    from openai import OpenAI as _OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    _OpenAI = None
+    OPENAI_AVAILABLE = False
+
 # =============================================================================
 # KONFIGURATION
 # =============================================================================
@@ -561,6 +568,81 @@ def _gb_parse_creditors(section_c: str) -> tuple:
     return gläubiger, betrag
 
 
+def gutachten_extract_info_llm(full_text: str) -> dict:
+    """
+    Extrahiert Eigentümer, Adresse, Gläubiger und Forderungsbetrag
+    aus dem PDF-Text via OpenAI GPT-4o-mini.
+
+    Gibt ein Result-Dict zurück (gleiche Struktur wie gutachten_extract_info).
+    Bei Fehler oder fehlendem API-Key: leeres Dict.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or not OPENAI_AVAILABLE:
+        return {}
+
+    # Nur die ersten 12.000 Zeichen senden – reicht für alle relevanten Infos
+    # und hält die Token-Kosten niedrig (~0,002€ pro Dokument)
+    text_snippet = full_text[:12000]
+
+    prompt = """Du analysierst Texte aus österreichischen Gerichts-Gutachten für Zwangsversteigerungen.
+
+Extrahiere genau diese Felder und antworte NUR mit validem JSON, ohne Erklärungen:
+
+{
+  "eigentümer_name": "Vollständiger Name der verpflichteten Partei (Immobilieneigentümer). Nur der Name, keine Adresse, kein Geburtsdatum. Mehrere Eigentümer mit ' | ' trennen.",
+  "eigentümer_adresse": "Straße und Hausnummer der verpflichteten Partei (Wohnadresse für Briefversand, NICHT die Liegenschaftsadresse)",
+  "eigentümer_plz_ort": "PLZ und Ort der verpflichteten Partei, z.B. '1010 Wien' oder 'D-88250 Weingarten'",
+  "gläubiger": ["Liste der betreibenden Banken/Gläubiger. Nur echte Kreditgeber (Banken, Sparkassen, etc.). KEINE Anwälte, Gerichte, Sachverständige, Hausverwaltungen (WEG/EG/EGT), Aktenzeichen."],
+  "forderung_betrag": "Forderungshöhe falls angegeben, z.B. 'EUR 150.000'"
+}
+
+Wichtige Regeln:
+- 'Verpflichtete Partei' = Eigentümer/Schuldner → das ist eigentümer_name
+- 'Betreibende Partei' = Gläubiger/Bank → das ist gläubiger
+- Anwälte (RA, Rechtsanwalt, vertreten durch) sind KEINE Gläubiger
+- Sachverständige, Hilfskräfte, Mitarbeiter des SV sind KEIN Eigentümer
+- WEG, EG, EGT, EigG, Eigentümergemeinschaft sind KEINE Gläubiger
+- Wenn ein Feld nicht gefunden wird: null
+- Geburtsdaten NICHT im Namen mitgeben"""
+
+    try:
+        client = _OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user",   "content": text_snippet},
+            ],
+            temperature=0,          # deterministisch
+            max_tokens=400,         # reicht für JSON-Antwort
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content.strip()
+        data = json.loads(raw)
+    except Exception as exc:
+        print(f"    [LLM] ⚠️  OpenAI-Fehler: {exc}")
+        return {}
+
+    def _str(val) -> str:
+        return str(val).strip() if val else ""
+
+    def _lst(val) -> list:
+        if isinstance(val, list):
+            return [str(v).strip() for v in val if v and str(v).strip()]
+        if isinstance(val, str) and val.strip():
+            return [val.strip()]
+        return []
+
+    return {
+        "eigentümer_name":    _str(data.get("eigentümer_name")),
+        "eigentümer_adresse": _str(data.get("eigentümer_adresse")),
+        "eigentümer_plz_ort": _str(data.get("eigentümer_plz_ort")),
+        "eigentümer_geb":     "",
+        "gläubiger":          _lst(data.get("gläubiger")),
+        "forderung_betrag":   _str(data.get("forderung_betrag")),
+    }
+
+
 def gutachten_extract_info(pdf_bytes: bytes) -> dict:
     """
     Extrahiert Eigentümer, Adresse, Gläubiger und Forderungsbetrag aus dem PDF.
@@ -1014,15 +1096,43 @@ def gutachten_enrich_notion_page(
         )
         return False
 
+    # ── Text aus PDF extrahieren ─────────────────────────────────────────────
     try:
-        info = gutachten_extract_info(pdf_bytes)
+        doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
+        full_text = "\n".join(p.get_text() for p in doc if p.get_text().strip())
     except Exception as exc:
-        print(f"    [Gutachten] ⚠️  Parse-Fehler: {exc}")
+        print(f"    [Gutachten] ⚠️  PDF-Text-Fehler: {exc}")
         notion.pages.update(
             page_id=page_id,
             properties={"Gutachten analysiert?": {"checkbox": False}}
         )
         return False
+
+    # ── Extraktion: LLM zuerst, Regex als Fallback ───────────────────────────
+    info = {}
+    used_llm = False
+    if OPENAI_AVAILABLE and os.environ.get("OPENAI_API_KEY"):
+        try:
+            info = gutachten_extract_info_llm(full_text)
+            if info.get("eigentümer_name") or info.get("gläubiger"):
+                used_llm = True
+                print("    [Gutachten] 🤖 LLM-Extraktion erfolgreich")
+        except Exception as exc:
+            print(f"    [Gutachten] ⚠️  LLM-Fehler: {exc}")
+            info = {}
+
+    if not used_llm:
+        # Fallback: Regex-Parser (Grundbuchauszug-Format + VP-Block)
+        try:
+            info = gutachten_extract_info(pdf_bytes)
+            print("    [Gutachten] 🔍 Regex-Fallback verwendet")
+        except Exception as exc:
+            print(f"    [Gutachten] ⚠️  Parse-Fehler: {exc}")
+            notion.pages.update(
+                page_id=page_id,
+                properties={"Gutachten analysiert?": {"checkbox": False}}
+            )
+            return False
 
     # ── Notion-Properties aufbauen ───────────────────────────────────────────
     # has_owner wird nach Bereinigung gesetzt (weiter unten)
