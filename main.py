@@ -1984,6 +1984,570 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
 
 
 # =============================================================================
+# SCHRITT 1: QUALITÄTS-CHECK – alle analysierten Einträge auf Vollständigkeit
+# =============================================================================
+
+def notion_qualitaetscheck(notion: Client, db_id: str) -> int:
+    """
+    Geht alle Einträge durch die bereits als 'Gutachten analysiert?' = True
+    markiert sind, aber eines oder mehrere dieser Felder LEER haben:
+      - Verpflichtende Partei (Eigentümer)
+      - Zustell Adresse
+      - Betreibende Partei (Gläubiger)
+
+    Solche Einträge werden zurückgesetzt (analysiert? = False) damit
+    notion_enrich_gutachten sie beim nächsten Schritt neu analysiert.
+
+    Einträge mit 'gescanntes Dokument' oder 'Kein PDF' im Notizen-Feld
+    werden NICHT zurückgesetzt (da kein PDF vorhanden bzw. nicht lesbar).
+
+    Gibt die Anzahl zurückgesetzter Einträge zurück.
+    """
+    GESCHUETZT_PHASEN = {
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "🗄 Archiviert",
+    }
+
+    print("\n[Qualitäts-Check] 🔍 Prüfe alle analysierten Einträge auf Vollständigkeit …")
+
+    to_reset: list[str] = []
+    has_more     = True
+    start_cursor = None
+    total_checked = 0
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Qualitäts-Check] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+
+            props = page.get("properties", {})
+
+            # Nur analysierte Einträge
+            analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
+            if not analysiert:
+                continue
+
+            # Geschützte Phasen überspringen
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in GESCHUETZT_PHASEN:
+                continue
+
+            # Archivierte überspringen
+            archiviert = props.get("Archiviert", {}).get("checkbox", False)
+            if archiviert:
+                continue
+
+            # Muss eine URL haben (sonst gibt es nichts zu analysieren)
+            link_val = props.get("Link", {}).get("url")
+            if not link_val:
+                continue
+
+            total_checked += 1
+
+            # Notizen prüfen – gescannte/fehlende PDFs nicht nochmal versuchen
+            notizen_rt = props.get("Notizen", {}).get("rich_text", [])
+            notizen_text = "".join(
+                (b.get("text") or {}).get("content", "") for b in notizen_rt
+            ).lower()
+            if "gescannt" in notizen_text or "kein pdf" in notizen_text or "nicht lesbar" in notizen_text:
+                continue
+
+            # Felder prüfen
+            eigentümer_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+            eigentümer    = "".join(
+                (b.get("text") or {}).get("content", "") for b in eigentümer_rt
+            ).strip()
+
+            adresse_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
+            adresse    = "".join(
+                (b.get("text") or {}).get("content", "") for b in adresse_rt
+            ).strip()
+
+            gläubiger_rt = props.get("Betreibende Partei", {}).get("rich_text", [])
+            gläubiger    = "".join(
+                (b.get("text") or {}).get("content", "") for b in gläubiger_rt
+            ).strip()
+
+            # Zurücksetzen wenn Eigentümer UND Adresse fehlen (beide leer)
+            if not eigentümer and not adresse:
+                to_reset.append(page["id"])
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    print(f"  [Qualitäts-Check] 📊 {total_checked} analysierte Einträge geprüft")
+    print(f"  [Qualitäts-Check] 🔄 {len(to_reset)} unvollständige Einträge → werden neu analysiert")
+
+    reset_count = 0
+    for page_id in to_reset:
+        try:
+            notion.pages.update(
+                page_id=page_id,
+                properties={"Gutachten analysiert?": {"checkbox": False}}
+            )
+            reset_count += 1
+        except Exception as exc:
+            print(f"  [Qualitäts-Check] ⚠️  Reset fehlgeschlagen für {page_id[:8]}…: {exc}")
+        time.sleep(0.15)
+
+    print(f"[Qualitäts-Check] ✅ {reset_count} Einträge zurückgesetzt")
+    return reset_count
+
+
+# =============================================================================
+# SCHRITT 2: VISION-ANALYSE – gescannte PDFs mit GPT-4o-Vision
+# =============================================================================
+
+def gutachten_extract_info_vision(pdf_bytes: bytes, pdf_url: str) -> dict:
+    """
+    Analysiert ein gescanntes PDF (kein extrahierbarer Text) mit GPT-4o-Vision.
+    Konvertiert die ersten 3 Seiten des PDFs in Bilder (base64) und sendet
+    sie an die OpenAI Vision API.
+
+    Gibt das gleiche Result-Dict zurück wie gutachten_extract_info_llm.
+    Gibt leeres Dict zurück bei Fehler.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or not OPENAI_AVAILABLE:
+        return {}
+    if not FITZ_AVAILABLE:
+        return {}
+
+    import base64
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        print(f"    [Vision] ⚠️  PDF öffnen fehlgeschlagen: {exc}")
+        return {}
+
+    # Erste 3 Seiten als Bilder rendern (reicht für Eigentümer-Info)
+    images_b64: list[str] = []
+    for page_num in range(min(3, len(doc))):
+        try:
+            page = doc[page_num]
+            mat  = fitz.Matrix(2.0, 2.0)   # 2x Zoom = ~150 DPI → gut lesbar, nicht zu groß
+            pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+            img_bytes = pix.tobytes("jpeg", jpg_quality=75)
+            images_b64.append(base64.b64encode(img_bytes).decode("utf-8"))
+        except Exception as exc:
+            print(f"    [Vision] ⚠️  Seite {page_num+1} konnte nicht gerendert werden: {exc}")
+            continue
+
+    if not images_b64:
+        print("    [Vision] ⚠️  Keine Seiten gerendert")
+        return {}
+
+    prompt = """Du analysierst Bilder aus österreichischen Gerichts-Gutachten für Zwangsversteigerungen.
+
+Extrahiere genau diese Felder und antworte NUR mit validem JSON, ohne Erklärungen:
+
+{
+  "eigentümer_name": "Vollständiger Name der verpflichteten Partei (Immobilieneigentümer). Nur der Name, keine Adresse, kein Geburtsdatum. Mehrere Eigentümer mit ' | ' trennen.",
+  "eigentümer_adresse": "Straße und Hausnummer der verpflichteten Partei (Wohnadresse für Briefversand, NICHT die Liegenschaftsadresse)",
+  "eigentümer_plz_ort": "PLZ und Ort der verpflichteten Partei, z.B. '1010 Wien'",
+  "gläubiger": ["Liste der betreibenden Banken/Gläubiger. Nur echte Kreditgeber. KEINE Anwälte, Gerichte, WEG/EG/Hausverwaltungen."],
+  "forderung_betrag": "Forderungshöhe falls angegeben, z.B. 'EUR 150.000'"
+}
+
+Wichtige Regeln:
+- 'Verpflichtete Partei' = Eigentümer/Schuldner
+- 'Betreibende Partei' = Gläubiger/Bank
+- Wenn ein Feld nicht gefunden wird: null"""
+
+    # Nachricht mit allen Seiten-Bildern zusammenbauen
+    content: list[dict] = [{"type": "text", "text": "Analysiere dieses Gutachten:"}]
+    for img_b64 in images_b64:
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{img_b64}",
+                "detail": "high"
+            }
+        })
+
+    try:
+        client   = _OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o",            # Vision-fähiges Modell (nicht mini!)
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user",   "content": content},
+            ],
+            temperature=0,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+        raw  = response.choices[0].message.content.strip()
+        data = json.loads(raw)
+        print(f"    [Vision] 🔭 GPT-4o Vision analysiert ({len(images_b64)} Seiten)")
+    except Exception as exc:
+        print(f"    [Vision] ⚠️  OpenAI Vision-Fehler: {exc}")
+        return {}
+
+    def _str(val) -> str:
+        return str(val).strip() if val else ""
+
+    def _lst(val) -> list:
+        if isinstance(val, list):
+            return [str(v).strip() for v in val if v and str(v).strip()]
+        if isinstance(val, str) and val.strip():
+            return [val.strip()]
+        return []
+
+    return {
+        "eigentümer_name":    _str(data.get("eigentümer_name")),
+        "eigentümer_adresse": _str(data.get("eigentümer_adresse")),
+        "eigentümer_plz_ort": _str(data.get("eigentümer_plz_ort")),
+        "eigentümer_geb":     "",
+        "gläubiger":          _lst(data.get("gläubiger")),
+        "forderung_betrag":   _str(data.get("forderung_betrag")),
+    }
+
+
+def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
+    """
+    Findet alle Einträge die als 'gescanntes Dokument' markiert sind
+    (Notizen enthält 'gescanntes Dokument' oder 'Kein Text lesbar')
+    und versucht sie mit GPT-4o Vision neu zu analysieren.
+
+    Gibt die Anzahl erfolgreich analysierter Einträge zurück.
+    """
+    if not OPENAI_AVAILABLE or not os.environ.get("OPENAI_API_KEY"):
+        print("[Vision-Analyse] ℹ️  Kein OpenAI API-Key – überspringe Vision-Analyse")
+        return 0
+    if not FITZ_AVAILABLE:
+        print("[Vision-Analyse] ℹ️  PyMuPDF nicht verfügbar – überspringe Vision-Analyse")
+        return 0
+
+    GESCHUETZT_PHASEN = {
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "🗄 Archiviert",
+    }
+
+    print("\n[Vision-Analyse] 🔭 Suche nach gescannten PDFs …")
+
+    to_vision: list[dict] = []
+    has_more     = True
+    start_cursor = None
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Vision-Analyse] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+
+            props = page.get("properties", {})
+
+            # Nur analysierte Einträge
+            analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
+            if not analysiert:
+                continue
+
+            # Geschützte Phasen + Archivierte überspringen
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in GESCHUETZT_PHASEN:
+                continue
+            if props.get("Archiviert", {}).get("checkbox", False):
+                continue
+
+            # Muss URL haben
+            link_val = props.get("Link", {}).get("url")
+            if not link_val:
+                continue
+
+            # Notizen prüfen: enthält 'gescanntes Dokument' oder 'Kein Text lesbar'?
+            notizen_rt = props.get("Notizen", {}).get("rich_text", [])
+            notizen_text = "".join(
+                (b.get("text") or {}).get("content", "") for b in notizen_rt
+            )
+            if "gescannt" not in notizen_text.lower() and "kein text lesbar" not in notizen_text.lower():
+                continue
+
+            # PDF-URL aus Notizen extrahieren
+            pdf_url_match = re.search(r'Gutachten-PDF:\s*(https?://\S+)', notizen_text)
+            pdf_url = pdf_url_match.group(1).strip() if pdf_url_match else None
+
+            # Eigentümer noch leer?
+            eigentümer_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+            eigentümer    = "".join(
+                (b.get("text") or {}).get("content", "") for b in eigentümer_rt
+            ).strip()
+            if eigentümer:
+                continue  # Eigentümer bereits vorhanden – überspringen
+
+            to_vision.append({
+                "page_id": page["id"],
+                "link":    link_val,
+                "pdf_url": pdf_url,
+                "notizen": notizen_text,
+            })
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    MAX_VISION = 20   # GPT-4o ist teurer → max 20 pro Run (~0.40€)
+    total_found = len(to_vision)
+    if total_found > MAX_VISION:
+        print(f"  [Vision-Analyse] ⚠️  {total_found} gefunden – verarbeite nur die ersten {MAX_VISION}")
+        to_vision = to_vision[:MAX_VISION]
+
+    print(f"  [Vision-Analyse] 📋 {len(to_vision)} gescannte PDFs werden analysiert")
+
+    enriched = 0
+    for entry in to_vision:
+        try:
+            # PDF direkt laden (URL aus Notizen oder neu von Edikt-Seite holen)
+            pdf_url = entry["pdf_url"]
+            if not pdf_url:
+                # PDF-URL neu von der Edikt-Seite laden
+                try:
+                    attachments = gutachten_fetch_attachment_links(entry["link"])
+                    pdfs = attachments.get("pdfs", [])
+                    if pdfs:
+                        best = gutachten_pick_best_pdf(pdfs)
+                        pdf_url = best["url"] if best else None
+                except Exception as exc:
+                    print(f"    [Vision] ⚠️  Edikt-Seite nicht ladbar: {exc}")
+                    continue
+
+            if not pdf_url:
+                print(f"    [Vision] ⚠️  Keine PDF-URL gefunden für {entry['page_id'][:8]}…")
+                continue
+
+            pdf_bytes = gutachten_download_pdf(pdf_url)
+            info = gutachten_extract_info_vision(pdf_bytes, pdf_url)
+
+            if not info.get("eigentümer_name") and not info.get("eigentümer_adresse"):
+                print(f"    [Vision] ℹ️  Kein Eigentümer gefunden (unleserlich?) – überspringe")
+                continue
+
+            # Notion-Properties aufbauen
+            def _rt(text: str) -> dict:
+                return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
+
+            def _clean_extracted_name(name: str) -> str:
+                if not name:
+                    return ""
+                if re.match(r'^[)\\\]}>]', name) or name.rstrip().endswith('-'):
+                    return ""
+                if not any(c.isalpha() for c in name):
+                    return ""
+                return name
+
+            def _clean_extracted_adresse(adr: str) -> str:
+                if not adr:
+                    return ""
+                adr = re.sub(r',?\s*Telefon.*$', '', adr, flags=re.IGNORECASE).strip().rstrip(',')
+                m_ort_vor_strasse = re.match(r'^(?:[A-Za-z]-?)?\d{4,5}\s+\S+.*?,\s*(.+)', adr)
+                if m_ort_vor_strasse:
+                    adr = m_ort_vor_strasse.group(1).strip()
+                adr = re.sub(r',\s*[A-ZÄÖÜ][a-zäöüß]+$', '', adr).strip()
+                return adr
+
+            name_clean = _clean_extracted_name(info.get("eigentümer_name", ""))
+            adr_clean  = _clean_extracted_adresse(info.get("eigentümer_adresse", ""))
+
+            properties: dict = {"Gutachten analysiert?": {"checkbox": True}}
+
+            if name_clean:
+                print(f"    [Vision] 👤 Eigentümer: {name_clean}")
+                properties["Verpflichtende Partei"] = _rt(name_clean)
+
+            if adr_clean:
+                print(f"    [Vision] 🏠 Adresse: {adr_clean}")
+                properties["Zustell Adresse"] = _rt(adr_clean)
+
+            if info.get("eigentümer_plz_ort"):
+                properties["Zustell PLZ/Ort"] = _rt(info["eigentümer_plz_ort"])
+
+            if info.get("gläubiger"):
+                gl_text = " | ".join(info["gläubiger"])
+                print(f"    [Vision] 🏦 Gläubiger: {gl_text[:80]}")
+                properties["Betreibende Partei"] = _rt(gl_text)
+
+            # Notizen aktualisieren (gescannt-Vermerk entfernen)
+            notiz_parts = []
+            if info.get("forderung_betrag"):
+                notiz_parts.append("Forderung: " + info["forderung_betrag"])
+            notiz_parts.append(f"Gutachten-PDF: {pdf_url}")
+            notiz_parts.append("(Via GPT-4o Vision analysiert)")
+            properties["Notizen"] = _rt("\n".join(notiz_parts))
+
+            notion.pages.update(page_id=entry["page_id"], properties=properties)
+            print(f"    [Vision] ✅ Notion aktualisiert")
+            enriched += 1
+
+        except Exception as exc:
+            print(f"  [Vision-Analyse] ❌ Fehler für {entry['page_id'][:8]}…: {exc}")
+        time.sleep(0.5)  # etwas mehr Pause wegen größerer API-Anfragen
+
+    print(f"[Vision-Analyse] ✅ {enriched} gescannte PDFs erfolgreich analysiert")
+    return enriched
+
+
+# =============================================================================
+# SCHRITT 3: TOTE URLs – HTTP 404 → automatisch archivieren
+# =============================================================================
+
+def notion_archiviere_tote_urls(notion: Client, db_id: str) -> int:
+    """
+    Prüft alle Einträge die:
+      - NICHT in einer geschützten Workflow-Phase sind
+      - NICHT archiviert sind
+      - Eine URL haben
+      - Noch keinen manuellen Status gesetzt haben (Status = leer / grau)
+
+    Für jeden solchen Eintrag wird die URL aufgerufen.
+    Bei HTTP 404 → Eintrag wird archiviert (Archiviert=True, Phase='🗄 Archiviert',
+    Notizen ergänzt mit 'Edikt-Seite nicht mehr verfügbar').
+
+    Gibt die Anzahl archivierter Einträge zurück.
+    """
+    GESCHUETZT_PHASEN = {
+        "🔎 In Prüfung",
+        "❌ Nicht relevant",
+        "✅ Relevant – Brief vorbereiten",
+        "📩 Brief versendet",
+        "📊 Gutachten analysiert",
+        "🗄 Archiviert",
+    }
+    # Nur Einträge ohne manuellen Status (unbearbeitet) archivieren
+    MANUELL_GESETZT = {"🟢 Grün", "🟡 Gelb", "🔴 Rot"}
+
+    print("\n[Tote-URLs] 🔗 Prüfe URLs auf 404 …")
+
+    to_check: list[dict] = []
+    has_more     = True
+    start_cursor = None
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Tote-URLs] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+
+            props = page.get("properties", {})
+
+            # Geschützte Phasen überspringen
+            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+            if phase in GESCHUETZT_PHASEN:
+                continue
+
+            # Bereits archivierte überspringen
+            if props.get("Archiviert", {}).get("checkbox", False):
+                continue
+
+            # Einträge mit manuellem Status überspringen (nicht auto-archivieren)
+            status_val = (props.get("Status", {}).get("select") or {}).get("name", "")
+            if status_val in MANUELL_GESETZT:
+                continue
+
+            # Muss eine URL haben
+            link_val = props.get("Link", {}).get("url")
+            if not link_val:
+                continue
+
+            to_check.append({"page_id": page["id"], "link": link_val})
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    MAX_CHECK = 50   # max 50 URL-Checks pro Run (schnell, aber schont das Netz)
+    if len(to_check) > MAX_CHECK:
+        to_check = to_check[:MAX_CHECK]
+
+    print(f"  [Tote-URLs] 📋 {len(to_check)} Einträge werden geprüft")
+
+    archived = 0
+    for entry in to_check:
+        try:
+            req = urllib.request.Request(
+                entry["link"],
+                headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                _ = r.read(1)   # nur Header laden, nicht ganzen Body
+            # URL erreichbar → kein Problem
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"  [Tote-URLs] 🗑  HTTP 404 → archiviere: {entry['link'][-60:]}")
+                try:
+                    # Bestehende Notizen lesen
+                    page_data  = notion.pages.retrieve(page_id=entry["page_id"])
+                    notizen_rt = page_data["properties"].get("Notizen", {}).get("rich_text", [])
+                    notizen_alt = "".join(
+                        (b.get("text") or {}).get("content", "") for b in notizen_rt
+                    ).strip()
+                    notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
+                                  "Edikt-Seite nicht mehr verfügbar (HTTP 404)"
+
+                    notion.pages.update(
+                        page_id=entry["page_id"],
+                        properties={
+                            "Archiviert": {"checkbox": True},
+                            "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
+                            "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
+                        }
+                    )
+                    archived += 1
+                except Exception as exc2:
+                    print(f"  [Tote-URLs] ⚠️  Archivierung fehlgeschlagen: {exc2}")
+        except Exception:
+            pass  # Netzwerkfehler, Timeout etc. → überspringen (kein 404)
+        time.sleep(0.2)
+
+    print(f"[Tote-URLs] ✅ {archived} tote URLs archiviert")
+    return archived
+
+
+# =============================================================================
 # SCRAPING – direkte HTTP-Requests (kein Browser nötig!)
 # =============================================================================
 
@@ -2158,9 +2722,23 @@ async def main() -> None:
     except Exception as exc:
         print(f"  [WARN] Bereinigung fehlgeschlagen (nicht kritisch): {exc}")
 
-    # ── 4. Gutachten-Anreicherung für manuell angelegte Einträge ─────────────
-    # Betrifft: Einträge die bereits eine URL haben aber noch nicht analysiert wurden.
-    # Das sind Immobilien die ihr selbst eingetragen habt (mit oder ohne Hash-ID).
+    # ── 3c. Tote URLs archivieren (HTTP 404) ─────────────────────────────────
+    tote_urls_archiviert = 0
+    try:
+        tote_urls_archiviert = notion_archiviere_tote_urls(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Tote-URLs-Check fehlgeschlagen (nicht kritisch): {exc}")
+
+    # ── 3d. Qualitäts-Check: analysierte Einträge auf Vollständigkeit prüfen ──
+    # Einträge die als 'analysiert' markiert sind, aber keinen Eigentümer/Adresse
+    # haben, werden zurückgesetzt damit Schritt 4 sie neu analysiert.
+    try:
+        notion_qualitaetscheck(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Qualitäts-Check fehlgeschlagen (nicht kritisch): {exc}")
+
+    # ── 4. Gutachten-Anreicherung: Text-PDFs (LLM) ───────────────────────────
+    # Betrifft: Einträge die eine URL haben aber noch nicht analysiert wurden.
     gutachten_enriched = 0
     if FITZ_AVAILABLE:
         try:
@@ -2172,20 +2750,31 @@ async def main() -> None:
     else:
         print("[Gutachten] ℹ️  PyMuPDF nicht verfügbar – überspringe Gutachten-Anreicherung")
 
+    # ── 4b. Vision-Analyse: gescannte PDFs (GPT-4o) ──────────────────────────
+    vision_enriched = 0
+    try:
+        vision_enriched = notion_enrich_gescannte(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Vision-Analyse fehlgeschlagen (nicht kritisch): {exc}")
+
     # ── 5. Zusammenfassung ────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print(f"✅ Neue Einträge:       {len(neue_eintraege)}")
-    print(f"🔴 Entfall-Updates:     {len(entfall_updates)}")
-    print(f"🔗 URLs ergänzt:        {enriched_count}")
-    print(f"📄 Gutachten analysiert:{gutachten_enriched}")
-    print(f"⚠️  Fehler:              {len(fehler)}")
+    print(f"✅ Neue Einträge:         {len(neue_eintraege)}")
+    print(f"🔴 Entfall-Updates:       {len(entfall_updates)}")
+    print(f"🔗 URLs ergänzt:          {enriched_count}")
+    print(f"🗑  Tote URLs archiviert:  {tote_urls_archiviert}")
+    print(f"📄 Gutachten analysiert:  {gutachten_enriched}")
+    print(f"🔭 Vision analysiert:     {vision_enriched}")
+    print(f"⚠️  Fehler:                {len(fehler)}")
     print("=" * 60)
 
-    if not neue_eintraege and not entfall_updates and not fehler and not gutachten_enriched:
+    if not neue_eintraege and not entfall_updates and not fehler \
+            and not gutachten_enriched and not vision_enriched \
+            and not tote_urls_archiviert:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
-    # ── 4. Telegram ───────────────────────────────────────────────────────────
+    # ── 6. Telegram ───────────────────────────────────────────────────────────
     lines = [
         "<b>🏛 Edikte-Monitor</b>",
         f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
@@ -2217,8 +2806,16 @@ async def main() -> None:
         lines.append(f"<b>🔗 URLs nachgetragen: {enriched_count}</b>")
         lines.append("")
 
+    if tote_urls_archiviert:
+        lines.append(f"<b>🗑 Tote Edikte archiviert: {tote_urls_archiviert}</b>")
+        lines.append("")
+
     if gutachten_enriched:
-        lines.append(f"<b>📄 Gutachten analysiert: {gutachten_enriched}</b>")
+        lines.append(f"<b>📄 Gutachten analysiert (Text): {gutachten_enriched}</b>")
+        lines.append("")
+
+    if vision_enriched:
+        lines.append(f"<b>🔭 Gutachten analysiert (Vision): {vision_enriched}</b>")
         lines.append("")
 
     if fehler:
