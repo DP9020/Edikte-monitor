@@ -1148,6 +1148,10 @@ def gutachten_enrich_notion_page(
         """Verwirft Parser-Artefakte die als Name durchgerutscht sind."""
         if not name:
             return ""
+        # GPT-Platzhalter / Nicht-Namen herausfiltern
+        INVALID_NAMES = {"nicht angegeben", "unbekannt", "n/a", "none", "null", "-", "–"}
+        if name.strip().lower() in INVALID_NAMES:
+            return ""
         # Fragmente wie ") und Ma-" (PDF-Seitenumbruch-Artefakte)
         if re.match(r'^[)\\]}>]', name) or name.rstrip().endswith('-'):
             return ""
@@ -1247,6 +1251,7 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
         "📊 Gutachten analysiert",
+        "✅ Gekauft",
         "🗄 Archiviert",
     }
 
@@ -1751,6 +1756,7 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
         "📊 Gutachten analysiert",
+        "✅ Gekauft",
         "🗄 Archiviert",
     }
 
@@ -1845,6 +1851,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
         "📊 Gutachten analysiert",
+        "✅ Gekauft",
         "🗄 Archiviert",
     }
 
@@ -1989,32 +1996,41 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
 
 def notion_status_sync(notion: Client, db_id: str) -> int:
     """
-    Synchronisiert Status-Farbe → Workflow-Phase + Checkboxen.
+    Synchronisiert zwei manuelle Felder → Workflow-Phase + Checkboxen.
 
-    Regeln (gelten für ALLE Einträge, egal welche Phase aktuell):
-      🔴 Rot  → Phase: '❌ Nicht relevant'
-                Neu eingelangt: False
-                Relevanz geprüft: True
+    ── Quelle 1: Status-Farbe ──────────────────────────────────────────────
+      🔴 Rot  → Phase: '❌ Nicht relevant', Neu eingelangt: False,
+                Relevanz geprüft: True, Archiviert: True
+      🟡 Gelb → Phase: '🔎 In Prüfung',   Neu eingelangt: False
+      🟢 Grün → Phase: '✅ Gekauft',       Neu eingelangt: False
 
-      🟡 Gelb → Phase: '🔎 In Prüfung'
-                Neu eingelangt: False
+    ── Quelle 2: 'Für uns relevant?' (Select) ──────────────────────────────
+      Ja         → Phase: '✅ Relevant – Brief vorbereiten',
+                   Relevanz geprüft: True, Neu eingelangt: False
+      Nein       → Phase: '❌ Nicht relevant', Status: 🔴 Rot,
+                   Relevanz geprüft: True, Neu eingelangt: False, Archiviert: True
+      Beobachten → Phase: '🔎 In Prüfung',
+                   Relevanz geprüft: True, Neu eingelangt: False
 
-      🟢 Grün → Phase: '✅ Gekauft'
-                Neu eingelangt: False
-
-    Einträge werden nur angefasst wenn Phase und Status NICHT bereits
-    übereinstimmen (kein unnötiges API-Spam).
+    Einträge werden nur angefasst wenn eine Änderung nötig ist.
     Gibt die Anzahl aktualisierter Einträge zurück.
     """
 
-    # Erwartete Phase je Status
-    SOLL_PHASE = {
+    # Erwartete Phase je Status-Farbe
+    STATUS_SOLL_PHASE = {
         "🔴 Rot":  "❌ Nicht relevant",
         "🟡 Gelb": "🔎 In Prüfung",
         "🟢 Grün": "✅ Gekauft",
     }
 
-    print("\n[Status-Sync] 🔄 Prüfe Status → Phase …")
+    # Erwartete Phase je 'Für uns relevant?'-Wert
+    RELEVANT_SOLL_PHASE = {
+        "Ja":         "✅ Relevant – Brief vorbereiten",
+        "Nein":       "❌ Nicht relevant",
+        "Beobachten": "🔎 In Prüfung",
+    }
+
+    print("\n[Status-Sync] 🔄 Prüfe Status + Relevanz → Phase …")
 
     to_update: list[dict] = []
     has_more     = True
@@ -2039,27 +2055,53 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
             if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
                 continue
 
-            props  = page.get("properties", {})
-            status = (props.get("Status", {}).get("select") or {}).get("name", "")
+            props     = page.get("properties", {})
+            status    = (props.get("Status", {}).get("select") or {}).get("name", "")
+            relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
+            phase_ist = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
 
-            # Nur bekannte Farb-Status verarbeiten
-            if status not in SOLL_PHASE:
+            update_props: dict = {}
+
+            # ── Quelle 2: 'Für uns relevant?' hat Vorrang vor Status-Farbe ──
+            if relevant in RELEVANT_SOLL_PHASE:
+                phase_soll = RELEVANT_SOLL_PHASE[relevant]
+
+                # Immer: Relevanz geprüft + Neu eingelangt
+                update_props["Relevanz geprüft"] = {"checkbox": True}
+                update_props["Neu eingelangt"]   = {"checkbox": False}
+
+                # Phase nur setzen wenn noch nicht korrekt
+                if phase_ist != phase_soll:
+                    update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
+
+                # Bei Nein: zusätzlich Status Rot + Archiviert
+                if relevant == "Nein":
+                    update_props["Status"]    = {"select": {"name": "🔴 Rot"}}
+                    update_props["Archiviert"] = {"checkbox": True}
+
+            # ── Quelle 1: Status-Farbe (nur wenn kein Relevanz-Wert gesetzt) ─
+            elif status in STATUS_SOLL_PHASE:
+                phase_soll = STATUS_SOLL_PHASE[status]
+
+                if phase_ist != phase_soll:
+                    update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
+
+                update_props["Neu eingelangt"] = {"checkbox": False}
+
+                if status == "🔴 Rot":
+                    update_props["Relevanz geprüft"] = {"checkbox": True}
+                    update_props["Archiviert"]        = {"checkbox": True}
+
+            # Keine relevanten Felder gesetzt → überspringen
+            if not update_props:
                 continue
 
-            phase_ist  = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-            phase_soll = SOLL_PHASE[status]
-
-            # Bereits korrekt gesetzt → überspringen
-            if phase_ist == phase_soll:
-                continue
-
-            neu_eingelangt = props.get("Neu eingelangt", {}).get("checkbox", False)
-
+            # Bereits alles korrekt → überspringen (nur Phase-Check reicht nicht,
+            # da Checkboxen evtl. noch falsch sind – daher immer in Queue)
             to_update.append({
-                "page_id":       page["id"],
-                "status":        status,
-                "phase_soll":    phase_soll,
-                "neu_eingelangt": neu_eingelangt,
+                "page_id":      page["id"],
+                "update_props": update_props,
+                "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={update_props.get('Workflow-Phase', {}).get('select', {}).get('name', phase_ist)}",
             })
 
         has_more     = resp.get("has_more", False)
@@ -2069,22 +2111,12 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
 
     updated = 0
     for entry in to_update:
-        properties: dict = {
-            "Workflow-Phase": {"select": {"name": entry["phase_soll"]}},
-            "Neu eingelangt": {"checkbox": False},
-        }
-
-        # Nur bei Rot: Relevanz geprüft anhaken
-        if entry["status"] == "🔴 Rot":
-            properties["Relevanz geprüft"] = {"checkbox": True}
-
         try:
-            notion.pages.update(page_id=entry["page_id"], properties=properties)
-            print(f"  [Status-Sync] ✅ {entry['status']} → {entry['phase_soll']}")
+            notion.pages.update(page_id=entry["page_id"], properties=entry["update_props"])
+            print(f"  [Status-Sync] ✅ {entry['label']}")
             updated += 1
         except Exception as exc:
             print(f"  [Status-Sync] ⚠️  Update fehlgeschlagen: {exc}")
-
         time.sleep(0.2)
 
     print(f"[Status-Sync] ✅ {updated} Einträge synchronisiert")
@@ -2116,6 +2148,7 @@ def notion_qualitaetscheck(notion: Client, db_id: str) -> int:
         "❌ Nicht relevant",
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
+        "✅ Gekauft",
         "🗄 Archiviert",
     }
 
@@ -2355,6 +2388,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
         "❌ Nicht relevant",
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
+        "✅ Gekauft",
         "🗄 Archiviert",
     }
 
@@ -2498,6 +2532,10 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
 
             def _clean_extracted_name(name: str) -> str:
                 if not name:
+                    return ""
+                # GPT-Platzhalter / Nicht-Namen herausfiltern
+                INVALID_NAMES = {"nicht angegeben", "unbekannt", "n/a", "none", "null", "-", "–"}
+                if name.strip().lower() in INVALID_NAMES:
                     return ""
                 if re.match(r'^[)\\\]}>]', name) or name.rstrip().endswith('-'):
                     return ""
