@@ -2751,20 +2751,20 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
 
 # ── Kontaktdaten der Betreuer (Bundesland → Ansprechpartner) ─────────────────
 #
-# Benjamin Pippan  → Wien, Steiermark
-# Friedrich Prause → Kärnten, Salzburg, Oberösterreich
+# Benjamin Pippan    → Wien, Oberösterreich
 # Christopher Dovjak → Niederösterreich, Burgenland
-# Tirol / Vorarlberg: noch kein Ansprechpartner
+# Friedrich Prause   → Steiermark, Kärnten, Salzburg, Tirol, Vorarlberg
 #
 KONTAKT_DATEN: dict[str, dict] = {
-    "Wien":         {"name": "Benjamin Pippan",    "tel": "+43699 133 90 251", "email": "office@benana.at"},
-    "Steiermark":   {"name": "Benjamin Pippan",    "tel": "+43699 133 90 251", "email": "office@benana.at"},
-    "Niederösterreich": {"name": "Christopher Dovjak", "tel": "+43 664 4531399", "email": "christopher.dovjak@dp-im.at"},
-    "Burgenland":   {"name": "Christopher Dovjak", "tel": "+43 664 4531399",   "email": "christopher.dovjak@dp-im.at"},
-    "Kärnten":      {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
-    "Salzburg":     {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
-    "Oberösterreich": {"name": "Friedrich Prause", "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
-    # Tirol / Vorarlberg: noch offen → Brief wird nicht automatisch erstellt
+    "Wien":             {"name": "Benjamin Pippan",    "tel": "+43699 133 90 251", "email": "office@benana.at"},
+    "Oberösterreich":   {"name": "Benjamin Pippan",    "tel": "+43699 133 90 251", "email": "office@benana.at"},
+    "Niederösterreich": {"name": "Christopher Dovjak", "tel": "+43 664 4531399",   "email": "christopher.dovjak@dp-im.at"},
+    "Burgenland":       {"name": "Christopher Dovjak", "tel": "+43 664 4531399",   "email": "christopher.dovjak@dp-im.at"},
+    "Steiermark":       {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    "Kärnten":          {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    "Salzburg":         {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    "Tirol":            {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    "Vorarlberg":       {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
 }
 
 BRIEF_VORLAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brief_vorlage.docx")
