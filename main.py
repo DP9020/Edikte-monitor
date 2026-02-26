@@ -1336,6 +1336,45 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     return known
 
 
+def notion_load_all_pages(notion: Client, db_id: str) -> list[dict]:
+    """
+    Lädt ALLE Pages aus der Notion-DB in einem einzigen Durchlauf.
+    Gibt eine Liste aller Page-Objekte (mit Properties) zurück.
+
+    Wird von Status-Sync, Bereinigung, Tote-URLs und Qualitäts-Check
+    gemeinsam genutzt um mehrfache DB-Scans zu vermeiden.
+    """
+    print("[Notion] 📥 Lade alle Pages für Cleanup-Schritte …")
+    pages: list[dict] = []
+    has_more     = True
+    start_cursor = None
+
+    while has_more:
+        kwargs: dict = {
+            "filter": {"value": "page", "property": "object"},
+            "page_size": 100,
+        }
+        if start_cursor:
+            kwargs["start_cursor"] = start_cursor
+        try:
+            resp = notion.search(**kwargs)
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Fehler beim Laden der Pages: {exc}")
+            break
+
+        for page in resp.get("results", []):
+            parent = page.get("parent", {})
+            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+                continue
+            pages.append(page)
+
+        has_more     = resp.get("has_more", False)
+        start_cursor = resp.get("next_cursor")
+
+    print(f"[Notion] ✅ {len(pages)} Pages geladen")
+    return pages
+
+
 def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
     """
     Legt einen neuen Eintrag in Notion an.
@@ -1832,7 +1871,8 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
     return enriched
 
 
-def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
+def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
+                                       all_pages: list[dict] | None = None) -> int:
     """
     Einmalige Bereinigung: Findet Einträge deren 'Verpflichtende Partei'
     einen Gerichtsnamen enthält (z.B. "BG Schwaz (870)", "BG Innere Stadt Wien (001)").
@@ -1863,95 +1903,64 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
 
     print("\n[Bereinigung] 🔧 Suche nach Einträgen mit falschem Gericht in 'Verpflichtende Partei' …")
 
+    pages = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
     to_fix: list[str] = []
-    has_more     = True
-    start_cursor = None
 
-    while has_more:
-        kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
-            "page_size": 100,
-        }
-        if start_cursor:
-            kwargs["start_cursor"] = start_cursor
+    for page in pages:
+        props = page.get("properties", {})
 
-        try:
-            resp = notion.search(**kwargs)
-        except Exception as exc:
-            print(f"  [Bereinigung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
-            break
+        # Geschützte Phasen auslassen
+        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        if phase in GESCHUETZT_PHASEN:
+            continue
 
-        for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
+        # 'Verpflichtende Partei' lesen
+        vp_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+        vp_text = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
 
-            props = page.get("properties", {})
+        if not vp_text:
+            continue
 
-            # Geschützte Phasen auslassen
-            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-            if phase in GESCHUETZT_PHASEN:
-                continue
+        # Enthält der Wert einen Gerichtsnamen?
+        if GERICHT_RE.match(vp_text):
+            to_fix.append(page["id"])
 
-            # 'Verpflichtende Partei' lesen
-            vp_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-            vp_text = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
-
-            if not vp_text:
-                continue
-
-            # Enthält der Wert einen Gerichtsnamen?
-            if GERICHT_RE.match(vp_text):
-                to_fix.append(page["id"])
-
-        has_more     = resp.get("has_more", False)
-        start_cursor = resp.get("next_cursor")
 
     # Zweiter Pass: Einträge mit analysiert?=True aber OHNE Adresse → neu analysieren
     # NUR einmalig: dieser Pass wird NICHT wiederholt wenn das PDF gescannt ist.
     # Erkennungskriterium: Notizen enthält bereits "Kein PDF" oder "gescannt"
     # → diese werden NICHT zurückgesetzt (sonst Endlosschleife)
     to_reanalyze: list[str] = []
-    has_more     = True
-    start_cursor = None
-    while has_more:
-        kwargs2: dict = {"filter": {"value": "page", "property": "object"}, "page_size": 100}
-        if start_cursor:
-            kwargs2["start_cursor"] = start_cursor
-        try:
-            resp2 = notion.search(**kwargs2)
-        except Exception:
-            break
-        for page in resp2.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-            props = page.get("properties", {})
-            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-            if phase in GESCHUETZT_PHASEN:
-                continue
-            # Nur Einträge die bereits als analysiert markiert sind
-            analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
-            if not analysiert:
-                continue
-            # Aber OHNE Zustelladresse
-            adr_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
-            adr_text = "".join(t.get("text", {}).get("content", "") for t in adr_rt).strip()
-            if not adr_text:
-                # STOPP: wenn Notizen bereits "Kein PDF" oder ähnliches enthalten
-                # → das PDF ist gescannt/nicht lesbar → NICHT nochmal versuchen
-                notiz_rt = props.get("Notizen", {}).get("rich_text", [])
-                notiz_text = "".join(t.get("text", {}).get("content", "") for t in notiz_rt).strip()
-                if any(marker in notiz_text for marker in (
-                    "Kein PDF", "gescannt", "nicht lesbar", "kein Eigentümer"
-                )):
-                    continue  # gescanntes Dokument → kein Reset, verhindert Endlosschleife
-                # Nur zurücksetzen wenn ein Link vorhanden (sonst kein PDF zum analysieren)
-                link_rt = props.get("Link", {}).get("url") or ""
-                if link_rt and page["id"] not in to_fix:
-                    to_reanalyze.append(page["id"])
-        has_more     = resp2.get("has_more", False)
-        start_cursor = resp2.get("next_cursor")
+    for page in resp2.get("results", []):
+        parent = page.get("parent", {})
+        if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
+            continue
+        props = page.get("properties", {})
+        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        if phase in GESCHUETZT_PHASEN:
+            continue
+        # Nur Einträge die bereits als analysiert markiert sind
+        analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
+        if not analysiert:
+            continue
+        # Aber OHNE Zustelladresse
+        adr_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
+        adr_text = "".join(t.get("text", {}).get("content", "") for t in adr_rt).strip()
+        if not adr_text:
+            # STOPP: wenn Notizen bereits "Kein PDF" oder ähnliches enthalten
+            # → das PDF ist gescannt/nicht lesbar → NICHT nochmal versuchen
+            notiz_rt = props.get("Notizen", {}).get("rich_text", [])
+            notiz_text = "".join(t.get("text", {}).get("content", "") for t in notiz_rt).strip()
+            if any(marker in notiz_text for marker in (
+                "Kein PDF", "gescannt", "nicht lesbar", "kein Eigentümer"
+            )):
+                continue  # gescanntes Dokument → kein Reset, verhindert Endlosschleife
+            # Nur zurücksetzen wenn ein Link vorhanden (sonst kein PDF zum analysieren)
+            link_rt = props.get("Link", {}).get("url") or ""
+            if link_rt and page["id"] not in to_fix:
+                to_reanalyze.append(page["id"])
+    has_more     = resp2.get("has_more", False)
+    start_cursor = resp2.get("next_cursor")
 
     if to_reanalyze:
         print(f"  [Bereinigung] 🔄 {len(to_reanalyze)} analysierte Einträge ohne Adresse → werden neu analysiert …")
@@ -1994,25 +2003,27 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str) -> int:
 # STATUS-SYNC – Status (Rot/Gelb/Grün) → Phase + Checkboxen automatisch setzen
 # =============================================================================
 
-def notion_status_sync(notion: Client, db_id: str) -> int:
+def notion_status_sync(notion: Client, db_id: str,
+                        all_pages: list[dict] | None = None) -> int:
     """
     Synchronisiert zwei manuelle Felder → Workflow-Phase + Checkboxen.
 
     ── Quelle 1: Status-Farbe ──────────────────────────────────────────────
       🔴 Rot  → Phase: '❌ Nicht relevant', Neu eingelangt: False,
-                Relevanz geprüft: True, Archiviert: True
+                Relevanz geprüft?: True, Archiviert: True
       🟡 Gelb → Phase: '🔎 In Prüfung',   Neu eingelangt: False
       🟢 Grün → Phase: '✅ Gekauft',       Neu eingelangt: False
 
     ── Quelle 2: 'Für uns relevant?' (Select) ──────────────────────────────
       Ja         → Phase: '✅ Relevant – Brief vorbereiten',
-                   Relevanz geprüft: True, Neu eingelangt: False
+                   Relevanz geprüft?: True, Neu eingelangt: False
       Nein       → Phase: '❌ Nicht relevant', Status: 🔴 Rot,
-                   Relevanz geprüft: True, Neu eingelangt: False, Archiviert: True
+                   Relevanz geprüft?: True, Neu eingelangt: False, Archiviert: True
       Beobachten → Phase: '🔎 In Prüfung',
-                   Relevanz geprüft: True, Neu eingelangt: False
+                   Relevanz geprüft?: True, Neu eingelangt: False
 
-    Einträge werden nur angefasst wenn eine Änderung nötig ist.
+    all_pages: vorgeladene Pages (von notion_load_all_pages). Falls None,
+               wird ein eigener Scan durchgeführt.
     Gibt die Anzahl aktualisierter Einträge zurück.
     """
 
@@ -2032,29 +2043,11 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
 
     print("\n[Status-Sync] 🔄 Prüfe Status + Relevanz → Phase …")
 
+    pages = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
     to_update: list[dict] = []
-    has_more     = True
-    start_cursor = None
 
-    while has_more:
-        kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
-            "page_size": 100,
-        }
-        if start_cursor:
-            kwargs["start_cursor"] = start_cursor
-
-        try:
-            resp = notion.search(**kwargs)
-        except Exception as exc:
-            print(f"  [Status-Sync] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
-            break
-
-        for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-
+    for page in pages:
+        if True:  # Einrückung beibehalten
             props     = page.get("properties", {})
             status    = (props.get("Status", {}).get("select") or {}).get("name", "")
             relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
@@ -2104,9 +2097,6 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
                 "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={update_props.get('Workflow-Phase', {}).get('select', {}).get('name', phase_ist)}",
             })
 
-        has_more     = resp.get("has_more", False)
-        start_cursor = resp.get("next_cursor")
-
     print(f"  [Status-Sync] 📋 {len(to_update)} Einträge werden synchronisiert")
 
     updated = 0
@@ -2127,7 +2117,8 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
 # SCHRITT 1: QUALITÄTS-CHECK – alle analysierten Einträge auf Vollständigkeit
 # =============================================================================
 
-def notion_qualitaetscheck(notion: Client, db_id: str) -> int:
+def notion_qualitaetscheck(notion: Client, db_id: str,
+                           all_pages: list[dict] | None = None) -> int:
     """
     Geht alle Einträge durch die bereits als 'Gutachten analysiert?' = True
     markiert sind, aber eines oder mehrere dieser Felder LEER haben:
@@ -2148,36 +2139,19 @@ def notion_qualitaetscheck(notion: Client, db_id: str) -> int:
         "❌ Nicht relevant",
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
+        "📊 Gutachten analysiert",
         "✅ Gekauft",
         "🗄 Archiviert",
     }
 
     print("\n[Qualitäts-Check] 🔍 Prüfe alle analysierten Einträge auf Vollständigkeit …")
 
+    pages = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
     to_reset: list[str] = []
-    has_more     = True
-    start_cursor = None
     total_checked = 0
 
-    while has_more:
-        kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
-            "page_size": 100,
-        }
-        if start_cursor:
-            kwargs["start_cursor"] = start_cursor
-
-        try:
-            resp = notion.search(**kwargs)
-        except Exception as exc:
-            print(f"  [Qualitäts-Check] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
-            break
-
-        for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-
+    for page in pages:
+        if True:
             props = page.get("properties", {})
 
             # Nur analysierte Einträge
@@ -2229,9 +2203,6 @@ def notion_qualitaetscheck(notion: Client, db_id: str) -> int:
             # Zurücksetzen wenn Eigentümer UND Adresse fehlen (beide leer)
             if not eigentümer and not adresse:
                 to_reset.append(page["id"])
-
-        has_more     = resp.get("has_more", False)
-        start_cursor = resp.get("next_cursor")
 
     print(f"  [Qualitäts-Check] 📊 {total_checked} analysierte Einträge geprüft")
     print(f"  [Qualitäts-Check] 🔄 {len(to_reset)} unvollständige Einträge → werden neu analysiert")
@@ -2388,6 +2359,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
         "❌ Nicht relevant",
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
+        "📊 Gutachten analysiert",
         "✅ Gekauft",
         "🗄 Archiviert",
     }
@@ -2598,7 +2570,8 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
 # SCHRITT 3: TOTE URLs – HTTP 404 → automatisch archivieren
 # =============================================================================
 
-def notion_archiviere_tote_urls(notion: Client, db_id: str) -> tuple[int, list[str]]:
+def notion_archiviere_tote_urls(notion: Client, db_id: str,
+                                all_pages: list[dict] | None = None) -> tuple[int, list[str]]:
     """
     Prüft ALLE Einträge (außer bereits archivierte) auf HTTP 404.
 
@@ -2623,29 +2596,11 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str) -> tuple[int, list[s
 
     print("\n[Tote-URLs] 🔗 Prüfe URLs auf 404 …")
 
+    pages = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
     to_check: list[dict] = []
-    has_more     = True
-    start_cursor = None
 
-    while has_more:
-        kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
-            "page_size": 100,
-        }
-        if start_cursor:
-            kwargs["start_cursor"] = start_cursor
-
-        try:
-            resp = notion.search(**kwargs)
-        except Exception as exc:
-            print(f"  [Tote-URLs] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
-            break
-
-        for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-
+    for page in pages:
+        if True:
             props = page.get("properties", {})
 
             # Bereits archivierte überspringen
@@ -2675,9 +2630,6 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str) -> tuple[int, list[s
                 "status":   status_val,
                 "titel":    titel,
             })
-
-        has_more     = resp.get("has_more", False)
-        start_cursor = resp.get("next_cursor")
 
     MAX_CHECK = 50   # max 50 URL-Checks pro Run (schont das Netz)
     if len(to_check) > MAX_CHECK:
@@ -2768,6 +2720,341 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str) -> tuple[int, list[s
 
     print(f"[Tote-URLs] ✅ {archived} tote URLs archiviert")
     return archived, alarm_lines
+
+
+# =============================================================================
+# BRIEF-WORKFLOW – Brief erstellen für relevante Einträge
+# =============================================================================
+#
+# Ablauf:
+#   1. Suche alle Einträge mit Phase "✅ Relevant – Brief vorbereiten"
+#      bei denen "Brief erstellt am" noch LEER ist.
+#   2. Bestimme zuständige Person anhand des Bundeslandes.
+#   3. Befülle DOCX-Vorlage (brief_vorlage.docx) mit Platzhaltern.
+#   4. Konvertiere DOCX → PDF (via reportlab/python-docx).
+#   5. Lade PDF als GitHub-Artifact hoch ODER schreibe Pfad in Notizen.
+#   6. Setze "Brief erstellt am" in Notion (heutiges Datum).
+#   7. Sende Telegram-Nachricht mit Zusammenfassung.
+#
+# Kontaktdaten der Zuständigen:
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │ Bundesland        │ Name         │ Tel          │ E-Mail        │
+#   ├───────────────────┼──────────────┼──────────────┼───────────────┤
+#   │ Wien, Steiermark  │ Benjamin     │ PLACEHOLDER  │ PLACEHOLDER   │
+#   │ NÖ, Burgenland    │ Christopher  │ PLACEHOLDER  │ PLACEHOLDER   │
+#   │ Kärnten, Sbg, OÖ │ Du (Alex)    │ PLACEHOLDER  │ PLACEHOLDER   │
+#   │ Tirol, Vorarlberg │ (noch offen) │ –            │ –             │
+#   └─────────────────────────────────────────────────────────────────┘
+#
+# WICHTIG: Kontaktdaten unten in KONTAKT_DATEN eintragen!
+# =============================================================================
+
+# ── Kontaktdaten (bitte ausfüllen!) ──────────────────────────────────────────
+KONTAKT_DATEN: dict[str, dict] = {
+    # Schlüssel = Bundesland-Name (exakt wie in Notion)
+    "Wien":         {"name": "Benjamin Muster",    "strasse": "Musterstraße 1",   "plz_ort": "1010 Wien",        "tel": "+43 1 234 5678",  "email": "benjamin@immo-in-not.at"},
+    "Steiermark":   {"name": "Benjamin Muster",    "strasse": "Musterstraße 1",   "plz_ort": "1010 Wien",        "tel": "+43 1 234 5678",  "email": "benjamin@immo-in-not.at"},
+    "Niederösterreich": {"name": "Christopher Muster", "strasse": "Hauptgasse 5", "plz_ort": "3100 St. Pölten",  "tel": "+43 2742 123456", "email": "christopher@immo-in-not.at"},
+    "Burgenland":   {"name": "Christopher Muster", "strasse": "Hauptgasse 5",     "plz_ort": "3100 St. Pölten",  "tel": "+43 2742 123456", "email": "christopher@immo-in-not.at"},
+    "Kärnten":      {"name": "Ihr Name",            "strasse": "Ihre Straße",      "plz_ort": "9020 Klagenfurt",  "tel": "+43 463 123456",  "email": "info@immo-in-not.at"},
+    "Salzburg":     {"name": "Ihr Name",            "strasse": "Ihre Straße",      "plz_ort": "9020 Klagenfurt",  "tel": "+43 463 123456",  "email": "info@immo-in-not.at"},
+    "Oberösterreich": {"name": "Ihr Name",          "strasse": "Ihre Straße",      "plz_ort": "9020 Klagenfurt",  "tel": "+43 463 123456",  "email": "info@immo-in-not.at"},
+    # Tirol / Vorarlberg: noch kein Ansprechpartner → Brief wird nicht erstellt
+}
+
+BRIEF_VORLAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brief_vorlage.docx")
+
+# Prüfe ob python-docx verfügbar ist
+try:
+    from docx import Document as _DocxDocument
+    from docx.shared import Pt as _DocxPt
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+
+def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> bytes:
+    """
+    Lädt die DOCX-Vorlage, ersetzt alle {{PLATZHALTER}} und gibt den DOCX-
+    Inhalt als Bytes zurück (für Notion-Upload oder lokales Speichern).
+    """
+    from docx import Document
+    from io import BytesIO
+
+    doc = Document(vorlage_path)
+
+    def replace_in_paragraph(para):
+        """Ersetzt Platzhalter in einem Paragraphen (auch über mehrere Runs)."""
+        # Erst den Gesamttext prüfen
+        full_text = "".join(r.text for r in para.runs)
+        new_text = full_text
+        for key, val in platzhalter.items():
+            new_text = new_text.replace(f"{{{{{key}}}}}", val)
+        if new_text != full_text:
+            # Alles in den ersten Run schreiben, Rest leeren
+            if para.runs:
+                para.runs[0].text = new_text
+                for r in para.runs[1:]:
+                    r.text = ""
+
+    for para in doc.paragraphs:
+        replace_in_paragraph(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    replace_in_paragraph(para)
+
+    buf = BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _brief_docx_to_pdf_bytes(docx_bytes: bytes) -> bytes | None:
+    """
+    Konvertiert DOCX-Bytes zu PDF-Bytes.
+    Versucht es mit LibreOffice (wenn vorhanden), sonst Fallback auf
+    reportlab (einfaches Text-PDF).
+    """
+    import subprocess
+    import tempfile
+    import os
+
+    # Variante A: LibreOffice (qualitativ beste Lösung)
+    lo_paths = [
+        "libreoffice", "soffice",
+        "/usr/bin/libreoffice", "/usr/bin/soffice",
+        "/usr/lib/libreoffice/program/soffice",
+    ]
+    for lo in lo_paths:
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                docx_path = os.path.join(tmpdir, "brief.docx")
+                pdf_path  = os.path.join(tmpdir, "brief.pdf")
+                with open(docx_path, "wb") as f:
+                    f.write(docx_bytes)
+                result = subprocess.run(
+                    [lo, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, docx_path],
+                    capture_output=True, timeout=30
+                )
+                if result.returncode == 0 and os.path.exists(pdf_path):
+                    with open(pdf_path, "rb") as f:
+                        return f.read()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+    # Variante B: reportlab (einfaches PDF mit dem Brieftext)
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.lib.styles import ParagraphStyle
+        from io import BytesIO
+
+        # DOCX-Text extrahieren
+        from docx import Document
+        from io import BytesIO as BytesIO2
+        doc = Document(BytesIO2(docx_bytes))
+        text_lines = [para.text for para in doc.paragraphs]
+
+        buf = BytesIO()
+        pdf = SimpleDocTemplate(buf, pagesize=A4,
+                                leftMargin=2.5*cm, rightMargin=2*cm,
+                                topMargin=2.5*cm, bottomMargin=2*cm)
+        styles = getSampleStyleSheet()
+        story = []
+        for line in text_lines:
+            if line.strip():
+                story.append(Paragraph(line, styles["Normal"]))
+            else:
+                story.append(Spacer(1, 0.3*cm))
+        pdf.build(story)
+        return buf.getvalue()
+    except Exception as e:
+        print(f"  [Brief] ⚠️  PDF-Konvertierung fehlgeschlagen: {e}")
+        return None
+
+
+def _brief_upload_to_notion(notion: "Client", page_id: str,
+                             pdf_bytes: bytes, dateiname: str) -> str | None:
+    """
+    Hängt die PDF als Block-Link an die Notion-Seite an.
+    Da Notion keinen direkten Datei-Upload über die API erlaubt,
+    wird der PDF-Inhalt als Base64 in einem Code-Block gespeichert
+    ODER als externer Link (falls ein Upload-Dienst konfiguriert ist).
+
+    Rückgabe: Kurz-Beschreibung für Notizen ("Brief als PDF gespeichert")
+    """
+    # Notion erlaubt keinen direkten Binär-Upload via API.
+    # Strategie: PDF im Workflow als GitHub-Artifact speichern +
+    #            Dateiname in den Notizen vermerken.
+    # → Hier nur den Dateinamen zurückgeben; das Artifact-Speichern
+    #   geschieht im GitHub-Workflow (upload-artifact Step).
+    return dateiname
+
+
+def notion_brief_erstellen(notion: "Client", db_id: str,
+                            all_pages: list[dict] | None = None) -> tuple[int, list[str]]:
+    """
+    Erstellt Briefe für alle Einträge mit Phase '✅ Relevant – Brief vorbereiten'
+    bei denen 'Brief erstellt am' noch leer ist.
+
+    Ablauf je Eintrag:
+      1. Lese Eigentümer, Adresse, PLZ/Ort, Bundesland aus Notion.
+      2. Bestimme zuständige Person aus KONTAKT_DATEN.
+      3. Befülle DOCX-Vorlage.
+      4. Erzeuge PDF (LibreOffice → reportlab Fallback).
+      5. Speichere PDF-Datei lokal (wird als GitHub-Artifact hochgeladen).
+      6. Setze 'Brief erstellt am' in Notion.
+      7. Füge Notiz "Brief erstellt am DD.MM.YYYY (Datei: ...)" hinzu.
+
+    Gibt (Anzahl erstellter Briefe, Liste der Telegram-Zeilen) zurück.
+    """
+    if not DOCX_AVAILABLE:
+        print("[Brief] ⚠️  python-docx nicht installiert – überspringe Brief-Erstellung")
+        return 0, []
+
+    if not os.path.exists(BRIEF_VORLAGE_PATH):
+        print(f"[Brief] ⚠️  Vorlage nicht gefunden: {BRIEF_VORLAGE_PATH} – überspringe")
+        return 0, []
+
+    ZIEL_PHASE = "✅ Relevant – Brief vorbereiten"
+
+    print("\n[Brief] 📝 Suche nach Einträgen für Brief-Erstellung …")
+
+    pages = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
+
+    to_process: list[dict] = []
+    for page in pages:
+        props = page.get("properties", {})
+        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        if phase != ZIEL_PHASE:
+            continue
+
+        # Überspringe wenn Brief bereits erstellt
+        brief_datum = props.get("Brief erstellt am", {}).get("date")
+        if brief_datum and brief_datum.get("start"):
+            continue
+
+        to_process.append(page)
+
+    print(f"[Brief] 📋 {len(to_process)} Einträge für Brief-Erstellung gefunden")
+    if not to_process:
+        return 0, []
+
+    erstellt = 0
+    telegram_lines: list[str] = []
+    from datetime import date
+
+    # Ausgabe-Verzeichnis für PDFs (wird als GitHub-Artifact hochgeladen)
+    pdf_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefe")
+    os.makedirs(pdf_output_dir, exist_ok=True)
+
+    for page in to_process:
+        page_id = page["id"]
+        props   = page.get("properties", {})
+
+        # ── Daten aus Notion lesen ────────────────────────────────────────────
+        titel_list  = props.get("Name", {}).get("title", [])
+        titel       = "".join(t.get("plain_text", "") for t in titel_list).strip()
+
+        eigentuemer_list = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+        eigentuemer      = "".join(t.get("plain_text", "") for t in eigentuemer_list).strip()
+
+        adresse_list = props.get("Zustell Adresse", {}).get("rich_text", [])
+        adresse      = "".join(t.get("plain_text", "") for t in adresse_list).strip()
+
+        plz_ort_list = props.get("Zustell PLZ/Ort", {}).get("rich_text", [])
+        plz_ort      = "".join(t.get("plain_text", "") for t in plz_ort_list).strip()
+
+        bundesland = (props.get("Bundesland", {}).get("select") or {}).get("name", "")
+
+        notizen_list = props.get("Notizen", {}).get("rich_text", [])
+        notizen_alt  = "".join(t.get("plain_text", "") for t in notizen_list).strip()
+
+        # ── Pflichtfelder prüfen ──────────────────────────────────────────────
+        if not eigentuemer:
+            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – kein Eigentümer")
+            continue
+        if not adresse or not plz_ort:
+            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – keine Zustelladresse")
+            continue
+        if not bundesland or bundesland not in KONTAKT_DATEN:
+            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – kein Kontakt für Bundesland '{bundesland}'")
+            continue
+
+        kontakt = KONTAKT_DATEN[bundesland]
+        heute   = date.today()
+        datum_str = heute.strftime("%d.%m.%Y")
+
+        # ── Platzhalter befüllen ──────────────────────────────────────────────
+        platzhalter = {
+            "EIGENTUEMER_NAME":    eigentuemer,
+            "ZUSTELL_ADRESSE":     adresse,
+            "ZUSTELL_PLZ_ORT":     plz_ort,
+            "LIEGENSCHAFT_ADRESSE": titel,
+            "DATUM":               datum_str,
+            "KONTAKT_NAME":        kontakt["name"],
+            "KONTAKT_STRASSE":     kontakt["strasse"],
+            "KONTAKT_PLZ_ORT":     kontakt["plz_ort"],
+            "KONTAKT_TEL":         kontakt["tel"],
+            "KONTAKT_EMAIL":       kontakt["email"],
+        }
+
+        try:
+            # ── DOCX befüllen ─────────────────────────────────────────────────
+            docx_bytes = _brief_fill_template(BRIEF_VORLAGE_PATH, platzhalter)
+
+            # ── PDF erzeugen ──────────────────────────────────────────────────
+            pdf_bytes = _brief_docx_to_pdf_bytes(docx_bytes)
+
+            # ── Dateien speichern ─────────────────────────────────────────────
+            safe_titel = re.sub(r'[^\w\s-]', '', titel)[:50].strip().replace(' ', '_')
+            dateiname_base = f"Brief_{datum_str.replace('.', '-')}_{safe_titel}"
+            docx_path = os.path.join(pdf_output_dir, dateiname_base + ".docx")
+            pdf_path  = os.path.join(pdf_output_dir, dateiname_base + ".pdf")
+
+            with open(docx_path, "wb") as f:
+                f.write(docx_bytes)
+            print(f"  [Brief] 💾 DOCX gespeichert: {os.path.basename(docx_path)}")
+
+            if pdf_bytes:
+                with open(pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
+                print(f"  [Brief] 💾 PDF  gespeichert: {os.path.basename(pdf_path)}")
+                datei_info = f"Brief erstellt am {datum_str} (PDF: {os.path.basename(pdf_path)})"
+            else:
+                datei_info = f"Brief erstellt am {datum_str} (DOCX: {os.path.basename(docx_path)}, kein PDF)"
+
+            # ── Notion aktualisieren ──────────────────────────────────────────
+            neue_notiz = notizen_alt
+            if neue_notiz and not neue_notiz.endswith("\n"):
+                neue_notiz += "\n"
+            neue_notiz += datei_info
+            neue_notiz = neue_notiz[:2000]
+
+            notion.pages.update(
+                page_id=page_id,
+                properties={
+                    "Brief erstellt am": {"date": {"start": heute.isoformat()}},
+                    "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
+                }
+            )
+            print(f"  [Brief] ✅ Brief-Datum gesetzt für: {titel[:60]}")
+
+            telegram_lines.append(
+                f"• {html_escape(eigentuemer)} | {html_escape(bundesland)} "
+                f"→ {kontakt['name']} | {html_escape(titel[:40])}"
+            )
+            erstellt += 1
+            time.sleep(0.3)
+
+        except Exception as exc:
+            print(f"  [Brief] ❌ Fehler bei {titel[:50]}: {exc}")
+
+    print(f"[Brief] ✅ {erstellt} Brief(e) erstellt")
+    return erstellt, telegram_lines
 
 
 # =============================================================================
@@ -2935,11 +3222,21 @@ async def main() -> None:
         fehler.append(msg)
         enriched_count = 0
 
-    # ── 3a. Status-Sync: Status-Farbe → Phase + Checkboxen ───────────────────
-    # Wenn ein Kollege manuell 🔴/🟡/🟢 setzt, werden Phase und Checkboxen
-    # automatisch angepasst (kein manuelles Ankreuzen nötig).
+    # ── 3. Einmaliges Laden aller Notion-Pages ────────────────────────────────
+    # Die folgenden 4 Schritte (Status-Sync, Bereinigung, Tote-URLs,
+    # Qualitäts-Check) würden sonst jeweils einen eigenen DB-Scan starten.
+    # Stattdessen laden wir die DB EINMALIG und geben das Ergebnis weiter.
     try:
-        notion_status_sync(notion, db_id)
+        _all_pages = notion_load_all_pages(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Konnte Pages nicht vorladen – Fallback auf Einzel-Scans: {exc}")
+        _all_pages = None   # jede Funktion macht dann selbst einen Scan
+
+    # ── 3a. Status-Sync: Status-Farbe / Für-uns-relevant? → Phase + Checkboxen ─
+    # Wenn ein Kollege manuell 🔴/🟡/🟢 setzt oder "Für uns relevant?" befüllt,
+    # werden Phase und Checkboxen automatisch angepasst (kein manuelles Ankreuzen nötig).
+    try:
+        notion_status_sync(notion, db_id, all_pages=_all_pages)
     except Exception as exc:
         print(f"  [WARN] Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
 
@@ -2949,7 +3246,7 @@ async def main() -> None:
     # erkannt, das Feld geleert und 'Gutachten analysiert?' zurückgesetzt,
     # damit der nächste Schritt (4) sie neu verarbeitet.
     try:
-        notion_reset_falsche_verpflichtende(notion, db_id)
+        notion_reset_falsche_verpflichtende(notion, db_id, all_pages=_all_pages)
     except Exception as exc:
         print(f"  [WARN] Bereinigung fehlgeschlagen (nicht kritisch): {exc}")
 
@@ -2957,7 +3254,7 @@ async def main() -> None:
     tote_urls_archiviert = 0
     tote_urls_alarme: list[str] = []
     try:
-        tote_urls_archiviert, tote_urls_alarme = notion_archiviere_tote_urls(notion, db_id)
+        tote_urls_archiviert, tote_urls_alarme = notion_archiviere_tote_urls(notion, db_id, all_pages=_all_pages)
     except Exception as exc:
         print(f"  [WARN] Tote-URLs-Check fehlgeschlagen (nicht kritisch): {exc}")
 
@@ -2965,9 +3262,19 @@ async def main() -> None:
     # Einträge die als 'analysiert' markiert sind, aber keinen Eigentümer/Adresse
     # haben, werden zurückgesetzt damit Schritt 4 sie neu analysiert.
     try:
-        notion_qualitaetscheck(notion, db_id)
+        notion_qualitaetscheck(notion, db_id, all_pages=_all_pages)
     except Exception as exc:
         print(f"  [WARN] Qualitäts-Check fehlgeschlagen (nicht kritisch): {exc}")
+
+    # ── 3e. Brief-Erstellung: relevant markierte Einträge → Brief erstellen ──────────────
+    # Betrifft: Einträge mit Phase '✅ Relevant – Brief vorbereiten'
+    # bei denen 'Brief erstellt am' noch leer ist.
+    brief_erstellt = 0
+    brief_telegram: list[str] = []
+    try:
+        brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_all_pages)
+    except Exception as exc:
+        print(f"  [WARN] Brief-Erstellung fehlgeschlagen (nicht kritisch): {exc}")
 
     # ── 4. Gutachten-Anreicherung: Text-PDFs (LLM) ───────────────────────────
     # Betrifft: Einträge die eine URL haben aber noch nicht analysiert wurden.
@@ -2997,12 +3304,14 @@ async def main() -> None:
     print(f"🗑  Tote URLs archiviert:  {tote_urls_archiviert}")
     print(f"📄 Gutachten analysiert:  {gutachten_enriched}")
     print(f"🔭 Vision analysiert:     {vision_enriched}")
+    print(f"✉️  Briefe erstellt:      {brief_erstellt}")
     print(f"⚠️  Fehler:                {len(fehler)}")
     print("=" * 60)
 
     if not neue_eintraege and not entfall_updates and not fehler \
             and not gutachten_enriched and not vision_enriched \
-            and not tote_urls_archiviert and not tote_urls_alarme:
+            and not tote_urls_archiviert and not tote_urls_alarme \
+            and not brief_erstellt:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
@@ -3046,6 +3355,12 @@ async def main() -> None:
         lines.append("<b>🚨 Achtung – Edikt verschwunden (manuelle Prüfung!):</b>")
         for alarm in tote_urls_alarme:
             lines.append(f"• {alarm}")
+        lines.append("")
+
+    if brief_erstellt:
+        lines.append(f"<b>✉️ Briefe erstellt: {brief_erstellt}</b>")
+        for bl in brief_telegram[:10]:
+            lines.append(f"• {bl}")
         lines.append("")
 
     if gutachten_enriched:
