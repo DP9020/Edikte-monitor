@@ -2749,17 +2749,22 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
 # WICHTIG: Kontaktdaten unten in KONTAKT_DATEN eintragen!
 # =============================================================================
 
-# ── Kontaktdaten (bitte ausfüllen!) ──────────────────────────────────────────
+# ── Kontaktdaten der Betreuer (Bundesland → Ansprechpartner) ─────────────────
+#
+# Benjamin Pippan  → Wien, Steiermark
+# Friedrich Prause → Kärnten, Salzburg, Oberösterreich
+# Christopher Dovjak → Niederösterreich, Burgenland
+# Tirol / Vorarlberg: noch kein Ansprechpartner
+#
 KONTAKT_DATEN: dict[str, dict] = {
-    # Schlüssel = Bundesland-Name (exakt wie in Notion)
-    "Wien":         {"name": "Benjamin Muster",    "strasse": "Musterstraße 1",   "plz_ort": "1010 Wien",        "tel": "+43 1 234 5678",  "email": "benjamin@immo-in-not.at"},
-    "Steiermark":   {"name": "Benjamin Muster",    "strasse": "Musterstraße 1",   "plz_ort": "1010 Wien",        "tel": "+43 1 234 5678",  "email": "benjamin@immo-in-not.at"},
-    "Niederösterreich": {"name": "Christopher Muster", "strasse": "Hauptgasse 5", "plz_ort": "3100 St. Pölten",  "tel": "+43 2742 123456", "email": "christopher@immo-in-not.at"},
-    "Burgenland":   {"name": "Christopher Muster", "strasse": "Hauptgasse 5",     "plz_ort": "3100 St. Pölten",  "tel": "+43 2742 123456", "email": "christopher@immo-in-not.at"},
-    "Kärnten":      {"name": "Ihr Name",            "strasse": "Ihre Straße",      "plz_ort": "9020 Klagenfurt",  "tel": "+43 463 123456",  "email": "info@immo-in-not.at"},
-    "Salzburg":     {"name": "Ihr Name",            "strasse": "Ihre Straße",      "plz_ort": "9020 Klagenfurt",  "tel": "+43 463 123456",  "email": "info@immo-in-not.at"},
-    "Oberösterreich": {"name": "Ihr Name",          "strasse": "Ihre Straße",      "plz_ort": "9020 Klagenfurt",  "tel": "+43 463 123456",  "email": "info@immo-in-not.at"},
-    # Tirol / Vorarlberg: noch kein Ansprechpartner → Brief wird nicht erstellt
+    "Wien":         {"name": "Benjamin Pippan",    "tel": "+43699 133 90 251", "email": "office@benana.at"},
+    "Steiermark":   {"name": "Benjamin Pippan",    "tel": "+43699 133 90 251", "email": "office@benana.at"},
+    "Niederösterreich": {"name": "Christopher Dovjak", "tel": "+43 664 4531399", "email": "christopher.dovjak@dp-im.at"},
+    "Burgenland":   {"name": "Christopher Dovjak", "tel": "+43 664 4531399",   "email": "christopher.dovjak@dp-im.at"},
+    "Kärnten":      {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    "Salzburg":     {"name": "Friedrich Prause",   "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    "Oberösterreich": {"name": "Friedrich Prause", "tel": "+43 664 1843888",   "email": "friedrich.prause@dp-im.at"},
+    # Tirol / Vorarlberg: noch offen → Brief wird nicht automatisch erstellt
 }
 
 BRIEF_VORLAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brief_vorlage.docx")
@@ -2776,26 +2781,45 @@ except ImportError:
 def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> bytes:
     """
     Lädt die DOCX-Vorlage, ersetzt alle {{PLATZHALTER}} und gibt den DOCX-
-    Inhalt als Bytes zurück (für Notion-Upload oder lokales Speichern).
+    Inhalt als Bytes zurück.
+
+    Unterstützt sowohl normale Runs als auch Hyperlink-Paragraphen
+    (bei denen der Text in w:hyperlink/w:r/w:t steckt und .runs leer ist).
     """
     from docx import Document
     from io import BytesIO
 
     doc = Document(vorlage_path)
+    W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
     def replace_in_paragraph(para):
-        """Ersetzt Platzhalter in einem Paragraphen (auch über mehrere Runs)."""
-        # Erst den Gesamttext prüfen
-        full_text = "".join(r.text for r in para.runs)
+        """Ersetzt Platzhalter in einem Paragraphen (Runs + Hyperlinks)."""
+        # --- Variante 1: normale Runs ---
+        if para.runs:
+            full_text = "".join(r.text for r in para.runs)
+            new_text = full_text
+            for key, val in platzhalter.items():
+                new_text = new_text.replace(f"{{{{{key}}}}}", val)
+            if new_text != full_text:
+                para.runs[0].text = new_text
+                for r in para.runs[1:]:
+                    r.text = ""
+            return
+
+        # --- Variante 2: Hyperlink-Struktur (keine Runs) ---
+        t_elements = para._element.findall(f".//{{{W_NS}}}t")
+        if not t_elements:
+            return
+        # Gesamttext aus allen w:t zusammensetzen
+        full_text = "".join((t.text or "") for t in t_elements)
         new_text = full_text
         for key, val in platzhalter.items():
             new_text = new_text.replace(f"{{{{{key}}}}}", val)
         if new_text != full_text:
-            # Alles in den ersten Run schreiben, Rest leeren
-            if para.runs:
-                para.runs[0].text = new_text
-                for r in para.runs[1:]:
-                    r.text = ""
+            # Ersten w:t mit neuem Text füllen, Rest leeren
+            t_elements[0].text = new_text
+            for t in t_elements[1:]:
+                t.text = ""
 
     for para in doc.paragraphs:
         replace_in_paragraph(para)
@@ -2810,88 +2834,97 @@ def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> byte
     return buf.getvalue()
 
 
-def _brief_docx_to_pdf_bytes(docx_bytes: bytes) -> bytes | None:
+def _brief_anrede(eigentuemer: str) -> str:
     """
-    Konvertiert DOCX-Bytes zu PDF-Bytes.
-    Versucht es mit LibreOffice (wenn vorhanden), sonst Fallback auf
-    reportlab (einfaches Text-PDF).
+    Erzeugt eine geschlechtsspezifische Anrede aus dem Eigentümernamen.
+    Heuristik:
+      - Enthält "Hr." / "Herr" → männlich
+      - Enthält "Fr." / "Frau" → weiblich
+      - Enthält bekannte weibliche Titel-Präfixe → weiblich
+      - Sonst → neutral "Sehr geehrte Damen und Herren,"
     """
-    import subprocess
-    import tempfile
-    import os
+    name = eigentuemer.strip()
+    # Direkte Anrede-Teile bestimmen
+    lower = name.lower()
+    if any(t in lower for t in ("herr", " hr.", "hr ")):
+        return f"Sehr geehrter Hr. {name},"
+    elif any(t in lower for t in ("frau", " fr.", "fr ")):
+        return f"Sehr geehrte Fr. {name},"
+    else:
+        return f"Sehr geehrte Damen und Herren,"
 
-    # Variante A: LibreOffice (qualitativ beste Lösung)
-    lo_paths = [
-        "libreoffice", "soffice",
-        "/usr/bin/libreoffice", "/usr/bin/soffice",
-        "/usr/lib/libreoffice/program/soffice",
-    ]
-    for lo in lo_paths:
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                docx_path = os.path.join(tmpdir, "brief.docx")
-                pdf_path  = os.path.join(tmpdir, "brief.pdf")
-                with open(docx_path, "wb") as f:
-                    f.write(docx_bytes)
-                result = subprocess.run(
-                    [lo, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, docx_path],
-                    capture_output=True, timeout=30
-                )
-                if result.returncode == 0 and os.path.exists(pdf_path):
-                    with open(pdf_path, "rb") as f:
-                        return f.read()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
 
-    # Variante B: reportlab (einfaches PDF mit dem Brieftext)
+def _brief_send_email(kontakt_email: str, kontakt_name: str,
+                      eigentuemer: str, titel: str,
+                      docx_bytes: bytes, dateiname_docx: str) -> bool:
+    """
+    Sendet den Brief als DOCX-Anhang per E-Mail an den zuständigen Betreuer.
+
+    Verwendet SMTP-Konfiguration aus Umgebungsvariablen:
+      SMTP_HOST      (default: smtp.gmail.com)
+      SMTP_PORT      (default: 587)
+      SMTP_USER      (Absender-Adresse)
+      SMTP_PASSWORD  (App-Passwort oder normales Passwort)
+      SMTP_FROM      (optional, default = SMTP_USER)
+
+    Gibt True bei Erfolg, False bei Fehler zurück.
+    """
+    import smtplib
+    import ssl
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.text import MIMEText
+    from email import encoders
+
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pw   = os.environ.get("SMTP_PASSWORD", "")
+    smtp_from = os.environ.get("SMTP_FROM", smtp_user)
+
+    if not smtp_user or not smtp_pw:
+        print(f"  [Brief] ℹ️  SMTP nicht konfiguriert (SMTP_USER/SMTP_PASSWORD fehlt) – nur lokal gespeichert")
+        return False
+
     try:
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.lib.units import cm
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-        from reportlab.lib.styles import ParagraphStyle
-        from io import BytesIO
+        msg = MIMEMultipart()
+        msg["From"]    = smtp_from
+        msg["To"]      = kontakt_email
+        msg["Subject"] = f"Neuer Brief: {titel[:80]}"
 
-        # DOCX-Text extrahieren
-        from docx import Document
-        from io import BytesIO as BytesIO2
-        doc = Document(BytesIO2(docx_bytes))
-        text_lines = [para.text for para in doc.paragraphs]
+        body = "\n".join([
+            f"Hallo {kontakt_name},",
+            "",
+            "anbei der Anschreiben-Entwurf für:",
+            f"  Eigentümer:   {eigentuemer}",
+            f"  Liegenschaft: {titel}",
+            "",
+            "Bitte ausdrucken und versenden.",
+            "",
+            "Automatisch erstellt vom Edikte-Monitor.",
+        ])
+        msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        buf = BytesIO()
-        pdf = SimpleDocTemplate(buf, pagesize=A4,
-                                leftMargin=2.5*cm, rightMargin=2*cm,
-                                topMargin=2.5*cm, bottomMargin=2*cm)
-        styles = getSampleStyleSheet()
-        story = []
-        for line in text_lines:
-            if line.strip():
-                story.append(Paragraph(line, styles["Normal"]))
-            else:
-                story.append(Spacer(1, 0.3*cm))
-        pdf.build(story)
-        return buf.getvalue()
-    except Exception as e:
-        print(f"  [Brief] ⚠️  PDF-Konvertierung fehlgeschlagen: {e}")
-        return None
+        # DOCX anhängen
+        part = MIMEBase("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
+        part.set_payload(docx_bytes)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{dateiname_docx}"')
+        msg.attach(part)
 
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.login(smtp_user, smtp_pw)
+            server.sendmail(smtp_from, kontakt_email, msg.as_bytes())
 
-def _brief_upload_to_notion(notion: "Client", page_id: str,
-                             pdf_bytes: bytes, dateiname: str) -> str | None:
-    """
-    Hängt die PDF als Block-Link an die Notion-Seite an.
-    Da Notion keinen direkten Datei-Upload über die API erlaubt,
-    wird der PDF-Inhalt als Base64 in einem Code-Block gespeichert
-    ODER als externer Link (falls ein Upload-Dienst konfiguriert ist).
+        print(f"  [Brief] ✉️  E-Mail gesendet an {kontakt_email}")
+        return True
 
-    Rückgabe: Kurz-Beschreibung für Notizen ("Brief als PDF gespeichert")
-    """
-    # Notion erlaubt keinen direkten Binär-Upload via API.
-    # Strategie: PDF im Workflow als GitHub-Artifact speichern +
-    #            Dateiname in den Notizen vermerken.
-    # → Hier nur den Dateinamen zurückgeben; das Artifact-Speichern
-    #   geschieht im GitHub-Workflow (upload-artifact Step).
-    return dateiname
+    except Exception as exc:
+        print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {exc}")
+        return False
 
 
 def notion_brief_erstellen(notion: "Client", db_id: str,
@@ -2903,11 +2936,12 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     Ablauf je Eintrag:
       1. Lese Eigentümer, Adresse, PLZ/Ort, Bundesland aus Notion.
       2. Bestimme zuständige Person aus KONTAKT_DATEN.
-      3. Befülle DOCX-Vorlage.
-      4. Erzeuge PDF (LibreOffice → reportlab Fallback).
-      5. Speichere PDF-Datei lokal (wird als GitHub-Artifact hochgeladen).
-      6. Setze 'Brief erstellt am' in Notion.
-      7. Füge Notiz "Brief erstellt am DD.MM.YYYY (Datei: ...)" hinzu.
+      3. Erzeuge Anrede (geschlechtsspezifisch).
+      4. Befülle DOCX-Vorlage (brief_vorlage.docx).
+      5. Sende DOCX per E-Mail an Betreuer (Option C).
+      6. Speichere DOCX lokal als GitHub-Artifact (Backup).
+      7. Setze 'Brief erstellt am' in Notion.
+      8. Füge Notiz "Brief erstellt am DD.MM.YYYY" hinzu.
 
     Gibt (Anzahl erstellter Briefe, Liste der Telegram-Zeilen) zurück.
     """
@@ -2931,12 +2965,10 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
         if phase != ZIEL_PHASE:
             continue
-
         # Überspringe wenn Brief bereits erstellt
         brief_datum = props.get("Brief erstellt am", {}).get("date")
         if brief_datum and brief_datum.get("start"):
             continue
-
         to_process.append(page)
 
     print(f"[Brief] 📋 {len(to_process)} Einträge für Brief-Erstellung gefunden")
@@ -2947,9 +2979,9 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     telegram_lines: list[str] = []
     from datetime import date
 
-    # Ausgabe-Verzeichnis für PDFs (wird als GitHub-Artifact hochgeladen)
-    pdf_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefe")
-    os.makedirs(pdf_output_dir, exist_ok=True)
+    # Ausgabe-Verzeichnis für DOCXs (wird als GitHub-Artifact hochgeladen)
+    brief_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefe")
+    os.makedirs(brief_output_dir, exist_ok=True)
 
     for page in to_process:
         page_id = page["id"]
@@ -2981,57 +3013,76 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             print(f"  [Brief] ⏭  Überspringe {titel[:50]} – keine Zustelladresse")
             continue
         if not bundesland or bundesland not in KONTAKT_DATEN:
-            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – kein Kontakt für Bundesland '{bundesland}'")
+            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – kein Kontakt für '{bundesland}'")
             continue
 
-        kontakt = KONTAKT_DATEN[bundesland]
-        heute   = date.today()
+        kontakt   = KONTAKT_DATEN[bundesland]
+        heute     = date.today()
         datum_str = heute.strftime("%d.%m.%Y")
+
+        # ── PLZ/Ort der Liegenschaft aus Titel extrahieren ────────────────────
+        # Titel-Format: "Musterstraße 1, 1010 Wien" oder nur Straße
+        # Falls PLZ/Ort erkennbar ist, splitten; sonst Bundesland als Fallback
+        liegenschaft_adresse = titel
+        liegenschaft_plz_ort = ""
+        titel_parts = titel.rsplit(",", 1)
+        if len(titel_parts) == 2 and re.match(r"\s*\d{4}", titel_parts[1]):
+            liegenschaft_adresse = titel_parts[0].strip()
+            liegenschaft_plz_ort = titel_parts[1].strip()
+        else:
+            # Versuche es mit dem gespeicherten PLZ-Feld
+            liegenschaft_plz_ort_list = props.get("PLZ/Ort", {}).get("rich_text", [])
+            liegenschaft_plz_ort = "".join(
+                t.get("plain_text", "") for t in liegenschaft_plz_ort_list
+            ).strip()
+
+        # ── Anrede ────────────────────────────────────────────────────────────
+        anrede = _brief_anrede(eigentuemer)
 
         # ── Platzhalter befüllen ──────────────────────────────────────────────
         platzhalter = {
-            "EIGENTUEMER_NAME":    eigentuemer,
-            "ZUSTELL_ADRESSE":     adresse,
-            "ZUSTELL_PLZ_ORT":     plz_ort,
-            "LIEGENSCHAFT_ADRESSE": titel,
-            "DATUM":               datum_str,
-            "KONTAKT_NAME":        kontakt["name"],
-            "KONTAKT_STRASSE":     kontakt["strasse"],
-            "KONTAKT_PLZ_ORT":     kontakt["plz_ort"],
-            "KONTAKT_TEL":         kontakt["tel"],
-            "KONTAKT_EMAIL":       kontakt["email"],
+            "EIGENTUEMER_NAME":     eigentuemer,
+            "ZUSTELL_ADRESSE":      adresse,
+            "ZUSTELL_PLZ_ORT":      plz_ort,
+            "DATUM":                f"Wien, am {datum_str}",
+            "LIEGENSCHAFT_ADRESSE": liegenschaft_adresse,
+            "LIEGENSCHAFT_PLZ_ORT": liegenschaft_plz_ort or plz_ort,
+            "ANREDE":               anrede,
+            "KONTAKT_NAME":         kontakt["name"],
+            "KONTAKT_TEL":          kontakt["tel"],
+            "KONTAKT_EMAIL":        kontakt["email"],
         }
 
         try:
             # ── DOCX befüllen ─────────────────────────────────────────────────
             docx_bytes = _brief_fill_template(BRIEF_VORLAGE_PATH, platzhalter)
 
-            # ── PDF erzeugen ──────────────────────────────────────────────────
-            pdf_bytes = _brief_docx_to_pdf_bytes(docx_bytes)
-
-            # ── Dateien speichern ─────────────────────────────────────────────
-            safe_titel = re.sub(r'[^\w\s-]', '', titel)[:50].strip().replace(' ', '_')
-            dateiname_base = f"Brief_{datum_str.replace('.', '-')}_{safe_titel}"
-            docx_path = os.path.join(pdf_output_dir, dateiname_base + ".docx")
-            pdf_path  = os.path.join(pdf_output_dir, dateiname_base + ".pdf")
+            # ── Dateiname ─────────────────────────────────────────────────────
+            safe_eigen = re.sub(r"[^\w\s-]", "", eigentuemer)[:40].strip().replace(" ", "_")
+            safe_datum = datum_str.replace(".", "-")
+            dateiname_docx = f"Brief_{safe_datum}_{safe_eigen}.docx"
+            docx_path = os.path.join(brief_output_dir, dateiname_docx)
 
             with open(docx_path, "wb") as f:
                 f.write(docx_bytes)
-            print(f"  [Brief] 💾 DOCX gespeichert: {os.path.basename(docx_path)}")
+            print(f"  [Brief] 💾 DOCX gespeichert: {dateiname_docx}")
 
-            if pdf_bytes:
-                with open(pdf_path, "wb") as f:
-                    f.write(pdf_bytes)
-                print(f"  [Brief] 💾 PDF  gespeichert: {os.path.basename(pdf_path)}")
-                datei_info = f"Brief erstellt am {datum_str} (PDF: {os.path.basename(pdf_path)})"
-            else:
-                datei_info = f"Brief erstellt am {datum_str} (DOCX: {os.path.basename(docx_path)}, kein PDF)"
+            # ── E-Mail an Betreuer (Option C) ─────────────────────────────────
+            email_ok = _brief_send_email(
+                kontakt_email   = kontakt["email"],
+                kontakt_name    = kontakt["name"],
+                eigentuemer     = eigentuemer,
+                titel           = titel,
+                docx_bytes      = docx_bytes,
+                dateiname_docx  = dateiname_docx,
+            )
 
-            # ── Notion aktualisieren ──────────────────────────────────────────
+            # ── Notion: Brief-Datum + Notiz setzen ────────────────────────────
+            email_info = f" (E-Mail an {kontakt['email']})" if email_ok else " (nur lokal gespeichert)"
             neue_notiz = notizen_alt
             if neue_notiz and not neue_notiz.endswith("\n"):
                 neue_notiz += "\n"
-            neue_notiz += datei_info
+            neue_notiz += f"Brief erstellt am {datum_str}{email_info}"
             neue_notiz = neue_notiz[:2000]
 
             notion.pages.update(
@@ -3041,11 +3092,13 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                     "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
                 }
             )
-            print(f"  [Brief] ✅ Brief-Datum gesetzt für: {titel[:60]}")
+            print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}")
 
+            # ── Telegram-Zeile ────────────────────────────────────────────────
+            icon = "✉️" if email_ok else "💾"
             telegram_lines.append(
-                f"• {html_escape(eigentuemer)} | {html_escape(bundesland)} "
-                f"→ {kontakt['name']} | {html_escape(titel[:40])}"
+                f"{icon} {html_escape(eigentuemer[:35])} | {html_escape(bundesland)} "
+                f"→ {html_escape(kontakt['name'])}"
             )
             erstellt += 1
             time.sleep(0.3)
@@ -3055,11 +3108,6 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
 
     print(f"[Brief] ✅ {erstellt} Brief(e) erstellt")
     return erstellt, telegram_lines
-
-
-# =============================================================================
-# SCRAPING – direkte HTTP-Requests (kein Browser nötig!)
-# =============================================================================
 
 def fetch_results_for_state(bundesland: str, bl_value: str) -> list[dict]:
     """

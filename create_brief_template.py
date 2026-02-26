@@ -1,163 +1,92 @@
 """
-Erstellt die Brief-Vorlage (brief_vorlage.docx) mit Platzhaltern.
-Nur einmalig ausführen – danach die Datei ins Repo committen.
+Erstellt brief_vorlage.docx aus dem Original-Brief (brief_vorlage_original.docx).
+Ersetzt die personenbezogenen Inhalte durch {{PLATZHALTER}}.
+
+Run: python3 create_brief_template.py
 """
+import re
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-import os
+from docx.shared import Pt
+from lxml import etree
 
-def set_font(run, name="Calibri", size=11, bold=False, color=None):
-    run.font.name = name
-    run.font.size = Pt(size)
-    run.font.bold = bold
-    if color:
-        run.font.color.rgb = RGBColor(*color)
+doc = Document("brief_vorlage_original.docx")
 
-def add_paragraph(doc, text="", alignment=WD_ALIGN_PARAGRAPH.LEFT, space_before=0, space_after=6):
-    p = doc.add_paragraph()
-    p.alignment = alignment
-    p.paragraph_format.space_before = Pt(space_before)
-    p.paragraph_format.space_after = Pt(space_after)
-    if text:
-        run = p.add_run(text)
-        set_font(run)
-    return p
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-doc = Document()
+def replace_runs_text(para, new_text, bold=None):
+    """Löscht alle Runs in einem Paragraphen, setzt einen neuen."""
+    # Erst prüfen ob es eine Hyperlink-Struktur ist (keine Runs, aber w:hyperlink)
+    ns = {"w": W}
+    hyperlinks = para._element.findall(".//w:hyperlink", ns)
+    
+    if not para.runs and hyperlinks:
+        # Hyperlink: alle w:t Elemente im Paragraphen ersetzen
+        for t_el in para._element.findall(".//w:t", ns):
+            t_el.text = new_text
+            new_text = ""  # Rest leeren
+        return
+    
+    if not para.runs:
+        run = para.add_run(new_text)
+        if bold is not None:
+            run.bold = bold
+        return
+    first = para.runs[0]
+    first.text = new_text
+    if bold is not None:
+        first.bold = bold
+    for run in para.runs[1:]:
+        run.text = ""
 
-# Seitenränder
-section = doc.sections[0]
-section.top_margin    = Cm(2.5)
-section.bottom_margin = Cm(2.0)
-section.left_margin   = Cm(2.5)
-section.right_margin  = Cm(2.0)
+# ── Empfänger (paras 2–4) ────────────────────────────────────────────────────
+replace_runs_text(doc.paragraphs[2], "{{EIGENTUEMER_NAME}}", bold=True)
+replace_runs_text(doc.paragraphs[3], "{{ZUSTELL_ADRESSE}}", bold=True)
+replace_runs_text(doc.paragraphs[4], "{{ZUSTELL_PLZ_ORT}}", bold=True)
 
-# ── Absender-Block (oben rechts) ──────────────────────────────────────────────
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("Immo-in-Not GmbH")
-set_font(run, bold=True, size=11)
+# ── Datum (para 7, rechtsbündig) ─────────────────────────────────────────────
+replace_runs_text(doc.paragraphs[7], "{{DATUM}}")
 
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("{{KONTAKT_NAME}}")
-set_font(run, size=11)
+# ── Betreff: Liegenschaftsadresse (paras 10–11) ──────────────────────────────
+replace_runs_text(doc.paragraphs[10], "{{LIEGENSCHAFT_ADRESSE}}", bold=True)
+replace_runs_text(doc.paragraphs[11], "{{LIEGENSCHAFT_PLZ_ORT}}", bold=True)
 
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("{{KONTAKT_STRASSE}}")
-set_font(run, size=11)
+# ── Anrede (para 12) ─────────────────────────────────────────────────────────
+replace_runs_text(doc.paragraphs[12], "{{ANREDE}}")
 
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("{{KONTAKT_PLZ_ORT}}")
-set_font(run, size=11)
+# ── Fließtext para 33: Telefonnummer tauschen ────────────────────────────────
+para33 = doc.paragraphs[33]
+full = "".join(r.text for r in para33.runs)
+new33 = re.sub(r'\+43\d[\d\s]+', "{{KONTAKT_TEL}}", full)
+replace_runs_text(para33, new33)
 
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("Tel: {{KONTAKT_TEL}}")
-set_font(run, size=11)
+# ── Signatur (paras 38–40) ───────────────────────────────────────────────────
+replace_runs_text(doc.paragraphs[38], "{{KONTAKT_NAME}}")
 
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(18)
-run = p.add_run("E-Mail: {{KONTAKT_EMAIL}}")
-set_font(run, size=11)
+# Para 39: Hyperlink – alle w:t Text-Elemente ersetzen
+replace_runs_text(doc.paragraphs[39], "{{KONTAKT_EMAIL}}")
 
-# ── Empfänger-Block ───────────────────────────────────────────────────────────
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("{{EIGENTUEMER_NAME}}")
-set_font(run, size=11)
+replace_runs_text(doc.paragraphs[40], "{{KONTAKT_TEL}}")
 
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("{{ZUSTELL_ADRESSE}}")
-set_font(run, size=11)
+# ── Speichern ─────────────────────────────────────────────────────────────────
+doc.save("brief_vorlage.docx")
+print("✅ brief_vorlage.docx erstellt")
 
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(18)
-run = p.add_run("{{ZUSTELL_PLZ_ORT}}")
-set_font(run, size=11)
+# ── Smoke-Test ────────────────────────────────────────────────────────────────
+from docx import Document as D
+d = D("brief_vorlage.docx")
+all_text = "\n".join(p.text for p in d.paragraphs)
 
-# ── Datum ─────────────────────────────────────────────────────────────────────
-p = doc.add_paragraph()
-p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-p.paragraph_format.space_after = Pt(18)
-run = p.add_run("{{DATUM}}")
-set_font(run, size=11)
+expected = [
+    "{{EIGENTUEMER_NAME}}", "{{ZUSTELL_ADRESSE}}", "{{ZUSTELL_PLZ_ORT}}",
+    "{{DATUM}}", "{{LIEGENSCHAFT_ADRESSE}}", "{{LIEGENSCHAFT_PLZ_ORT}}",
+    "{{ANREDE}}", "{{KONTAKT_TEL}}", "{{KONTAKT_NAME}}",
+]
+for ph in expected:
+    status = "✅" if ph in all_text else "❌ FEHLT!"
+    print(f"  {status} {ph}")
 
-# ── Betreff ───────────────────────────────────────────────────────────────────
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(12)
-run = p.add_run("Betreff: Ihre Liegenschaft – {{LIEGENSCHAFT_ADRESSE}}")
-set_font(run, bold=True, size=12)
-
-# ── Anrede ────────────────────────────────────────────────────────────────────
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(12)
-run = p.add_run("Sehr geehrte Damen und Herren,")
-set_font(run, size=11)
-
-# ── Brieftext ─────────────────────────────────────────────────────────────────
-text1 = (
-    "wir haben festgestellt, dass Ihre Liegenschaft in "
-    "{{LIEGENSCHAFT_ADRESSE}} "
-    "zum Verkauf ansteht. Als spezialisiertes Unternehmen im Bereich der "
-    "Immobilienrettung bei finanziellen Engpässen möchten wir Ihnen eine "
-    "diskrete und faire Lösung anbieten."
-)
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(10)
-run = p.add_run(text1)
-set_font(run, size=11)
-
-text2 = (
-    "Immo-in-Not GmbH unterstützt Eigentümer in finanziell schwierigen "
-    "Situationen mit einem transparenten Sale-and-Rent-Back-Modell: Sie "
-    "erhalten sofortige Liquidität und können trotzdem in Ihrem Zuhause "
-    "wohnen bleiben."
-)
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(10)
-run = p.add_run(text2)
-set_font(run, size=11)
-
-text3 = (
-    "Gerne stehen wir Ihnen für ein unverbindliches Gespräch zur Verfügung. "
-    "Bitte kontaktieren Sie uns telefonisch unter {{KONTAKT_TEL}} oder per "
-    "E-Mail an {{KONTAKT_EMAIL}}."
-)
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(18)
-run = p.add_run(text3)
-set_font(run, size=11)
-
-# ── Grußformel ────────────────────────────────────────────────────────────────
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(24)
-run = p.add_run("Mit freundlichen Grüßen,")
-set_font(run, size=11)
-
-# ── Unterschrift ──────────────────────────────────────────────────────────────
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("{{KONTAKT_NAME}}")
-set_font(run, bold=True, size=11)
-
-p = doc.add_paragraph()
-p.paragraph_format.space_after = Pt(0)
-run = p.add_run("Immo-in-Not GmbH")
-set_font(run, size=11)
-
-output = "/home/user/webapp/brief_vorlage.docx"
-doc.save(output)
-print(f"✅ Vorlage gespeichert: {output}")
+# Email-Platzhalter ist in Hyperlink-XML, extra prüfen
+from lxml import etree
+xml_content = etree.tostring(d.element, encoding="unicode")
+email_ok = "{{KONTAKT_EMAIL}}" in xml_content
+print(f"  {'✅' if email_ok else '❌ FEHLT!'} {{KONTAKT_EMAIL}} (Hyperlink)")
