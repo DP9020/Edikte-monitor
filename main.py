@@ -2067,7 +2067,7 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
                 phase_soll = RELEVANT_SOLL_PHASE[relevant]
 
                 # Immer: Relevanz geprüft + Neu eingelangt
-                update_props["Relevanz geprüft"] = {"checkbox": True}
+                update_props["Relevanz geprüft?"] = {"checkbox": True}
                 update_props["Neu eingelangt"]   = {"checkbox": False}
 
                 # Phase nur setzen wenn noch nicht korrekt
@@ -2089,7 +2089,7 @@ def notion_status_sync(notion: Client, db_id: str) -> int:
                 update_props["Neu eingelangt"] = {"checkbox": False}
 
                 if status == "🔴 Rot":
-                    update_props["Relevanz geprüft"] = {"checkbox": True}
+                    update_props["Relevanz geprüft?"] = {"checkbox": True}
                     update_props["Archiviert"]        = {"checkbox": True}
 
             # Keine relevanten Felder gesetzt → überspringen
