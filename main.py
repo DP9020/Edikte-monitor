@@ -2900,41 +2900,28 @@ def _brief_send_email(kontakt_email: str, kontakt_name: str,
                       eigentuemer: str, titel: str,
                       docx_bytes: bytes, dateiname_docx: str) -> bool:
     """
-    Sendet den Brief als DOCX-Anhang per E-Mail an den zuständigen Betreuer.
+    Sendet den Brief als DOCX-Anhang per E-Mail via SendGrid API.
 
-    Verwendet SMTP-Konfiguration aus Umgebungsvariablen:
-      SMTP_HOST      (default: smtp.gmail.com)
-      SMTP_PORT      (default: 587)
-      SMTP_USER      (Absender-Adresse)
-      SMTP_PASSWORD  (App-Passwort oder normales Passwort)
-      SMTP_FROM      (optional, default = SMTP_USER)
+    Benötigte Umgebungsvariablen:
+      SENDGRID_API_KEY  – API-Key (beginnt mit SG.)
+      SMTP_USER         – Absender-Adresse (muss in SendGrid verifiziert sein)
 
     Gibt True bei Erfolg, False bei Fehler zurück.
     """
-    import smtplib
-    import ssl
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.base import MIMEBase
-    from email.mime.text import MIMEText
-    from email import encoders
+    import base64
 
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = os.environ.get("SMTP_USER", "")
-    smtp_pw   = os.environ.get("SMTP_PASSWORD", "")
-    smtp_from = os.environ.get("SMTP_FROM", smtp_user)
+    api_key   = os.environ.get("SENDGRID_API_KEY", "")
+    absender  = os.environ.get("SMTP_USER", "")
 
-    if not smtp_user or not smtp_pw:
-        print(f"  [Brief] ℹ️  SMTP nicht konfiguriert (SMTP_USER/SMTP_PASSWORD fehlt) – nur lokal gespeichert")
+    if not api_key or not absender:
+        print("  [Brief] ℹ️  SendGrid nicht konfiguriert (SENDGRID_API_KEY/SMTP_USER fehlt)")
         return False
 
     try:
-        msg = MIMEMultipart()
-        msg["From"]    = smtp_from
-        msg["To"]      = kontakt_email
-        msg["Subject"] = f"Neuer Brief: {titel[:80]}"
+        # DOCX als Base64
+        docx_b64 = base64.b64encode(docx_bytes).decode("utf-8")
 
-        body = "\n".join([
+        body_text = "\n".join([
             f"Hallo {kontakt_name},",
             "",
             "anbei der Anschreiben-Entwurf für:",
@@ -2945,24 +2932,39 @@ def _brief_send_email(kontakt_email: str, kontakt_name: str,
             "",
             "Automatisch erstellt vom Edikte-Monitor.",
         ])
-        msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        # DOCX anhängen
-        part = MIMEBase("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
-        part.set_payload(docx_bytes)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{dateiname_docx}"')
-        msg.attach(part)
+        payload = {
+            "personalizations": [{"to": [{"email": kontakt_email, "name": kontakt_name}]}],
+            "from": {"email": absender},
+            "subject": f"Neuer Anschreiben-Entwurf: {eigentuemer[:60]}",
+            "content": [{"type": "text/plain", "value": body_text}],
+            "attachments": [{
+                "content":     docx_b64,
+                "type":        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "filename":    dateiname_docx,
+                "disposition": "attachment",
+            }],
+        }
 
-        context = ssl.create_default_context()
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.login(smtp_user, smtp_pw)
-            server.sendmail(smtp_from, kontakt_email, msg.as_bytes())
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req  = urllib.request.Request(
+            "https://api.sendgrid.com/v3/mail/send",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type":  "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            status = r.getcode()
 
-        print(f"  [Brief] ✉️  E-Mail gesendet an {kontakt_email}")
-        return True
+        if status in (200, 202):
+            print(f"  [Brief] ✉️  E-Mail gesendet an {kontakt_email}")
+            return True
+        else:
+            print(f"  [Brief] ⚠️  SendGrid HTTP {status}")
+            return False
 
     except Exception as exc:
         print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {exc}")
