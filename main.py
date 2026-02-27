@@ -305,6 +305,53 @@ def _strip_html_tags(text: str) -> str:
     return plain
 
 
+def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "") -> bool:
+    """
+    Schickt eine DOCX-Datei als Telegram-Dokument (sendDocument, multipart/form-data).
+    Gibt True zurück wenn erfolgreich, sonst False.
+    """
+    try:
+        token   = env("TELEGRAM_BOT_TOKEN")
+        chat_id = env("TELEGRAM_CHAT_ID")
+        url     = f"https://api.telegram.org/bot{token}/sendDocument"
+
+        boundary = "----TelegramBoundary7438291"
+        CRLF = b"\r\n"
+
+        def field(name: str, value: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+
+        body = (
+            field("chat_id", chat_id)
+            + field("caption", caption[:1024])
+            + (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="document"; filename="{dateiname}"\r\n'
+                f"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\n"
+            ).encode("utf-8")
+            + docx_bytes
+            + CRLF
+            + f"--{boundary}--\r\n".encode("utf-8")
+        )
+
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
+        print(f"  [Brief] 📨 Telegram-Dokument gesendet: {dateiname}")
+        return True
+    except Exception as exc:
+        print(f"  [Brief] ⚠️  Telegram-Dokument fehlgeschlagen: {exc}")
+        return False
+
+
 async def send_telegram(message: str) -> None:
     """
     Sendet eine Nachricht via Telegram Bot (HTML-Modus).
@@ -3077,8 +3124,18 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 dateiname_docx  = dateiname_docx,
             )
 
+            # ── Telegram-Dokument (immer – auch ohne SMTP) ────────────────────
+            # Schickt den fertigen Brief als DOCX-Datei direkt in den Telegram-Chat.
+            tg_caption = (
+                f"📄 Brief für {eigentuemer[:60]}\n"
+                f"📍 {bundesland} | Betreuer: {kontakt['name']}\n"
+                f"📅 {datum_str}"
+            )
+            send_telegram_document(docx_bytes, dateiname_docx, caption=tg_caption)
+
             # ── Notion: Brief-Datum + Notiz setzen ────────────────────────────
-            email_info = f" (E-Mail an {kontakt['email']})" if email_ok else " (nur lokal gespeichert)"
+            versand_info = f"E-Mail an {kontakt['email']}" if email_ok else "Telegram"
+            email_info = f" ({versand_info})"
             neue_notiz = notizen_alt
             if neue_notiz and not neue_notiz.endswith("\n"):
                 neue_notiz += "\n"
@@ -3117,7 +3174,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}")
 
             # ── Telegram-Zeile ────────────────────────────────────────────────
-            icon = "✉️" if email_ok else "💾"
+            icon = "✉️" if email_ok else "📨"
             telegram_lines.append(
                 f"{icon} {html_escape(eigentuemer[:35])} | {html_escape(bundesland)} "
                 f"→ {html_escape(kontakt['name'])}"
