@@ -3276,6 +3276,34 @@ async def main() -> None:
     notion = Client(auth=env("NOTION_TOKEN"))
     db_id  = clean_notion_db_id(env("NOTION_DATABASE_ID"))
 
+    # ── BRIEF_ONLY-Modus: nur Status-Sync + Brief-Erstellung ─────────────────
+    # Wird gesetzt wenn Env-Variable BRIEF_ONLY=true gesetzt ist.
+    # Kein Scraping, keine PDF-Analyse – läuft in ~30 Sekunden statt ~10 Minuten.
+    if os.environ.get("BRIEF_ONLY", "").lower() == "true":
+        print("[Modus] ⚡ BRIEF_ONLY – nur Status-Sync + Brief-Erstellung")
+        try:
+            _pages = notion_load_all_pages(notion, db_id)
+            notion_status_sync(notion, db_id, all_pages=_pages)
+            # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
+            _pages = notion_load_all_pages(notion, db_id)
+            brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_pages)
+            print(f"[Modus] ✅ BRIEF_ONLY fertig – {brief_erstellt} Brief(e) erstellt")
+            if brief_erstellt == 0:
+                print("[Modus] Keine neuen Briefe – kein Telegram-Versand.")
+            else:
+                lines = [
+                    "<b>📨 Neue Briefe erstellt</b>",
+                    f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
+                    "",
+                    f"<b>✉️ Briefe erstellt: {brief_erstellt}</b>",
+                ]
+                for bl in brief_telegram[:20]:
+                    lines.append(f"• {bl}")
+                await send_telegram("\n".join(lines))
+        except Exception as exc:
+            print(f"[Modus] ❌ BRIEF_ONLY Fehler: {exc}")
+        return
+
     neue_eintraege:  list[dict] = []
     entfall_updates: list[dict] = []
     fehler:          list[str]  = []
