@@ -1931,10 +1931,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
     # Erkennungskriterium: Notizen enthält bereits "Kein PDF" oder "gescannt"
     # → diese werden NICHT zurückgesetzt (sonst Endlosschleife)
     to_reanalyze: list[str] = []
-    for page in resp2.get("results", []):
-        parent = page.get("parent", {})
-        if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-            continue
+    for page in pages:  # 'pages' wurde oben bereits geladen (all_pages oder eigener Scan)
         props = page.get("properties", {})
         phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
         if phase in GESCHUETZT_PHASEN:
@@ -1959,8 +1956,6 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
             link_rt = props.get("Link", {}).get("url") or ""
             if link_rt and page["id"] not in to_fix:
                 to_reanalyze.append(page["id"])
-    has_more     = resp2.get("has_more", False)
-    start_cursor = resp2.get("next_cursor")
 
     if to_reanalyze:
         print(f"  [Bereinigung] 🔄 {len(to_reanalyze)} analysierte Einträge ohne Adresse → werden neu analysiert …")
@@ -2965,9 +2960,14 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
         if phase != ZIEL_PHASE:
             continue
-        # Überspringe wenn Brief bereits erstellt
+        # Überspringe wenn Brief bereits erstellt (per Datumsfeld ODER Notiz-Marker)
         brief_datum = props.get("Brief erstellt am", {}).get("date")
         if brief_datum and brief_datum.get("start"):
+            continue
+        # Fallback: prüfe ob Notiz bereits "Brief erstellt am" enthält
+        notizen_rt = props.get("Notizen", {}).get("rich_text", [])
+        notizen_text = "".join(t.get("plain_text", "") for t in notizen_rt)
+        if "Brief erstellt am" in notizen_text:
             continue
         to_process.append(page)
 
@@ -3085,13 +3085,35 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             neue_notiz += f"Brief erstellt am {datum_str}{email_info}"
             neue_notiz = neue_notiz[:2000]
 
-            notion.pages.update(
-                page_id=page_id,
-                properties={
-                    "Brief erstellt am": {"date": {"start": heute.isoformat()}},
-                    "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
-                }
-            )
+            # Zuerst versuchen mit "Brief erstellt am" Datumsfeld
+            notion_update_ok = False
+            try:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={
+                        "Brief erstellt am": {"date": {"start": heute.isoformat()}},
+                        "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
+                    }
+                )
+                notion_update_ok = True
+            except Exception as notion_exc:
+                err_str = str(notion_exc)
+                if "Brief erstellt am" in err_str and "not a property" in err_str:
+                    # Feld existiert nicht in Notion → nur Notiz schreiben
+                    print(f"  [Brief] ⚠️  Feld 'Brief erstellt am' existiert nicht in Notion – "
+                          f"schreibe nur Notiz")
+                    try:
+                        notion.pages.update(
+                            page_id=page_id,
+                            properties={
+                                "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
+                            }
+                        )
+                        notion_update_ok = True
+                    except Exception as notiz_exc:
+                        print(f"  [Brief] ⚠️  Auch Notiz-Update fehlgeschlagen: {notiz_exc}")
+                else:
+                    print(f"  [Brief] ⚠️  Notion-Update fehlgeschlagen: {notion_exc}")
             print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}")
 
             # ── Telegram-Zeile ────────────────────────────────────────────────
@@ -3287,6 +3309,15 @@ async def main() -> None:
         notion_status_sync(notion, db_id, all_pages=_all_pages)
     except Exception as exc:
         print(f"  [WARN] Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
+
+    # ── WICHTIG: Pages nach Status-Sync neu laden ────────────────────────────
+    # Status-Sync hat Phasen/Checkboxen in Notion aktualisiert.
+    # Damit Brief-Erstellung und Qualitäts-Check die neuen Werte sehen,
+    # muss die lokale Kopie jetzt neu geladen werden.
+    try:
+        _all_pages = notion_load_all_pages(notion, db_id)
+    except Exception as exc:
+        print(f"  [WARN] Neu-Laden nach Status-Sync fehlgeschlagen – Fallback auf alte Daten: {exc}")
 
     # ── 3b. Einmalige Bereinigung: falsche Gerichtsnamen in 'Verpflichtende Partei' ──
     # Frühere Script-Versionen haben irrtümlich den Gerichtsnamen (z.B. "BG Schwaz (870)")
