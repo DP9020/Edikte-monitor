@@ -3032,70 +3032,106 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     brief_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefe")
     os.makedirs(brief_output_dir, exist_ok=True)
 
+    # ── Einträge nach Eigentümer gruppieren ───────────────────────────────────
+    # Gleicher Eigentümer → ein Brief mit allen Liegenschaften aufgelistet
+    from collections import defaultdict
+    gruppen: dict[str, list[dict]] = defaultdict(list)
+
     for page in to_process:
-        page_id = page["id"]
-        props   = page.get("properties", {})
-
-        # ── Daten aus Notion lesen ────────────────────────────────────────────
-        titel_list  = props.get("Name", {}).get("title", [])
-        titel       = "".join(t.get("plain_text", "") for t in titel_list).strip()
-
+        props = page.get("properties", {})
         eigentuemer_list = props.get("Verpflichtende Partei", {}).get("rich_text", [])
         eigentuemer      = "".join(t.get("plain_text", "") for t in eigentuemer_list).strip()
+        # Normalisierter Key: Kleinbuchstaben, Leerzeichen zusammengefasst
+        key = " ".join(eigentuemer.lower().split()) if eigentuemer else f"__leer_{page['id']}"
+        gruppen[key].append(page)
 
-        adresse_list = props.get("Zustell Adresse", {}).get("rich_text", [])
+    print(f"[Brief] 👥 {len(gruppen)} Eigentümer-Gruppe(n) → {len(to_process)} Einträge")
+
+    heute     = date.today()
+    datum_str = heute.strftime("%d.%m.%Y")
+
+    for eigen_key, gruppe in gruppen.items():
+        # ── Daten aus erstem Eintrag der Gruppe lesen ─────────────────────────
+        first_page  = gruppe[0]
+        first_props = first_page.get("properties", {})
+
+        eigentuemer_list = first_props.get("Verpflichtende Partei", {}).get("rich_text", [])
+        eigentuemer      = "".join(t.get("plain_text", "") for t in eigentuemer_list).strip()
+
+        adresse_list = first_props.get("Zustell Adresse", {}).get("rich_text", [])
         adresse      = "".join(t.get("plain_text", "") for t in adresse_list).strip()
 
-        plz_ort_list = props.get("Zustell PLZ/Ort", {}).get("rich_text", [])
+        plz_ort_list = first_props.get("Zustell PLZ/Ort", {}).get("rich_text", [])
         plz_ort      = "".join(t.get("plain_text", "") for t in plz_ort_list).strip()
 
-        bundesland = (props.get("Bundesland", {}).get("select") or {}).get("name", "")
-
-        notizen_list = props.get("Notizen", {}).get("rich_text", [])
-        notizen_alt  = "".join(t.get("plain_text", "") for t in notizen_list).strip()
+        bundesland = (first_props.get("Bundesland", {}).get("select") or {}).get("name", "")
 
         # ── Pflichtfelder prüfen ──────────────────────────────────────────────
+        titel_list = first_props.get("Name", {}).get("title", [])
+        titel      = "".join(t.get("plain_text", "") for t in titel_list).strip()
+
         if not eigentuemer:
-            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – kein Eigentümer")
+            print(f"  [Brief] ⏭  Überspringe Gruppe – kein Eigentümer")
             continue
         if not adresse or not plz_ort:
-            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – keine Zustelladresse")
+            print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50]} – keine Zustelladresse")
             continue
         if not bundesland or bundesland not in KONTAKT_DATEN:
-            print(f"  [Brief] ⏭  Überspringe {titel[:50]} – kein Kontakt für '{bundesland}'")
+            print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50]} – kein Kontakt für '{bundesland}'")
             continue
 
-        kontakt   = KONTAKT_DATEN[bundesland]
-        heute     = date.today()
-        datum_str = heute.strftime("%d.%m.%Y")
+        kontakt = KONTAKT_DATEN[bundesland]
 
-        # ── PLZ/Ort der Liegenschaft aus Titel extrahieren ────────────────────
-        # Titel-Format: "Musterstraße 1, 1010 Wien" oder nur Straße
-        # Falls PLZ/Ort erkennbar ist, splitten; sonst Bundesland als Fallback
-        liegenschaft_adresse = titel
-        liegenschaft_plz_ort = ""
-        titel_parts = titel.rsplit(",", 1)
-        if len(titel_parts) == 2 and re.match(r"\s*\d{4}", titel_parts[1]):
-            liegenschaft_adresse = titel_parts[0].strip()
-            liegenschaft_plz_ort = titel_parts[1].strip()
+        # ── Alle Liegenschaften der Gruppe sammeln ────────────────────────────
+        liegenschaften = []
+        for page in gruppe:
+            props = page.get("properties", {})
+            t_list = props.get("Name", {}).get("title", [])
+            t_text = "".join(x.get("plain_text", "") for x in t_list).strip()
+
+            # PLZ/Ort aus Titel extrahieren
+            t_adresse = t_text
+            t_plz_ort = ""
+            t_parts = t_text.rsplit(",", 1)
+            if len(t_parts) == 2 and re.match(r"\s*\d{4}", t_parts[1]):
+                t_adresse = t_parts[0].strip()
+                t_plz_ort = t_parts[1].strip()
+            else:
+                plz_rt = props.get("PLZ/Ort", {}).get("rich_text", [])
+                t_plz_ort = "".join(x.get("plain_text", "") for x in plz_rt).strip()
+
+            liegenschaften.append({
+                "adresse": t_adresse,
+                "plz_ort": t_plz_ort,
+                "titel":   t_text,
+            })
+
+        # ── Liegenschaft(en) für Platzhalter aufbereiten ──────────────────────
+        # Bei mehreren: erste Liegenschaft im Template, Rest als Auflistung
+        erste = liegenschaften[0]
+        if len(liegenschaften) == 1:
+            liegenschaft_adresse = erste["adresse"]
+            liegenschaft_plz_ort = erste["plz_ort"] or plz_ort
         else:
-            # Versuche es mit dem gespeicherten PLZ-Feld
-            liegenschaft_plz_ort_list = props.get("PLZ/Ort", {}).get("rich_text", [])
-            liegenschaft_plz_ort = "".join(
-                t.get("plain_text", "") for t in liegenschaft_plz_ort_list
-            ).strip()
+            # Mehrere Liegenschaften → im Betreff aufzählen
+            liegenschaft_adresse = erste["adresse"]
+            liegenschaft_plz_ort = erste["plz_ort"] or plz_ort
+            zusatz = "\n".join(
+                f"  • {l['adresse']}{', ' + l['plz_ort'] if l['plz_ort'] else ''}"
+                for l in liegenschaften[1:]
+            )
+            liegenschaft_plz_ort += f"\n\nWeitere Liegenschaften:\n{zusatz}"
 
-        # ── Anrede ────────────────────────────────────────────────────────────
+        # ── Anrede + Platzhalter ──────────────────────────────────────────────
         anrede = _brief_anrede(eigentuemer)
 
-        # ── Platzhalter befüllen ──────────────────────────────────────────────
         platzhalter = {
             "EIGENTUEMER_NAME":     eigentuemer,
             "ZUSTELL_ADRESSE":      adresse,
             "ZUSTELL_PLZ_ORT":      plz_ort,
             "DATUM":                f"Wien, am {datum_str}",
             "LIEGENSCHAFT_ADRESSE": liegenschaft_adresse,
-            "LIEGENSCHAFT_PLZ_ORT": liegenschaft_plz_ort or plz_ort,
+            "LIEGENSCHAFT_PLZ_ORT": liegenschaft_plz_ort,
             "ANREDE":               anrede,
             "KONTAKT_NAME":         kontakt["name"],
             "KONTAKT_TEL":          kontakt["tel"],
@@ -3107,88 +3143,93 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             docx_bytes = _brief_fill_template(BRIEF_VORLAGE_PATH, platzhalter)
 
             # ── Dateiname ─────────────────────────────────────────────────────
-            safe_eigen = re.sub(r"[^\w\s-]", "", eigentuemer)[:40].strip().replace(" ", "_")
-            safe_datum = datum_str.replace(".", "-")
+            safe_eigen     = re.sub(r"[^\w\s-]", "", eigentuemer)[:40].strip().replace(" ", "_")
+            safe_datum     = datum_str.replace(".", "-")
             dateiname_docx = f"Brief_{safe_datum}_{safe_eigen}.docx"
-            docx_path = os.path.join(brief_output_dir, dateiname_docx)
+            docx_path      = os.path.join(brief_output_dir, dateiname_docx)
 
             with open(docx_path, "wb") as f:
                 f.write(docx_bytes)
-            print(f"  [Brief] 💾 DOCX gespeichert: {dateiname_docx}")
 
-            # ── E-Mail an Betreuer (Option C) ─────────────────────────────────
+            anzahl_str = f" ({len(liegenschaften)} Liegenschaften)" if len(liegenschaften) > 1 else ""
+            print(f"  [Brief] 💾 DOCX gespeichert: {dateiname_docx}{anzahl_str}")
+
+            # ── E-Mail an Betreuer ────────────────────────────────────────────
             email_ok = _brief_send_email(
-                kontakt_email   = kontakt["email"],
-                kontakt_name    = kontakt["name"],
-                eigentuemer     = eigentuemer,
-                titel           = titel,
-                docx_bytes      = docx_bytes,
-                dateiname_docx  = dateiname_docx,
+                kontakt_email  = kontakt["email"],
+                kontakt_name   = kontakt["name"],
+                eigentuemer    = eigentuemer,
+                titel          = titel if len(liegenschaften) == 1 else
+                                 f"{len(liegenschaften)} Liegenschaften: " +
+                                 ", ".join(l["adresse"][:30] for l in liegenschaften[:3]),
+                docx_bytes     = docx_bytes,
+                dateiname_docx = dateiname_docx,
             )
 
-            # ── Telegram-Dokument (immer – auch ohne SMTP) ────────────────────
-            # Schickt den fertigen Brief als DOCX-Datei direkt in den Telegram-Chat.
+            # ── Telegram-Dokument ─────────────────────────────────────────────
             tg_caption = (
                 f"📄 Brief für {eigentuemer[:60]}\n"
                 f"📍 {bundesland} | Betreuer: {kontakt['name']}\n"
                 f"📅 {datum_str}"
+                + (f"\n🏠 {len(liegenschaften)} Liegenschaften" if len(liegenschaften) > 1 else "")
             )
             send_telegram_document(docx_bytes, dateiname_docx, caption=tg_caption)
 
-            # ── Notion: Brief-Datum + Notiz setzen ────────────────────────────
+            # ── Notion: alle Seiten der Gruppe aktualisieren ──────────────────
             versand_info = f"E-Mail an {kontakt['email']}" if email_ok else "Telegram"
-            email_info = f" ({versand_info})"
-            neue_notiz = notizen_alt
-            if neue_notiz and not neue_notiz.endswith("\n"):
-                neue_notiz += "\n"
-            neue_notiz += f"Brief erstellt am {datum_str}{email_info}"
-            neue_notiz = neue_notiz[:2000]
-
-            # Zuerst versuchen mit "Brief erstellt am" Datumsfeld
-            notion_update_ok = False
-            try:
-                notion.pages.update(
-                    page_id=page_id,
-                    properties={
-                        "Brief erstellt am": {"date": {"start": heute.isoformat()}},
-                        "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
-                    }
-                )
-                notion_update_ok = True
-            except Exception as notion_exc:
-                err_str = str(notion_exc)
-                if "Brief erstellt am" in err_str and "not a property" in err_str:
-                    # Feld existiert nicht in Notion → nur Notiz schreiben
-                    print(f"  [Brief] ⚠️  Feld 'Brief erstellt am' existiert nicht in Notion – "
-                          f"schreibe nur Notiz")
-                    try:
-                        notion.pages.update(
-                            page_id=page_id,
-                            properties={
-                                "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
-                            }
-                        )
-                        notion_update_ok = True
-                    except Exception as notiz_exc:
-                        print(f"  [Brief] ⚠️  Auch Notiz-Update fehlgeschlagen: {notiz_exc}")
+            for page in gruppe:
+                p_id = page["id"]
+                p_props = page.get("properties", {})
+                notizen_list = p_props.get("Notizen", {}).get("rich_text", [])
+                notizen_alt  = "".join(t.get("plain_text", "") for t in notizen_list).strip()
+                neue_notiz   = notizen_alt
+                if neue_notiz and not neue_notiz.endswith("\n"):
+                    neue_notiz += "\n"
+                if len(liegenschaften) > 1:
+                    neue_notiz += f"Brief erstellt am {datum_str} (Sammelbrief, {versand_info})"
                 else:
-                    print(f"  [Brief] ⚠️  Notion-Update fehlgeschlagen: {notion_exc}")
-            print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}")
+                    neue_notiz += f"Brief erstellt am {datum_str} ({versand_info})"
+                neue_notiz = neue_notiz[:2000]
 
-            # ── Telegram-Zeile ────────────────────────────────────────────────
+                try:
+                    notion.pages.update(
+                        page_id=p_id,
+                        properties={
+                            "Brief erstellt am": {"date": {"start": heute.isoformat()}},
+                            "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
+                        }
+                    )
+                except Exception as notion_exc:
+                    err_str = str(notion_exc)
+                    if "Brief erstellt am" in err_str and "not a property" in err_str:
+                        try:
+                            notion.pages.update(
+                                page_id=p_id,
+                                properties={
+                                    "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
+                                }
+                            )
+                        except Exception as notiz_exc:
+                            print(f"  [Brief] ⚠️  Notiz-Update fehlgeschlagen für {p_id[:8]}: {notiz_exc}")
+                    else:
+                        print(f"  [Brief] ⚠️  Notion-Update fehlgeschlagen für {p_id[:8]}: {notion_exc}")
+                time.sleep(0.2)
+
             icon = "✉️" if email_ok else "📨"
+            print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}{anzahl_str}")
             telegram_lines.append(
                 f"{icon} {html_escape(eigentuemer[:35])} | {html_escape(bundesland)} "
-                f"→ {html_escape(kontakt['name'])}"
+                f"→ {html_escape(kontakt['name'])}{html_escape(anzahl_str)}"
             )
             erstellt += 1
             time.sleep(0.3)
 
         except Exception as exc:
-            print(f"  [Brief] ❌ Fehler bei {titel[:50]}: {exc}")
+            print(f"  [Brief] ❌ Fehler bei {eigentuemer[:50]}: {exc}")
 
-    print(f"[Brief] ✅ {erstellt} Brief(e) erstellt")
+    print(f"[Brief] ✅ {erstellt} Brief(e) erstellt ({len(to_process)} Einträge)")
     return erstellt, telegram_lines
+
 
 def fetch_results_for_state(bundesland: str, bl_value: str) -> list[dict]:
     """
