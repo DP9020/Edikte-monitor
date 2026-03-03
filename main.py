@@ -3404,7 +3404,10 @@ async def main() -> None:
                     elif page_id == "(geschuetzt)":
                         print(f"  [Notion] 🔒 Entfall übersprungen (geschützte Phase): {eid}")
                     else:
-                        print(f"  [Notion] ℹ️  Entfall ohne DB-Eintrag: {eid}")
+                        # Kein DB-Eintrag → trotzdem als Alarm melden
+                        print(f"  [Notion] ⚠️  Entfall ohne DB-Eintrag (neues Edikt): {eid}")
+                        # Zu entfall_updates hinzufügen damit Telegram-Nachricht erscheint
+                        entfall_updates.append(item)
 
             except Exception as exc:
                 msg = f"Notion-Fehler {item.get('edikt_id', '?')}: {exc}"
