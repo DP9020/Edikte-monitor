@@ -3348,7 +3348,6 @@ async def main() -> None:
         return
 
     neue_eintraege:  list[dict] = []
-    entfall_updates: list[dict] = []
     fehler:          list[str]  = []
 
     # ── 1. Alle bekannten IDs einmalig laden (schnelle lokale Deduplizierung) ─
@@ -3400,25 +3399,12 @@ async def main() -> None:
                     page_id = known_ids.get(eid)
                     if page_id and page_id not in ("(neu)", "(geschuetzt)", "(gefiltert)"):
                         notion_mark_entfall(notion, page_id, item)
-                        entfall_updates.append(item)
+                        # Kein Telegram für Entfall/Verschiebung – nur Notion-Eintrag
                     elif page_id == "(geschuetzt)":
                         print(f"  [Notion] 🔒 Entfall übersprungen (geschützte Phase): {eid}")
                     else:
-                        # Kein DB-Eintrag → Detailseite abrufen für echte Adresse, dann Alarm melden
-                        print(f"  [Notion] ⚠️  Entfall ohne DB-Eintrag: {eid}")
-                        item_link = item.get("link", "")
-                        if item_link:
-                            try:
-                                detail_info = fetch_detail(item_link)
-                                adresse_real = detail_info.get("adresse_voll", "")
-                                if adresse_real:
-                                    item = dict(item)  # Kopie um Original nicht zu verändern
-                                    item["adresse_detail"] = adresse_real
-                                    print(f"    [Detail] 📍 Adresse gefunden: {adresse_real}")
-                            except Exception as det_exc:
-                                print(f"    [Detail] ⚠️  Fehler beim Abrufen: {det_exc}")
-                        # Zu entfall_updates hinzufügen damit Telegram-Nachricht erscheint
-                        entfall_updates.append(item)
+                        # Kein DB-Eintrag → nur loggen, keine Benachrichtigung
+                        print(f"  [Notion] ℹ️  Entfall ohne DB-Eintrag: {eid}")
 
             except Exception as exc:
                 msg = f"Notion-Fehler {item.get('edikt_id', '?')}: {exc}"
@@ -3520,7 +3506,6 @@ async def main() -> None:
     # ── 5. Zusammenfassung ────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print(f"✅ Neue Einträge:         {len(neue_eintraege)}")
-    print(f"🔴 Entfall-Updates:       {len(entfall_updates)}")
     print(f"🔗 URLs ergänzt:          {enriched_count}")
     print(f"🗑  Tote URLs archiviert:  {tote_urls_archiviert}")
     print(f"📄 Gutachten analysiert:  {gutachten_enriched}")
@@ -3529,7 +3514,7 @@ async def main() -> None:
     print(f"⚠️  Fehler:                {len(fehler)}")
     print("=" * 60)
 
-    if not neue_eintraege and not entfall_updates and not fehler \
+    if not neue_eintraege and not fehler \
             and not gutachten_enriched and not vision_enriched \
             and not tote_urls_archiviert and not tote_urls_alarme \
             and not brief_erstellt:
@@ -3558,13 +3543,7 @@ async def main() -> None:
             lines.append(f"  ... und {len(neue_eintraege) - 20} weitere")
         lines.append("")
 
-    if entfall_updates:
-        lines.append(f"<b>🔴 Termin entfallen/verschoben: {len(entfall_updates)}</b>")
-        for item in entfall_updates[:10]:
-            # Echte Adresse bevorzugen (wird für Edikte ohne DB-Eintrag abgerufen)
-            adresse_display = item.get("adresse_detail") or item.get("beschreibung", "")[:60]
-            lines.append(f"• {html_escape(item['bundesland'])} – {html_escape(adresse_display)}")
-        lines.append("")
+    # Entfall/Verschiebung wird nicht per Telegram gemeldet – nur in Notion eingetragen
 
     if enriched_count:
         lines.append(f"<b>🔗 URLs nachgetragen: {enriched_count}</b>")
