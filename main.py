@@ -3160,24 +3160,33 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         liegenschaften = []
         for page in gruppe:
             props = page.get("properties", {})
-            t_list = props.get("Name", {}).get("title", [])
-            t_text = "".join(x.get("plain_text", "") for x in t_list).strip()
 
-            # PLZ/Ort aus Titel extrahieren
-            t_adresse = t_text
-            t_plz_ort = ""
-            t_parts = t_text.rsplit(",", 1)
-            if len(t_parts) == 2 and re.match(r"\s*\d{4}", t_parts[1]):
-                t_adresse = t_parts[0].strip()
-                t_plz_ort = t_parts[1].strip()
-            else:
-                plz_rt = props.get("PLZ/Ort", {}).get("rich_text", [])
-                t_plz_ort = "".join(x.get("plain_text", "") for x in plz_rt).strip()
+            # ── Liegenschaftsadresse: bevorzugt das dedizierte Titelfeld ──────
+            # Notion speichert die volle Adresse (Straße + Hausnr) im Titelfeld
+            # "Liegenschaftsadresse", PLZ/Ort separat in "Liegenschafts PLZ"
+            titel_rt  = props.get("Liegenschaftsadresse", {}).get("title", [])
+            t_adresse = "".join(x.get("plain_text", "") for x in titel_rt).strip()
+
+            # Fallback: altes "Name"-Feld
+            if not t_adresse:
+                t_list    = props.get("Name", {}).get("title", [])
+                t_adresse = "".join(x.get("plain_text", "") for x in t_list).strip()
+
+            # PLZ/Ort: zuerst dediziertes Feld, dann aus Adresse extrahieren
+            plz_rt    = props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
+            t_plz_ort = "".join(x.get("plain_text", "") for x in plz_rt).strip()
+
+            if not t_plz_ort:
+                # Versuche PLZ/Ort am Ende der Adresse zu finden (z.B. "Musterstr. 1, 1010 Wien")
+                t_parts = t_adresse.rsplit(",", 1)
+                if len(t_parts) == 2 and re.match(r"\s*\d{4}", t_parts[1]):
+                    t_adresse = t_parts[0].strip()
+                    t_plz_ort = t_parts[1].strip()
 
             liegenschaften.append({
                 "adresse": t_adresse,
                 "plz_ort": t_plz_ort,
-                "titel":   t_text,
+                "titel":   t_adresse,
             })
 
         # ── Liegenschaft(en) für Platzhalter aufbereiten ──────────────────────
