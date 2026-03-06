@@ -10,8 +10,10 @@ import re
 import json
 import time
 import asyncio
+import base64
 import urllib.request
 import urllib.parse
+from html import unescape as html_unescape
 from datetime import datetime
 from notion_client import Client
 
@@ -77,6 +79,18 @@ EXCLUDE_KATEGORIEN = {
 
 # Notion-Feldname für PLZ (exakt so wie in der Datenbank angelegt)
 NOTION_PLZ_FIELD = "Liegenschafts PLZ"
+
+# Workflow-Phasen die NICHT automatisch überschrieben werden dürfen
+# (Einträge die bereits manuell bearbeitet wurden)
+GESCHUETZT_PHASEN: frozenset[str] = frozenset({
+    "🔎 In Prüfung",
+    "❌ Nicht relevant",
+    "✅ Relevant – Brief vorbereiten",
+    "📩 Brief versendet",
+    "📊 Gutachten analysiert",
+    "✅ Gekauft",
+    "🗄 Archiviert",
+})
 
 # Edikt-ID aus dem Link extrahieren
 ID_RE = re.compile(r"alldoc/([0-9a-f]+)!OpenDocument", re.IGNORECASE)
@@ -178,8 +192,7 @@ def fetch_detail(link: str) -> dict:
     def clean(html_fragment: str) -> str:
         t = re.sub(r"<[^>]+>", " ", html_fragment)
         t = t.replace("\xa0", " ").replace("&nbsp;", " ")
-        from html import unescape
-        t = unescape(t)
+        t = html_unescape(t)
         return " ".join(t.split()).strip()
 
     fields: dict[str, str] = {}
@@ -268,6 +281,55 @@ def fetch_detail(link: str) -> dict:
 
 
 # =============================================================================
+# GLOBALE HILFSFUNKTIONEN (werden von mehreren Modulen genutzt)
+# =============================================================================
+
+def _rt(text: str) -> dict:
+    """Erstellt ein Notion rich_text Property."""
+    return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
+
+
+def _str_val(val) -> str:
+    """Konvertiert einen Wert sicher zu str."""
+    return str(val).strip() if val else ""
+
+
+def _lst_val(val) -> list:
+    """Konvertiert einen Wert sicher zu einer bereinigten Liste."""
+    if isinstance(val, list):
+        return [str(v).strip() for v in val if v and str(v).strip()]
+    if isinstance(val, str) and val.strip():
+        return [val.strip()]
+    return []
+
+
+def _clean_name(name: str) -> str:
+    """Verwirft Parser-Artefakte die als Eigentümername durchgerutscht sind."""
+    if not name:
+        return ""
+    INVALID = {"nicht angegeben", "unbekannt", "n/a", "none", "null", "-", "–"}
+    if name.strip().lower() in INVALID:
+        return ""
+    if re.match(r'^[)\]}>]', name) or name.rstrip().endswith('-'):
+        return ""
+    if not any(c.isalpha() for c in name):
+        return ""
+    return name
+
+
+def _clean_adresse(adr: str) -> str:
+    """Bereinigt fehlerhafte Adressen aus der PDF-Extraktion."""
+    if not adr:
+        return ""
+    adr = re.sub(r',?\s*Telefon.*$', '', adr, flags=re.IGNORECASE).strip().rstrip(',')
+    m = re.match(r'^(?:[A-Za-z]-?)?\d{4,5}\s+\S+.*?,\s*(.+)', adr)
+    if m:
+        adr = m.group(1).strip()
+    adr = re.sub(r',\s*[A-ZÄÖÜ][a-zäöüß]+$', '', adr).strip()
+    return adr
+
+
+# =============================================================================
 # TELEGRAM
 # =============================================================================
 
@@ -309,9 +371,9 @@ def _strip_html_tags(text: str) -> str:
 BENJAMIN_BUNDESLAENDER = {"Wien", "Oberösterreich"}
 
 
-def _get_benjamin_chat_id() -> str | None:
-    """Gibt Benjamins Chat-ID zurück, oder None wenn nicht konfiguriert."""
-    return os.getenv("TELEGRAM_CHAT_ID_BENJAMIN") or None
+def _get_benjamin_chat_id() -> str:
+    """Gibt die Telegram Chat-ID von Benjamin zurück (aus Umgebungsvariable)."""
+    return os.environ.get("TELEGRAM_CHAT_ID_BENJAMIN", "")
 
 
 def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "", bundesland: str = "") -> bool:
@@ -744,23 +806,14 @@ Wichtige Regeln:
         print(f"    [LLM] ⚠️  OpenAI-Fehler: {exc}")
         return {}
 
-    def _str(val) -> str:
-        return str(val).strip() if val else ""
-
-    def _lst(val) -> list:
-        if isinstance(val, list):
-            return [str(v).strip() for v in val if v and str(v).strip()]
-        if isinstance(val, str) and val.strip():
-            return [val.strip()]
-        return []
 
     return {
-        "eigentümer_name":    _str(data.get("eigentümer_name")),
-        "eigentümer_adresse": _str(data.get("eigentümer_adresse")),
-        "eigentümer_plz_ort": _str(data.get("eigentümer_plz_ort")),
+        "eigentümer_name":    _str_val(data.get("eigentümer_name")),
+        "eigentümer_adresse": _str_val(data.get("eigentümer_adresse")),
+        "eigentümer_plz_ort": _str_val(data.get("eigentümer_plz_ort")),
         "eigentümer_geb":     "",
-        "gläubiger":          _lst(data.get("gläubiger")),
-        "forderung_betrag":   _str(data.get("forderung_betrag")),
+        "gläubiger":          _lst_val(data.get("gläubiger")),
+        "forderung_betrag":   _str_val(data.get("forderung_betrag")),
     }
 
 
@@ -1261,43 +1314,9 @@ def gutachten_enrich_notion_page(
         "Gutachten analysiert?": {"checkbox": True},
     }
 
-    def _rt(text: str) -> dict:
-        return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
-
-    # ── Nachbereinigung: Name + Adresse validieren ──────────────────────────
-    def _clean_extracted_name(name: str) -> str:
-        """Verwirft Parser-Artefakte die als Name durchgerutscht sind."""
-        if not name:
-            return ""
-        # GPT-Platzhalter / Nicht-Namen herausfiltern
-        INVALID_NAMES = {"nicht angegeben", "unbekannt", "n/a", "none", "null", "-", "–"}
-        if name.strip().lower() in INVALID_NAMES:
-            return ""
-        # Fragmente wie ") und Ma-" (PDF-Seitenumbruch-Artefakte)
-        if re.match(r'^[)\\]}>]', name) or name.rstrip().endswith('-'):
-            return ""
-        # Nur Punkte/Symbole ohne echte Buchstaben
-        if not any(c.isalpha() for c in name):
-            return ""
-        return name
-
-    def _clean_extracted_adresse(adr: str) -> str:
-        """Bereinigt fehlerhafte Adressen."""
-        if not adr:
-            return ""
-        # "A-9063 Maria Saal, Trattenweg 6, Telefon" → Telefon-Teil abschneiden
-        adr = re.sub(r',?\s*Telefon.*$', '', adr, flags=re.IGNORECASE).strip().rstrip(',')
-        # "8042 Graz, Neue-Welt-Höhe 17a" oder "A-9063 Maria Saal, Trattenweg 6"
-        # → PLZ+Ort vor Straße → nur Straße nehmen
-        m_ort_vor_strasse = re.match(r'^(?:[A-Za-z]-?)?\d{4,5}\s+\S+.*?,\s*(.+)', adr)
-        if m_ort_vor_strasse:
-            adr = m_ort_vor_strasse.group(1).strip()
-        # "Pritzstraße 9 A, Linz" → Stadtname am Ende entfernen (keine PLZ → kein PLZ/Ort-Feld)
-        adr = re.sub(r',\s*[A-ZÄÖÜ][a-zäöüß]+$', '', adr).strip()
-        return adr
-
-    name_clean = _clean_extracted_name(info.get("eigentümer_name", ""))
-    adr_clean  = _clean_extracted_adresse(info.get("eigentümer_adresse", ""))
+    # ── Nachbereinigung: globale Hilfsfunktionen verwenden ──────────────────
+    name_clean = _clean_name(info.get("eigentümer_name", ""))
+    adr_clean  = _clean_adresse(info.get("eigentümer_adresse", ""))
 
     if name_clean:
         print(f"    [Gutachten] 👤 Eigentümer: {name_clean}")
@@ -1364,17 +1383,7 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     Paginierung: Notion liefert max. 100 Ergebnisse pro Anfrage.
     """
     # Workflow-Phasen die NICHT überschrieben werden dürfen
-    # Phasen die vom Scraper NICHT überschrieben werden dürfen
-    # (Einträge die bereits manuell bearbeitet wurden)
-    GESCHUETZT_PHASEN = {
-        "🔎 In Prüfung",
-        "❌ Nicht relevant",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "✅ Gekauft",
-        "🗄 Archiviert",
-    }
+    # (globale GESCHUETZT_PHASEN Konstante wird verwendet)
 
     print("[Notion] 📥 Lade alle bestehenden IDs aus der Datenbank …")
     known: dict[str, str] = {}  # edikt_id -> page_id  (oder "(geschuetzt)")
@@ -1910,15 +1919,7 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
 
     Gibt die Anzahl der erfolgreich angereicherten Einträge zurück.
     """
-    GESCHUETZT_PHASEN = {
-        "🔎 In Prüfung",
-        "❌ Nicht relevant",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "✅ Gekauft",
-        "🗄 Archiviert",
-    }
+    # globale GESCHUETZT_PHASEN Konstante wird verwendet
 
     print("\n[Gutachten-Anreicherung] 📄 Suche nach Einträgen ohne Gutachten-Analyse …")
 
@@ -2006,15 +2007,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
 
     Gibt die Anzahl der bereinigten Einträge zurück.
     """
-    GESCHUETZT_PHASEN = {
-        "🔎 In Prüfung",
-        "❌ Nicht relevant",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "✅ Gekauft",
-        "🗄 Archiviert",
-    }
+    # globale GESCHUETZT_PHASEN Konstante wird verwendet
 
     # Gerichts-Muster: "BG Irgendwas (123)" oder "BG Irgendwas"
     GERICHT_RE = re.compile(
@@ -2163,55 +2156,54 @@ def notion_status_sync(notion: Client, db_id: str,
     to_update: list[dict] = []
 
     for page in pages:
-        if True:  # Einrückung beibehalten
-            props     = page.get("properties", {})
-            status    = (props.get("Status", {}).get("select") or {}).get("name", "")
-            relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
-            phase_ist = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        props     = page.get("properties", {})
+        status    = (props.get("Status", {}).get("select") or {}).get("name", "")
+        relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
+        phase_ist = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
 
-            update_props: dict = {}
+        update_props: dict = {}
 
-            # ── Quelle 2: 'Für uns relevant?' hat Vorrang vor Status-Farbe ──
-            if relevant in RELEVANT_SOLL_PHASE:
-                phase_soll = RELEVANT_SOLL_PHASE[relevant]
+        # ── Quelle 2: 'Für uns relevant?' hat Vorrang vor Status-Farbe ──
+        if relevant in RELEVANT_SOLL_PHASE:
+            phase_soll = RELEVANT_SOLL_PHASE[relevant]
 
-                # Immer: Relevanz geprüft + Neu eingelangt
+            # Immer: Relevanz geprüft + Neu eingelangt
+            update_props["Relevanz geprüft?"] = {"checkbox": True}
+            update_props["Neu eingelangt"]   = {"checkbox": False}
+
+            # Phase nur setzen wenn noch nicht korrekt
+            if phase_ist != phase_soll:
+                update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
+
+            # Bei Nein: zusätzlich Status Rot + Archiviert
+            if relevant == "Nein":
+                update_props["Status"]    = {"select": {"name": "🔴 Rot"}}
+                update_props["Archiviert"] = {"checkbox": True}
+
+        # ── Quelle 1: Status-Farbe (nur wenn kein Relevanz-Wert gesetzt) ─
+        elif status in STATUS_SOLL_PHASE:
+            phase_soll = STATUS_SOLL_PHASE[status]
+
+            if phase_ist != phase_soll:
+                update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
+
+            update_props["Neu eingelangt"] = {"checkbox": False}
+
+            if status == "🔴 Rot":
                 update_props["Relevanz geprüft?"] = {"checkbox": True}
-                update_props["Neu eingelangt"]   = {"checkbox": False}
+                update_props["Archiviert"]        = {"checkbox": True}
 
-                # Phase nur setzen wenn noch nicht korrekt
-                if phase_ist != phase_soll:
-                    update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
+        # Keine relevanten Felder gesetzt → überspringen
+        if not update_props:
+            continue
 
-                # Bei Nein: zusätzlich Status Rot + Archiviert
-                if relevant == "Nein":
-                    update_props["Status"]    = {"select": {"name": "🔴 Rot"}}
-                    update_props["Archiviert"] = {"checkbox": True}
-
-            # ── Quelle 1: Status-Farbe (nur wenn kein Relevanz-Wert gesetzt) ─
-            elif status in STATUS_SOLL_PHASE:
-                phase_soll = STATUS_SOLL_PHASE[status]
-
-                if phase_ist != phase_soll:
-                    update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
-
-                update_props["Neu eingelangt"] = {"checkbox": False}
-
-                if status == "🔴 Rot":
-                    update_props["Relevanz geprüft?"] = {"checkbox": True}
-                    update_props["Archiviert"]        = {"checkbox": True}
-
-            # Keine relevanten Felder gesetzt → überspringen
-            if not update_props:
-                continue
-
-            # Bereits alles korrekt → überspringen (nur Phase-Check reicht nicht,
-            # da Checkboxen evtl. noch falsch sind – daher immer in Queue)
-            to_update.append({
-                "page_id":      page["id"],
-                "update_props": update_props,
-                "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={update_props.get('Workflow-Phase', {}).get('select', {}).get('name', phase_ist)}",
-            })
+        # Bereits alles korrekt → überspringen (nur Phase-Check reicht nicht,
+        # da Checkboxen evtl. noch falsch sind – daher immer in Queue)
+        to_update.append({
+            "page_id":      page["id"],
+            "update_props": update_props,
+            "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={update_props.get('Workflow-Phase', {}).get('select', {}).get('name', phase_ist)}",
+        })
 
     print(f"  [Status-Sync] 📋 {len(to_update)} Einträge werden synchronisiert")
 
@@ -2250,15 +2242,7 @@ def notion_qualitaetscheck(notion: Client, db_id: str,
 
     Gibt die Anzahl zurückgesetzter Einträge zurück.
     """
-    GESCHUETZT_PHASEN = {
-        "🔎 In Prüfung",
-        "❌ Nicht relevant",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "✅ Gekauft",
-        "🗄 Archiviert",
-    }
+    # globale GESCHUETZT_PHASEN Konstante wird verwendet
 
     print("\n[Qualitäts-Check] 🔍 Prüfe alle analysierten Einträge auf Vollständigkeit …")
 
@@ -2267,58 +2251,57 @@ def notion_qualitaetscheck(notion: Client, db_id: str,
     total_checked = 0
 
     for page in pages:
-        if True:
-            props = page.get("properties", {})
+        props = page.get("properties", {})
 
-            # Nur analysierte Einträge
-            analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
-            if not analysiert:
-                continue
+        # Nur analysierte Einträge
+        analysiert = props.get("Gutachten analysiert?", {}).get("checkbox", False)
+        if not analysiert:
+            continue
 
-            # Geschützte Phasen überspringen
-            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-            if phase in GESCHUETZT_PHASEN:
-                continue
+        # Geschützte Phasen überspringen
+        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        if phase in GESCHUETZT_PHASEN:
+            continue
 
-            # Archivierte überspringen
-            archiviert = props.get("Archiviert", {}).get("checkbox", False)
-            if archiviert:
-                continue
+        # Archivierte überspringen
+        archiviert = props.get("Archiviert", {}).get("checkbox", False)
+        if archiviert:
+            continue
 
-            # Muss eine URL haben (sonst gibt es nichts zu analysieren)
-            link_val = props.get("Link", {}).get("url")
-            if not link_val:
-                continue
+        # Muss eine URL haben (sonst gibt es nichts zu analysieren)
+        link_val = props.get("Link", {}).get("url")
+        if not link_val:
+            continue
 
-            total_checked += 1
+        total_checked += 1
 
-            # Notizen prüfen – gescannte/fehlende PDFs nicht nochmal versuchen
-            notizen_rt = props.get("Notizen", {}).get("rich_text", [])
-            notizen_text = "".join(
-                (b.get("text") or {}).get("content", "") for b in notizen_rt
-            ).lower()
-            if "gescannt" in notizen_text or "kein pdf" in notizen_text or "nicht lesbar" in notizen_text:
-                continue
+        # Notizen prüfen – gescannte/fehlende PDFs nicht nochmal versuchen
+        notizen_rt = props.get("Notizen", {}).get("rich_text", [])
+        notizen_text = "".join(
+            (b.get("text") or {}).get("content", "") for b in notizen_rt
+        ).lower()
+        if "gescannt" in notizen_text or "kein pdf" in notizen_text or "nicht lesbar" in notizen_text:
+            continue
 
-            # Felder prüfen
-            eigentümer_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-            eigentümer    = "".join(
-                (b.get("text") or {}).get("content", "") for b in eigentümer_rt
-            ).strip()
+        # Felder prüfen
+        eigentümer_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+        eigentümer    = "".join(
+            (b.get("text") or {}).get("content", "") for b in eigentümer_rt
+        ).strip()
 
-            adresse_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
-            adresse    = "".join(
-                (b.get("text") or {}).get("content", "") for b in adresse_rt
-            ).strip()
+        adresse_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
+        adresse    = "".join(
+            (b.get("text") or {}).get("content", "") for b in adresse_rt
+        ).strip()
 
-            gläubiger_rt = props.get("Betreibende Partei", {}).get("rich_text", [])
-            gläubiger    = "".join(
-                (b.get("text") or {}).get("content", "") for b in gläubiger_rt
-            ).strip()
+        gläubiger_rt = props.get("Betreibende Partei", {}).get("rich_text", [])
+        gläubiger    = "".join(
+            (b.get("text") or {}).get("content", "") for b in gläubiger_rt
+        ).strip()
 
-            # Zurücksetzen wenn Eigentümer UND Adresse fehlen (beide leer)
-            if not eigentümer and not adresse:
-                to_reset.append(page["id"])
+        # Zurücksetzen wenn Eigentümer UND Adresse fehlen (beide leer)
+        if not eigentümer and not adresse:
+            to_reset.append(page["id"])
 
     print(f"  [Qualitäts-Check] 📊 {total_checked} analysierte Einträge geprüft")
     print(f"  [Qualitäts-Check] 🔄 {len(to_reset)} unvollständige Einträge → werden neu analysiert")
@@ -2357,8 +2340,6 @@ def gutachten_extract_info_vision(pdf_bytes: bytes, pdf_url: str) -> dict:
         return {}
     if not FITZ_AVAILABLE:
         return {}
-
-    import base64
 
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -2435,23 +2416,13 @@ Wichtige Regeln:
         print(f"    [Vision] ⚠️  OpenAI Vision-Fehler: {exc}")
         return {}
 
-    def _str(val) -> str:
-        return str(val).strip() if val else ""
-
-    def _lst(val) -> list:
-        if isinstance(val, list):
-            return [str(v).strip() for v in val if v and str(v).strip()]
-        if isinstance(val, str) and val.strip():
-            return [val.strip()]
-        return []
-
     return {
-        "eigentümer_name":    _str(data.get("eigentümer_name")),
-        "eigentümer_adresse": _str(data.get("eigentümer_adresse")),
-        "eigentümer_plz_ort": _str(data.get("eigentümer_plz_ort")),
+        "eigentümer_name":    _str_val(data.get("eigentümer_name")),
+        "eigentümer_adresse": _str_val(data.get("eigentümer_adresse")),
+        "eigentümer_plz_ort": _str_val(data.get("eigentümer_plz_ort")),
         "eigentümer_geb":     "",
-        "gläubiger":          _lst(data.get("gläubiger")),
-        "forderung_betrag":   _str(data.get("forderung_betrag")),
+        "gläubiger":          _lst_val(data.get("gläubiger")),
+        "forderung_betrag":   _str_val(data.get("forderung_betrag")),
     }
 
 
@@ -2470,15 +2441,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
         print("[Vision-Analyse] ℹ️  PyMuPDF nicht verfügbar – überspringe Vision-Analyse")
         return 0
 
-    GESCHUETZT_PHASEN = {
-        "🔎 In Prüfung",
-        "❌ Nicht relevant",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "✅ Gekauft",
-        "🗄 Archiviert",
-    }
+    # globale GESCHUETZT_PHASEN Konstante wird verwendet
 
     print("\n[Vision-Analyse] 🔭 Suche nach gescannten PDFs …")
 
@@ -2614,35 +2577,9 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
                 print(f"    [Vision] ℹ️  Kein Eigentümer gefunden → als unleserlich markiert")
                 continue
 
-            # Notion-Properties aufbauen
-            def _rt(text: str) -> dict:
-                return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
-
-            def _clean_extracted_name(name: str) -> str:
-                if not name:
-                    return ""
-                # GPT-Platzhalter / Nicht-Namen herausfiltern
-                INVALID_NAMES = {"nicht angegeben", "unbekannt", "n/a", "none", "null", "-", "–"}
-                if name.strip().lower() in INVALID_NAMES:
-                    return ""
-                if re.match(r'^[)\\\]}>]', name) or name.rstrip().endswith('-'):
-                    return ""
-                if not any(c.isalpha() for c in name):
-                    return ""
-                return name
-
-            def _clean_extracted_adresse(adr: str) -> str:
-                if not adr:
-                    return ""
-                adr = re.sub(r',?\s*Telefon.*$', '', adr, flags=re.IGNORECASE).strip().rstrip(',')
-                m_ort_vor_strasse = re.match(r'^(?:[A-Za-z]-?)?\d{4,5}\s+\S+.*?,\s*(.+)', adr)
-                if m_ort_vor_strasse:
-                    adr = m_ort_vor_strasse.group(1).strip()
-                adr = re.sub(r',\s*[A-ZÄÖÜ][a-zäöüß]+$', '', adr).strip()
-                return adr
-
-            name_clean = _clean_extracted_name(info.get("eigentümer_name", ""))
-            adr_clean  = _clean_extracted_adresse(info.get("eigentümer_adresse", ""))
+            # Notion-Properties aufbauen (globale Hilfsfunktionen)
+            name_clean = _clean_name(info.get("eigentümer_name", ""))
+            adr_clean  = _clean_adresse(info.get("eigentümer_adresse", ""))
 
             properties: dict = {"Gutachten analysiert?": {"checkbox": True}}
 
@@ -2716,36 +2653,35 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
     to_check: list[dict] = []
 
     for page in pages:
-        if True:
-            props = page.get("properties", {})
+        props = page.get("properties", {})
 
-            # Bereits archivierte überspringen
-            phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-            if phase in SKIP_PHASEN:
-                continue
-            if props.get("Archiviert", {}).get("checkbox", False):
-                continue
+        # Bereits archivierte überspringen
+        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        if phase in SKIP_PHASEN:
+            continue
+        if props.get("Archiviert", {}).get("checkbox", False):
+            continue
 
-            # Muss eine URL haben
-            link_val = props.get("Link", {}).get("url")
-            if not link_val:
-                continue
+        # Muss eine URL haben
+        link_val = props.get("Link", {}).get("url")
+        if not link_val:
+            continue
 
-            status_val = (props.get("Status", {}).get("select") or {}).get("name", "")
+        status_val = (props.get("Status", {}).get("select") or {}).get("name", "")
 
-            # Titel für Alarm
-            titel_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
-            titel = "".join(
-                (b.get("text") or {}).get("content", "") for b in titel_rt
-            ).strip() or page["id"][:8]
+        # Titel für Alarm
+        titel_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
+        titel = "".join(
+            (b.get("text") or {}).get("content", "") for b in titel_rt
+        ).strip() or page["id"][:8]
 
-            to_check.append({
-                "page_id":  page["id"],
-                "link":     link_val,
-                "phase":    phase,
-                "status":   status_val,
-                "titel":    titel,
-            })
+        to_check.append({
+            "page_id":  page["id"],
+            "link":     link_val,
+            "phase":    phase,
+            "status":   status_val,
+            "titel":    titel,
+        })
 
     MAX_CHECK = 50   # max 50 URL-Checks pro Run (schont das Netz)
     if len(to_check) > MAX_CHECK:
@@ -2957,12 +2893,11 @@ def _geschlecht_via_gpt(vorname: str) -> str | None:
     Wird gecacht um API-Kosten zu minimieren.
     """
     try:
-        import openai as _openai
         api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key:
+        if not api_key or not OPENAI_AVAILABLE:
             return None
 
-        client = _openai.OpenAI(api_key=api_key)
+        client = _OpenAI(api_key=api_key)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{
@@ -3090,8 +3025,6 @@ def _brief_send_email(kontakt_email: str, kontakt_name: str,
 
     Gibt True bei Erfolg, False bei Fehler zurück.
     """
-    import base64
-
     api_key   = os.environ.get("SENDGRID_API_KEY", "")
     absender  = os.environ.get("SMTP_USER", "")
 
@@ -3249,7 +3182,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         bundesland = (first_props.get("Bundesland", {}).get("select") or {}).get("name", "")
 
         # ── Pflichtfelder prüfen ──────────────────────────────────────────────
-        titel_list = first_props.get("Name", {}).get("title", [])
+        titel_list = first_props.get("Liegenschaftsadresse", {}).get("title", [])
         titel      = "".join(t.get("plain_text", "") for t in titel_list).strip()
 
         if not eigentuemer:
