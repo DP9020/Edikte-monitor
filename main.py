@@ -305,9 +305,19 @@ def _strip_html_tags(text: str) -> str:
     return plain
 
 
-def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "") -> bool:
+# Bundesländer die Benjamin (Pippan) betreffen
+BENJAMIN_BUNDESLAENDER = {"Wien", "Oberösterreich"}
+
+
+def _get_benjamin_chat_id() -> str | None:
+    """Gibt Benjamins Chat-ID zurück, oder None wenn nicht konfiguriert."""
+    return os.getenv("TELEGRAM_CHAT_ID_BENJAMIN") or None
+
+
+def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "", bundesland: str = "") -> bool:
     """
     Schickt eine DOCX-Datei als Telegram-Dokument (sendDocument, multipart/form-data).
+    Wenn bundesland in BENJAMIN_BUNDESLAENDER → auch an Benjamin senden.
     Gibt True zurück wenn erfolgreich, sonst False.
     """
     try:
@@ -346,18 +356,58 @@ def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "")
         with urllib.request.urlopen(req, timeout=30) as r:
             r.read()
         print(f"  [Brief] 📨 Telegram-Dokument gesendet: {dateiname}")
+
+        # Auch an Benjamin senden wenn Bundesland Wien oder OÖ
+        benjamin_id = _get_benjamin_chat_id()
+        if benjamin_id and bundesland in BENJAMIN_BUNDESLAENDER:
+            _send_document_to_chat(token, benjamin_id, docx_bytes, dateiname, caption)
+            print(f"  [Brief] 📨 Telegram-Dokument auch an Benjamin gesendet: {dateiname}")
+
         return True
     except Exception as exc:
         print(f"  [Brief] ⚠️  Telegram-Dokument fehlgeschlagen: {exc}")
         return False
 
 
-async def send_telegram(message: str) -> None:
+def _send_document_to_chat(token: str, chat_id: str, docx_bytes: bytes, dateiname: str, caption: str) -> None:
+    """Sendet ein Dokument an eine bestimmte Chat-ID."""
+    url      = f"https://api.telegram.org/bot{token}/sendDocument"
+    boundary = "----TelegramBoundary7438292"
+    CRLF     = b"\r\n"
+
+    def field(name: str, value: str) -> bytes:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n"
+        ).encode("utf-8")
+
+    body = (
+        field("chat_id", chat_id)
+        + field("caption", caption[:1024])
+        + (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="document"; filename="{dateiname}"\r\n'
+            f"Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\n\r\n"
+        ).encode("utf-8")
+        + docx_bytes
+        + CRLF
+        + f"--{boundary}--\r\n".encode("utf-8")
+    )
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        r.read()
+
+
+async def send_telegram(message: str, extra_chat_ids: list[str] | None = None) -> None:
     """
     Sendet eine Nachricht via Telegram Bot (HTML-Modus).
-    - Wenn die Nachricht > 4096 Zeichen: wird in mehrere Teile aufgeteilt,
-      wobei jeder Teil an einer Zeilengrenze getrennt wird (kein halber HTML-Tag).
+    - Wenn die Nachricht > 4096 Zeichen: wird in mehrere Teile aufgeteilt.
     - Bei HTML-Fehler (400): Fallback auf reinen Text ohne parse_mode.
+    - extra_chat_ids: zusätzliche Chat-IDs die dieselbe Nachricht bekommen.
     """
     token   = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
@@ -409,6 +459,30 @@ async def send_telegram(message: str) -> None:
                 print(f"[Telegram] ✅ Plain-Text{label} gesendet ({len(plain)} Zeichen)")
             except Exception as e2:
                 raise RuntimeError(f"Telegram komplett fehlgeschlagen{label}: {e2}") from e2
+
+    # Nachricht auch an extra Chat-IDs senden (z.B. Benjamin)
+    if extra_chat_ids:
+        for extra_id in extra_chat_ids:
+            for i, part in enumerate(parts, 1):
+                label = f" ({i}/{total})" if total > 1 else ""
+                try:
+                    _telegram_send_raw(url, {
+                        "chat_id":                  extra_id,
+                        "text":                     part,
+                        "parse_mode":               "HTML",
+                        "disable_web_page_preview": True,
+                    })
+                    print(f"[Telegram] ✅ Nachricht{label} an {extra_id} gesendet")
+                except Exception as e:
+                    plain = _truncate_plain(_strip_html_tags(part))
+                    try:
+                        _telegram_send_raw(url, {
+                            "chat_id":                  extra_id,
+                            "text":                     plain,
+                            "disable_web_page_preview": True,
+                        })
+                    except Exception:
+                        print(f"[Telegram] ⚠️  Nachricht an {extra_id} fehlgeschlagen: {e}")
 
 
 # =============================================================================
@@ -3173,7 +3247,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 f"📅 {datum_str}"
                 + (f"\n🏠 {len(liegenschaften)} Liegenschaften" if len(liegenschaften) > 1 else "")
             )
-            send_telegram_document(docx_bytes, dateiname_docx, caption=tg_caption)
+            send_telegram_document(docx_bytes, dateiname_docx, caption=tg_caption, bundesland=bundesland)
 
             # ── Notion: alle Seiten der Gruppe aktualisieren ──────────────────
             versand_info = f"E-Mail an {kontakt['email']}" if email_ok else "Telegram"
@@ -3582,6 +3656,36 @@ async def main() -> None:
         await send_telegram("\n".join(lines))
     except Exception as exc:
         print(f"[ERROR] Telegram fehlgeschlagen: {exc}")
+
+    # ── Benjamin: gefilterte Nachricht nur für Wien + OÖ ─────────────────────
+    benjamin_id = _get_benjamin_chat_id()
+    if benjamin_id:
+        try:
+            # Nur neue Einträge aus Wien oder OÖ herausfiltern
+            benjamin_eintraege = [
+                e for e in neue_eintraege
+                if e.get("bundesland", "") in BENJAMIN_BUNDESLAENDER
+            ]
+            if benjamin_eintraege:
+                b_lines = [
+                    "<b>🏛 Edikte-Monitor</b>",
+                    f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
+                    f"<i>(Wien &amp; Oberösterreich)</i>",
+                    "",
+                    f"<b>🟢 Neue Versteigerungen: {len(benjamin_eintraege)}</b>",
+                ]
+                for item in benjamin_eintraege[:20]:
+                    detail    = item.get("_detail", {})
+                    adresse   = html_escape(detail.get("adresse_voll") or item["beschreibung"][:70])
+                    kategorie = html_escape(detail.get("kategorie", ""))
+                    kat_str   = f" [{kategorie}]" if kategorie else ""
+                    b_lines.append(f"• {html_escape(item['bundesland'])} – {adresse}{kat_str}")
+                await send_telegram("\n".join(b_lines), extra_chat_ids=[benjamin_id])
+                print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin gesendet ({len(benjamin_eintraege)} Einträge)")
+            else:
+                print("[Telegram] ℹ️  Keine Wien/OÖ-Einträge – kein Telegram an Benjamin")
+        except Exception as exc:
+            print(f"[ERROR] Telegram Benjamin fehlgeschlagen: {exc}")
 
 
 if __name__ == "__main__":
