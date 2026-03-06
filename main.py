@@ -2952,22 +2952,60 @@ def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> byte
 
 def _brief_anrede(eigentuemer: str) -> str:
     """
-    Erzeugt eine geschlechtsspezifische Anrede aus dem Eigentümernamen.
-    Heuristik:
-      - Enthält "Hr." / "Herr" → männlich
-      - Enthält "Fr." / "Frau" → weiblich
-      - Enthält bekannte weibliche Titel-Präfixe → weiblich
-      - Sonst → neutral "Sehr geehrte Damen und Herren,"
+    Erzeugt eine korrekte Anrede aus dem Eigentümernamen (verpflichtende Partei).
+
+    Regeln:
+      - Mehrere Personen (erkennbar an " und ", " & ", "/" zwischen Namen) oder
+        Firma/GmbH/AG/... → "Sehr geehrte Damen und Herren,"
+      - Enthält "Herr" / "Hr." → "Sehr geehrter Herr [Nachname],"
+      - Enthält "Frau" / "Fr." → "Sehr geehrte Frau [Nachname],"
+      - Titel (Dr., Mag., Ing., DI, Prof.) werden korrekt vorangestellt
+      - Sonst → "Sehr geehrte Damen und Herren,"
     """
     name = eigentuemer.strip()
-    # Direkte Anrede-Teile bestimmen
     lower = name.lower()
-    if any(t in lower for t in ("herr", " hr.", "hr ")):
-        return f"Sehr geehrter Hr. {name},"
-    elif any(t in lower for t in ("frau", " fr.", "fr ")):
-        return f"Sehr geehrte Fr. {name},"
-    else:
-        return f"Sehr geehrte Damen und Herren,"
+
+    # ── Firma / Mehrere Personen → neutral ───────────────────────────────────
+    FIRMA_KEYWORDS = (
+        "gmbh", "ag ", " ag", "og ", " og", "kg ", " kg", "keg", "stiftung",
+        "verein", "genossenschaft", "gbr", "inc.", "ltd", "s.r.o",
+        "immobilien", "holding", "gmbh & co", "eigentümergemeinschaft",
+    )
+    if any(kw in lower for kw in FIRMA_KEYWORDS):
+        return "Sehr geehrte Damen und Herren,"
+
+    # Mehrere Personen erkennbar an Trennzeichen
+    if any(sep in name for sep in (" und ", " & ", " / ", " u. ")):
+        return "Sehr geehrte Damen und Herren,"
+
+    # ── Titel extrahieren (werden in der Anrede behalten) ────────────────────
+    TITEL = ("Dr.", "Mag.", "Ing.", "DI", "Dipl.-Ing.", "Prof.", "DDr.",
+             "MBA", "MSc", "BSc", "MMag.", "MAS", "LL.M.", "BEd", "MEd")
+    titel_teile = []
+    rest = name
+    for t in TITEL:
+        if rest.startswith(t + " ") or f" {t} " in rest:
+            titel_teile.append(t)
+            rest = rest.replace(t, "").strip()
+
+    # ── Geschlecht bestimmen ──────────────────────────────────────────────────
+    # "Herr" / "Hr." im Namen → männlich
+    if re.search(r"\bherr\b|\bhr\.", lower):
+        # Nachname: letztes Wort nach dem Vornamen
+        clean = re.sub(r"\b(herr|hr\.)\b", "", rest, flags=re.IGNORECASE).strip()
+        titel_str = " ".join(titel_teile) + " " if titel_teile else ""
+        nachname  = clean.split()[-1] if clean.split() else clean
+        return f"Sehr geehrter Herr {titel_str}{nachname},"
+
+    # "Frau" / "Fr." im Namen → weiblich
+    if re.search(r"\bfrau\b|\bfr\.", lower):
+        clean = re.sub(r"\b(frau|fr\.)\b", "", rest, flags=re.IGNORECASE).strip()
+        titel_str = " ".join(titel_teile) + " " if titel_teile else ""
+        nachname  = clean.split()[-1] if clean.split() else clean
+        return f"Sehr geehrte Frau {titel_str}{nachname},"
+
+    # ── Kein eindeutiges Geschlecht → neutral ────────────────────────────────
+    return "Sehr geehrte Damen und Herren,"
 
 
 def _brief_send_email(kontakt_email: str, kontakt_name: str,
