@@ -2950,22 +2950,64 @@ def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> byte
     return buf.getvalue()
 
 
+def _geschlecht_via_gpt(vorname: str) -> str | None:
+    """
+    Fragt ChatGPT nach dem Geschlecht eines Vornamens.
+    Gibt "m" (männlich), "f" (weiblich) oder None (unbekannt/neutral) zurück.
+    Wird gecacht um API-Kosten zu minimieren.
+    """
+    try:
+        import openai as _openai
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            return None
+
+        client = _openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Ist der Vorname \"{vorname}\" männlich oder weiblich? "
+                    "Antworte NUR mit einem einzigen Buchstaben: "
+                    "m (männlich), f (weiblich) oder n (neutral/unbekannt). "
+                    "Keine Erklärung, nur den Buchstaben."
+                )
+            }],
+            max_tokens=1,
+            temperature=0,
+        )
+        antwort = response.choices[0].message.content.strip().lower()
+        if antwort == "m":
+            return "m"
+        elif antwort == "f":
+            return "f"
+        return None
+    except Exception as exc:
+        print(f"  [Anrede] ⚠️  GPT-Geschlechtserkennung fehlgeschlagen: {exc}")
+        return None
+
+
+# Cache damit jeder Vorname nur einmal abgefragt wird
+_geschlecht_cache: dict[str, str | None] = {}
+
+
 def _brief_anrede(eigentuemer: str) -> str:
     """
     Erzeugt eine korrekte Anrede aus dem Eigentümernamen (verpflichtende Partei).
 
-    Regeln:
-      - Mehrere Personen (erkennbar an " und ", " & ", "/" zwischen Namen) oder
-        Firma/GmbH/AG/... → "Sehr geehrte Damen und Herren,"
-      - Enthält "Herr" / "Hr." → "Sehr geehrter Herr [Nachname],"
-      - Enthält "Frau" / "Fr." → "Sehr geehrte Frau [Nachname],"
-      - Titel (Dr., Mag., Ing., DI, Prof.) werden korrekt vorangestellt
-      - Sonst → "Sehr geehrte Damen und Herren,"
+    Reihenfolge:
+      1. Firma / GmbH / AG etc.           → "Sehr geehrte Damen und Herren,"
+      2. Mehrere Personen (" und ", " & ") → "Sehr geehrte Damen und Herren,"
+      3. "Herr" / "Hr." explizit          → "Sehr geehrter Herr [Nachname],"
+      4. "Frau" / "Fr." explizit          → "Sehr geehrte Frau [Nachname],"
+      5. Vorname via ChatGPT erkennen     → männlich/weiblich/neutral
+      6. Fallback                         → "Sehr geehrte Damen und Herren,"
     """
     name = eigentuemer.strip()
     lower = name.lower()
 
-    # ── Firma / Mehrere Personen → neutral ───────────────────────────────────
+    # ── 1. Firma / Mehrere Personen → neutral ────────────────────────────────
     FIRMA_KEYWORDS = (
         "gmbh", "ag ", " ag", "og ", " og", "kg ", " kg", "keg", "stiftung",
         "verein", "genossenschaft", "gbr", "inc.", "ltd", "s.r.o",
@@ -2974,11 +3016,10 @@ def _brief_anrede(eigentuemer: str) -> str:
     if any(kw in lower for kw in FIRMA_KEYWORDS):
         return "Sehr geehrte Damen und Herren,"
 
-    # Mehrere Personen erkennbar an Trennzeichen
     if any(sep in name for sep in (" und ", " & ", " / ", " u. ")):
         return "Sehr geehrte Damen und Herren,"
 
-    # ── Titel extrahieren (werden in der Anrede behalten) ────────────────────
+    # ── Titel extrahieren ────────────────────────────────────────────────────
     TITEL = ("Dr.", "Mag.", "Ing.", "DI", "Dipl.-Ing.", "Prof.", "DDr.",
              "MBA", "MSc", "BSc", "MMag.", "MAS", "LL.M.", "BEd", "MEd")
     titel_teile = []
@@ -2987,24 +3028,53 @@ def _brief_anrede(eigentuemer: str) -> str:
         if rest.startswith(t + " ") or f" {t} " in rest:
             titel_teile.append(t)
             rest = rest.replace(t, "").strip()
+    titel_str = " ".join(titel_teile) + " " if titel_teile else ""
 
-    # ── Geschlecht bestimmen ──────────────────────────────────────────────────
-    # "Herr" / "Hr." im Namen → männlich
+    # ── 3. Explizites "Herr" / "Hr." ─────────────────────────────────────────
     if re.search(r"\bherr\b|\bhr\.", lower):
-        # Nachname: letztes Wort nach dem Vornamen
-        clean = re.sub(r"\b(herr|hr\.)\b", "", rest, flags=re.IGNORECASE).strip()
-        titel_str = " ".join(titel_teile) + " " if titel_teile else ""
-        nachname  = clean.split()[-1] if clean.split() else clean
+        clean    = re.sub(r"\b(herr|hr\.)\b", "", rest, flags=re.IGNORECASE).strip()
+        nachname = clean.split()[-1] if clean.split() else clean
         return f"Sehr geehrter Herr {titel_str}{nachname},"
 
-    # "Frau" / "Fr." im Namen → weiblich
+    # ── 4. Explizites "Frau" / "Fr." ─────────────────────────────────────────
     if re.search(r"\bfrau\b|\bfr\.", lower):
-        clean = re.sub(r"\b(frau|fr\.)\b", "", rest, flags=re.IGNORECASE).strip()
-        titel_str = " ".join(titel_teile) + " " if titel_teile else ""
-        nachname  = clean.split()[-1] if clean.split() else clean
+        clean    = re.sub(r"\b(frau|fr\.)\b", "", rest, flags=re.IGNORECASE).strip()
+        nachname = clean.split()[-1] if clean.split() else clean
         return f"Sehr geehrte Frau {titel_str}{nachname},"
 
-    # ── Kein eindeutiges Geschlecht → neutral ────────────────────────────────
+    # ── 5. Vorname via ChatGPT erkennen ──────────────────────────────────────
+    # Annahme: Format "Nachname Vorname" oder "Vorname Nachname"
+    # Wir probieren beide Varianten: erstes und letztes Wort als Vorname
+    woerter = rest.split()
+    nachname = woerter[-1] if woerter else rest
+
+    # Ersten und letzten Wort als möglichen Vornamen testen
+    vorname_kandidaten = []
+    if len(woerter) >= 2:
+        vorname_kandidaten = [woerter[0], woerter[-2]]  # erstes Wort, vorletztes Wort
+    elif len(woerter) == 1:
+        vorname_kandidaten = [woerter[0]]
+
+    geschlecht = None
+    vorname_gefunden = None
+    for vn in vorname_kandidaten:
+        if vn in _geschlecht_cache:
+            geschlecht = _geschlecht_cache[vn]
+        else:
+            geschlecht = _geschlecht_via_gpt(vn)
+            _geschlecht_cache[vn] = geschlecht
+        if geschlecht in ("m", "f"):
+            vorname_gefunden = vn
+            break
+
+    if geschlecht == "m":
+        print(f"  [Anrede] 👤 {vorname_gefunden} → männlich")
+        return f"Sehr geehrter Herr {titel_str}{nachname},"
+    elif geschlecht == "f":
+        print(f"  [Anrede] 👤 {vorname_gefunden} → weiblich")
+        return f"Sehr geehrte Frau {titel_str}{nachname},"
+
+    # ── 6. Fallback → neutral ────────────────────────────────────────────────
     return "Sehr geehrte Damen und Herren,"
 
 
