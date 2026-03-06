@@ -21,29 +21,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Show Telegram Chat IDs (temporaer)
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          seen = set()
-          for u in data.get('result', []):
-              msg = u.get('message') or u.get('my_chat_member', {})
-              chat = msg.get('chat', {})
-              cid = chat.get('id')
-              name = chat.get('first_name','') + ' ' + chat.get('last_name','')
-              if cid and cid not in seen:
-                  seen.add(cid)
-                  print(f'Chat-ID: {cid} | Name: {name.strip()}')
-          "
       - name: Run
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID_BENJAMIN: ${{ secrets.TELEGRAM_CHAT_ID_BENJAMIN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
