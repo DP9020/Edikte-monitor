@@ -2160,10 +2160,6 @@ def notion_status_sync(notion: Client, db_id: str,
         status    = (props.get("Status", {}).get("select") or {}).get("name", "")
         relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
         phase_ist = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-        bundesland = (props.get("Bundesland", {}).get("select") or {}).get("name", "")
-        titel_rt   = props.get("Liegenschaftsadresse", {}).get("title", [])
-        titel      = "".join(t.get("plain_text", "") for t in titel_rt)
-
         update_props: dict = {}
 
         # ── Quelle 2: 'Für uns relevant?' hat Vorrang vor Status-Farbe ──
@@ -2200,43 +2196,26 @@ def notion_status_sync(notion: Client, db_id: str,
         if not update_props:
             continue
 
-        # Ziel-Phase ermitteln (entweder frisch gesetzt oder bereits korrekt)
-        phase_neu = update_props.get("Workflow-Phase", {}).get("select", {}).get("name", phase_ist)
-
-        # Für Benjamin-Benachrichtigung: Einträge die JETZT erstmals als
-        # 'Relevant' gesetzt werden (phase_ist war vorher NICHT 'Relevant').
-        # Nur wenn sich die Phase tatsächlich ändert (phase_ist != phase_soll).
-        neu_relevant = (
-            phase_neu == "✅ Relevant – Brief vorbereiten"
-            and phase_ist != "✅ Relevant – Brief vorbereiten"
-        )
-
         to_update.append({
             "page_id":      page["id"],
             "update_props": update_props,
-            "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={phase_neu}",
-            "bundesland":   bundesland,
-            "titel":        titel,
-            "neu_relevant": neu_relevant,
+            "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={update_props.get('Workflow-Phase', {}).get('select', {}).get('name', phase_ist)}",
         })
 
     print(f"  [Status-Sync] 📋 {len(to_update)} Einträge werden synchronisiert")
 
     updated = 0
-    neu_relevante_benjamin: list[dict] = []   # Wien/OÖ die gerade erst 'Relevant' wurden
     for entry in to_update:
         try:
             notion.pages.update(page_id=entry["page_id"], properties=entry["update_props"])
             print(f"  [Status-Sync] ✅ {entry['label']}")
             updated += 1
-            if entry["neu_relevant"] and entry["bundesland"] in BENJAMIN_BUNDESLAENDER:
-                neu_relevante_benjamin.append(entry)
         except Exception as exc:
             print(f"  [Status-Sync] ⚠️  Update fehlgeschlagen: {exc}")
         time.sleep(0.2)
 
     print(f"[Status-Sync] ✅ {updated} Einträge synchronisiert")
-    return updated, neu_relevante_benjamin
+    return updated
 
 
 # =============================================================================
@@ -3468,7 +3447,7 @@ async def main() -> None:
         print("[Modus] ⚡ BRIEF_ONLY – nur Status-Sync + Brief-Erstellung")
         try:
             _pages = notion_load_all_pages(notion, db_id)
-            _, _neu_rel_ben = notion_status_sync(notion, db_id, all_pages=_pages)
+            notion_status_sync(notion, db_id, all_pages=_pages)
             # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
             _pages = notion_load_all_pages(notion, db_id)
             brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_pages)
@@ -3485,25 +3464,6 @@ async def main() -> None:
                 for bl in brief_telegram[:20]:
                     lines.append(f"• {bl}")
                 await send_telegram("\n".join(lines))
-            # Benjamin über neu-relevante Wien/OÖ-Einträge informieren
-            _ben_id = _get_benjamin_chat_id()
-            if _ben_id and _neu_rel_ben:
-                try:
-                    r_lines = [
-                        "<b>🏛 Edikte-Monitor</b>",
-                        f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
-                        f"<i>(Wien &amp; Oberösterreich – als relevant markiert)</i>",
-                        "",
-                        f"<b>✅ Relevant markiert: {len(_neu_rel_ben)}</b>",
-                    ]
-                    for entry in _neu_rel_ben[:20]:
-                        bl  = html_escape(entry.get("bundesland", ""))
-                        ttl = html_escape(entry.get("titel", "")[:70])
-                        r_lines.append(f"• {bl} – {ttl}")
-                    await send_telegram("\n".join(r_lines), extra_chat_ids=[_ben_id])
-                    print(f"[Telegram] ✅ Relevant-Markierung an Benjamin gesendet ({len(_neu_rel_ben)} Einträge)")
-                except Exception as exc:
-                    print(f"[ERROR] Telegram Benjamin (BRIEF_ONLY) fehlgeschlagen: {exc}")
         except Exception as exc:
             print(f"[Modus] ❌ BRIEF_ONLY Fehler: {exc}")
         return
@@ -3594,11 +3554,8 @@ async def main() -> None:
     # ── 3a. Status-Sync: Status-Farbe / Für-uns-relevant? → Phase + Checkboxen ─
     # Wenn ein Kollege manuell 🔴/🟡/🟢 setzt oder "Für uns relevant?" befüllt,
     # werden Phase und Checkboxen automatisch angepasst (kein manuelles Ankreuzen nötig).
-    # Rückgabe: (updated_count, neu_relevante_benjamin) – Einträge aus Wien/OÖ
-    # die in diesem Run erstmals als '✅ Relevant' markiert wurden.
-    neu_relevante_benjamin: list[dict] = []
     try:
-        _, neu_relevante_benjamin = notion_status_sync(notion, db_id, all_pages=_all_pages)
+        notion_status_sync(notion, db_id, all_pages=_all_pages)
     except Exception as exc:
         print(f"  [WARN] Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
 
@@ -3747,11 +3704,9 @@ async def main() -> None:
     except Exception as exc:
         print(f"[ERROR] Telegram fehlgeschlagen: {exc}")
 
-    # ── Benjamin: gefilterte Nachrichten nur für Wien + OÖ ───────────────────
+    # ── Benjamin: gefilterte Nachricht nur für Wien + OÖ ─────────────────────
     benjamin_id = _get_benjamin_chat_id()
     if benjamin_id:
-
-        # 1) Neue Versteigerungen aus Wien/OÖ (in diesem Run erstmals importiert)
         try:
             benjamin_eintraege = [
                 e for e in neue_eintraege
@@ -3772,33 +3727,11 @@ async def main() -> None:
                     kat_str   = f" [{kategorie}]" if kategorie else ""
                     b_lines.append(f"• {html_escape(item['bundesland'])} – {adresse}{kat_str}")
                 await send_telegram("\n".join(b_lines), extra_chat_ids=[benjamin_id])
-                print(f"[Telegram] ✅ Neue Versteigerungen an Benjamin gesendet ({len(benjamin_eintraege)} Einträge)")
+                print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin gesendet ({len(benjamin_eintraege)} Einträge)")
             else:
-                print("[Telegram] ℹ️  Keine neuen Wien/OÖ-Versteigerungen – kein Telegram an Benjamin")
+                print("[Telegram] ℹ️  Keine Wien/OÖ-Einträge – kein Telegram an Benjamin")
         except Exception as exc:
-            print(f"[ERROR] Telegram Benjamin (Versteigerungen) fehlgeschlagen: {exc}")
-
-        # 2) Einträge die in diesem Run erstmals als '✅ Relevant' markiert wurden
-        #    (Kollege hat manuell "Für uns relevant? = Ja" gesetzt)
-        try:
-            if neu_relevante_benjamin:
-                r_lines = [
-                    "<b>🏛 Edikte-Monitor</b>",
-                    f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
-                    f"<i>(Wien &amp; Oberösterreich – als relevant markiert)</i>",
-                    "",
-                    f"<b>✅ Relevant markiert: {len(neu_relevante_benjamin)}</b>",
-                ]
-                for entry in neu_relevante_benjamin[:20]:
-                    bl  = html_escape(entry.get("bundesland", ""))
-                    ttl = html_escape(entry.get("titel", "")[:70])
-                    r_lines.append(f"• {bl} – {ttl}")
-                await send_telegram("\n".join(r_lines), extra_chat_ids=[benjamin_id])
-                print(f"[Telegram] ✅ Relevant-Markierung an Benjamin gesendet ({len(neu_relevante_benjamin)} Einträge)")
-            else:
-                print("[Telegram] ℹ️  Keine neu-relevanten Wien/OÖ-Einträge in diesem Run")
-        except Exception as exc:
-            print(f"[ERROR] Telegram Benjamin (Relevant) fehlgeschlagen: {exc}")
+            print(f"[ERROR] Telegram Benjamin fehlgeschlagen: {exc}")
 
 
 if __name__ == "__main__":
