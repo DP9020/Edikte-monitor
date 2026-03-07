@@ -2160,7 +2160,6 @@ def notion_status_sync(notion: Client, db_id: str,
         status    = (props.get("Status", {}).get("select") or {}).get("name", "")
         relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
         phase_ist = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-
         update_props: dict = {}
 
         # ── Quelle 2: 'Für uns relevant?' hat Vorrang vor Status-Farbe ──
@@ -2197,8 +2196,6 @@ def notion_status_sync(notion: Client, db_id: str,
         if not update_props:
             continue
 
-        # Bereits alles korrekt → überspringen (nur Phase-Check reicht nicht,
-        # da Checkboxen evtl. noch falsch sind – daher immer in Queue)
         to_update.append({
             "page_id":      page["id"],
             "update_props": update_props,
@@ -2951,7 +2948,7 @@ def _brief_anrede(eigentuemer: str) -> str:
     if any(kw in lower for kw in FIRMA_KEYWORDS):
         return "Sehr geehrte Damen und Herren,"
 
-    if any(sep in name for sep in (" und ", " & ", " / ", " u. ")):
+    if any(sep in name for sep in (" und ", " & ", " / ", " u. ", " | ")):
         return "Sehr geehrte Damen und Herren,"
 
     # ── Titel extrahieren ────────────────────────────────────────────────────
@@ -3711,7 +3708,6 @@ async def main() -> None:
     benjamin_id = _get_benjamin_chat_id()
     if benjamin_id:
         try:
-            # Nur neue Einträge aus Wien oder OÖ herausfiltern
             benjamin_eintraege = [
                 e for e in neue_eintraege
                 if e.get("bundesland", "") in BENJAMIN_BUNDESLAENDER
