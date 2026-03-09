@@ -3704,7 +3704,7 @@ async def main() -> None:
     except Exception as exc:
         print(f"[ERROR] Telegram fehlgeschlagen: {exc}")
 
-    # ── Benjamin: gefilterte Nachricht nur für Wien + OÖ ─────────────────────
+    # ── Benjamin: gefilterte Nachricht direkt (nur Wien + OÖ) ────────────────
     benjamin_id = _get_benjamin_chat_id()
     if benjamin_id:
         try:
@@ -3726,8 +3726,27 @@ async def main() -> None:
                     kategorie = html_escape(detail.get("kategorie", ""))
                     kat_str   = f" [{kategorie}]" if kategorie else ""
                     b_lines.append(f"• {html_escape(item['bundesland'])} – {adresse}{kat_str}")
-                await send_telegram("\n".join(b_lines), extra_chat_ids=[benjamin_id])
-                print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin gesendet ({len(benjamin_eintraege)} Einträge)")
+                # Direkt an Benjamin senden – NICHT über extra_chat_ids von send_telegram
+                token = env("TELEGRAM_BOT_TOKEN")
+                tg_url = f"https://api.telegram.org/bot{token}/sendMessage"
+                msg = "\n".join(b_lines)
+                try:
+                    _telegram_send_raw(tg_url, {
+                        "chat_id":                  benjamin_id,
+                        "text":                     msg,
+                        "parse_mode":               "HTML",
+                        "disable_web_page_preview": True,
+                    })
+                    print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin gesendet ({len(benjamin_eintraege)} Einträge)")
+                except Exception:
+                    # Fallback: Plain Text
+                    plain = _truncate_plain(_strip_html_tags(msg))
+                    _telegram_send_raw(tg_url, {
+                        "chat_id":                  benjamin_id,
+                        "text":                     plain,
+                        "disable_web_page_preview": True,
+                    })
+                    print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin (Plain) gesendet ({len(benjamin_eintraege)} Einträge)")
             else:
                 print("[Telegram] ℹ️  Keine Wien/OÖ-Einträge – kein Telegram an Benjamin")
         except Exception as exc:
