@@ -41,6 +41,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_CHAT_ID_BENJAMIN: ${{ secrets.TELEGRAM_CHAT_ID_BENJAMIN }}
+          TELEGRAM_CHAT_ID_CHRISTOPHER: ${{ secrets.TELEGRAM_CHAT_ID_CHRISTOPHER }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
