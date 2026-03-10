@@ -370,10 +370,18 @@ def _strip_html_tags(text: str) -> str:
 # Bundesländer die Benjamin (Pippan) betreffen
 BENJAMIN_BUNDESLAENDER = {"Wien", "Oberösterreich"}
 
+# Bundesländer die Christopher (Dovjak) betreffen
+CHRISTOPHER_BUNDESLAENDER = {"Niederösterreich", "Burgenland"}
+
 
 def _get_benjamin_chat_id() -> str:
     """Gibt die Telegram Chat-ID von Benjamin zurück (aus Umgebungsvariable)."""
     return os.environ.get("TELEGRAM_CHAT_ID_BENJAMIN", "")
+
+
+def _get_christopher_chat_id() -> str:
+    """Gibt die Telegram Chat-ID von Christopher zurück (aus Umgebungsvariable)."""
+    return os.environ.get("TELEGRAM_CHAT_ID_CHRISTOPHER", "")
 
 
 def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "", bundesland: str = "") -> bool:
@@ -424,6 +432,12 @@ def send_telegram_document(docx_bytes: bytes, dateiname: str, caption: str = "",
         if benjamin_id and bundesland in BENJAMIN_BUNDESLAENDER:
             _send_document_to_chat(token, benjamin_id, docx_bytes, dateiname, caption)
             print(f"  [Brief] 📨 Telegram-Dokument auch an Benjamin gesendet: {dateiname}")
+
+        # Auch an Christopher senden wenn Bundesland NÖ oder Burgenland
+        christopher_id = _get_christopher_chat_id()
+        if christopher_id and bundesland in CHRISTOPHER_BUNDESLAENDER:
+            _send_document_to_chat(token, christopher_id, docx_bytes, dateiname, caption)
+            print(f"  [Brief] 📨 Telegram-Dokument auch an Christopher gesendet: {dateiname}")
 
         return True
     except Exception as exc:
@@ -3704,53 +3718,68 @@ async def main() -> None:
     except Exception as exc:
         print(f"[ERROR] Telegram fehlgeschlagen: {exc}")
 
-    # ── Benjamin: gefilterte Nachricht direkt (nur Wien + OÖ) ────────────────
+    # ── Gefilterte Nachrichten direkt an Betreuer senden ─────────────────────
+    tg_token = env("TELEGRAM_BOT_TOKEN")
+    tg_url   = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+
+    def _send_filtered(chat_id: str, name: str, bundeslaender: set, label: str) -> None:
+        """Sendet gefilterte Versteigerungs-Nachricht direkt an einen Betreuer."""
+        eintraege = [
+            e for e in neue_eintraege
+            if e.get("bundesland", "") in bundeslaender
+        ]
+        if not eintraege:
+            print(f"[Telegram] ℹ️  Keine {label}-Einträge – kein Telegram an {name}")
+            return
+        lines = [
+            "<b>🏛 Edikte-Monitor</b>",
+            f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
+            f"<i>({html_escape(label)})</i>",
+            "",
+            f"<b>🟢 Neue Versteigerungen: {len(eintraege)}</b>",
+        ]
+        for item in eintraege[:20]:
+            detail    = item.get("_detail", {})
+            adresse   = html_escape(detail.get("adresse_voll") or item["beschreibung"][:70])
+            kategorie = html_escape(detail.get("kategorie", ""))
+            kat_str   = f" [{kategorie}]" if kategorie else ""
+            lines.append(f"• {html_escape(item['bundesland'])} – {adresse}{kat_str}")
+        msg = "\n".join(lines)
+        try:
+            _telegram_send_raw(tg_url, {
+                "chat_id":                  chat_id,
+                "text":                     msg,
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": True,
+            })
+            print(f"[Telegram] ✅ Gefilterte Nachricht an {name} gesendet ({len(eintraege)} Einträge)")
+        except Exception:
+            plain = _truncate_plain(_strip_html_tags(msg))
+            try:
+                _telegram_send_raw(tg_url, {
+                    "chat_id":                  chat_id,
+                    "text":                     plain,
+                    "disable_web_page_preview": True,
+                })
+                print(f"[Telegram] ✅ Gefilterte Nachricht an {name} (Plain) gesendet ({len(eintraege)} Einträge)")
+            except Exception as exc2:
+                print(f"[ERROR] Telegram {name} fehlgeschlagen: {exc2}")
+
+    # Benjamin: Wien + Oberösterreich
     benjamin_id = _get_benjamin_chat_id()
     if benjamin_id:
         try:
-            benjamin_eintraege = [
-                e for e in neue_eintraege
-                if e.get("bundesland", "") in BENJAMIN_BUNDESLAENDER
-            ]
-            if benjamin_eintraege:
-                b_lines = [
-                    "<b>🏛 Edikte-Monitor</b>",
-                    f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
-                    f"<i>(Wien &amp; Oberösterreich)</i>",
-                    "",
-                    f"<b>🟢 Neue Versteigerungen: {len(benjamin_eintraege)}</b>",
-                ]
-                for item in benjamin_eintraege[:20]:
-                    detail    = item.get("_detail", {})
-                    adresse   = html_escape(detail.get("adresse_voll") or item["beschreibung"][:70])
-                    kategorie = html_escape(detail.get("kategorie", ""))
-                    kat_str   = f" [{kategorie}]" if kategorie else ""
-                    b_lines.append(f"• {html_escape(item['bundesland'])} – {adresse}{kat_str}")
-                # Direkt an Benjamin senden – NICHT über extra_chat_ids von send_telegram
-                token = env("TELEGRAM_BOT_TOKEN")
-                tg_url = f"https://api.telegram.org/bot{token}/sendMessage"
-                msg = "\n".join(b_lines)
-                try:
-                    _telegram_send_raw(tg_url, {
-                        "chat_id":                  benjamin_id,
-                        "text":                     msg,
-                        "parse_mode":               "HTML",
-                        "disable_web_page_preview": True,
-                    })
-                    print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin gesendet ({len(benjamin_eintraege)} Einträge)")
-                except Exception:
-                    # Fallback: Plain Text
-                    plain = _truncate_plain(_strip_html_tags(msg))
-                    _telegram_send_raw(tg_url, {
-                        "chat_id":                  benjamin_id,
-                        "text":                     plain,
-                        "disable_web_page_preview": True,
-                    })
-                    print(f"[Telegram] ✅ Gefilterte Nachricht an Benjamin (Plain) gesendet ({len(benjamin_eintraege)} Einträge)")
-            else:
-                print("[Telegram] ℹ️  Keine Wien/OÖ-Einträge – kein Telegram an Benjamin")
+            _send_filtered(benjamin_id, "Benjamin", BENJAMIN_BUNDESLAENDER, "Wien & Oberösterreich")
         except Exception as exc:
             print(f"[ERROR] Telegram Benjamin fehlgeschlagen: {exc}")
+
+    # Christopher: Niederösterreich + Burgenland
+    christopher_id = _get_christopher_chat_id()
+    if christopher_id:
+        try:
+            _send_filtered(christopher_id, "Christopher", CHRISTOPHER_BUNDESLAENDER, "Niederösterreich & Burgenland")
+        except Exception as exc:
+            print(f"[ERROR] Telegram Christopher fehlgeschlagen: {exc}")
 
 
 if __name__ == "__main__":
