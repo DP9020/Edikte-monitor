@@ -576,22 +576,31 @@ async def send_telegram(message: str, extra_chat_ids: list[str] | None = None) -
 
 def gdrive_get_service():
     """Erstellt den Google Drive API Service via Service Account (Base64 oder raw JSON)."""
+    print(f"[GDrive] 🔧 GDRIVE_AVAILABLE={GDRIVE_AVAILABLE}")
     if not GDRIVE_AVAILABLE:
+        print("[GDrive] ❌ google-api-python-client nicht installiert")
         return None
     key_raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY", "")
     if not key_raw:
+        print("[GDrive] ❌ GOOGLE_SERVICE_ACCOUNT_KEY nicht gesetzt")
         return None
+    print(f"[GDrive] 🔑 Key gefunden (Länge: {len(key_raw)} Zeichen, Base64={not key_raw.strip().startswith('{')})")
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+    print(f"[GDrive] 📁 GOOGLE_DRIVE_FOLDER_ID={'gesetzt ('+folder_id[:8]+'…)' if folder_id else 'NICHT GESETZT'}")
     try:
         if not key_raw.strip().startswith("{"):
             key_raw = base64.b64decode(key_raw).decode("utf-8")
         creds_info = json.loads(key_raw)
+        print(f"[GDrive] 👤 Service Account: {creds_info.get('client_email', '?')}")
         creds = _gsa.Credentials.from_service_account_info(
             creds_info,
             scopes=["https://www.googleapis.com/auth/drive"],
         )
-        return _gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+        svc = _gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+        print("[GDrive] ✅ Service erfolgreich erstellt")
+        return svc
     except Exception as exc:
-        print(f"[GDrive] ⚠️  Service-Erstellung fehlgeschlagen: {exc}")
+        print(f"[GDrive] ❌ Service-Erstellung fehlgeschlagen: {exc}")
         return None
 
 
@@ -648,15 +657,22 @@ def gdrive_sync_gelb_entries(
         return 0
 
     kandidaten: list[dict] = []
+    gelb_gesamt = 0
     for page in all_pages:
         props       = page.get("properties", {})
         status      = (props.get("Status", {}).get("select") or {}).get("name", "")
         edikt_link  = props.get("Link", {}).get("url") or ""
         drive_link  = props.get("Google Drive Link", {}).get("url") or ""
-        if status == "🟡 Gelb" and edikt_link and not drive_link:
-            kandidaten.append(page)
+        if status == "🟡 Gelb":
+            gelb_gesamt += 1
+            if not edikt_link:
+                print(f"  [GDrive] ⚠️  Gelb-Eintrag ohne Link übersprungen")
+            elif drive_link:
+                print(f"  [GDrive] ℹ️  Drive-Link bereits vorhanden – übersprungen")
+            else:
+                kandidaten.append(page)
 
-    print(f"\n[GDrive] 🔍 {len(kandidaten)} Gelb-Eintrag/Einträge ohne Drive-Link gefunden")
+    print(f"\n[GDrive] 🔍 {gelb_gesamt} Gelb-Einträge gesamt, {len(kandidaten)} ohne Drive-Link")
     if not kandidaten:
         return 0
 
