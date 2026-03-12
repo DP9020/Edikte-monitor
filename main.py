@@ -886,7 +886,7 @@ def _gb_parse_single_owner(lines: list, anteil_idx: int) -> dict:
         if "GEB:" in stripped.upper():         continue
         if "ADR:" in stripped.upper():         continue
         if re.match(r'^\*+', stripped):        continue  # Trennlinie
-        if re.match(r'^Seite\s+\d+\s+von\s+\d+', stripped, re.IGNORECASE): continue  # BUG 1: Seitenangabe
+        if re.search(r'Seite\s+\d+\s+von\s+\d+', stripped, re.IGNORECASE): continue  # Seitenangabe (auch mid-string)
 
         owner["name"] = stripped
 
@@ -1312,7 +1312,8 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
     # Falls Name bekannt aber Adresse fehlt noch → nochmal im gesamten Text suchen
     # (Fallback für Fälle wo Adresse nicht direkt nach "Verpflichtete Partei" steht)
     if result["eigentümer_name"] and not result["eigentümer_adresse"]:
-        name_start = re.escape(result["eigentümer_name"][:40])
+        _name_for_regex = result["eigentümer_name"] if len(result["eigentümer_name"]) <= 100 else result["eigentümer_name"][:80]
+        name_start = re.escape(_name_for_regex)
         all_matches = list(re.finditer(name_start, full_text, re.IGNORECASE))
         for match_pos in reversed(all_matches):  # letztes Vorkommen zuerst
             search_block = full_text[match_pos.start():match_pos.start() + 500]
@@ -1345,8 +1346,6 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                     result["eigentümer_plz_ort"] = ort
                     break
                 if _ist_adresszeile(line):
-                    prev_line = line
-                else:
                     prev_line = line
             if result["eigentümer_adresse"]:
                 break
@@ -1685,6 +1684,12 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             title_rt_all = props.get("Liegenschaftsadresse", {}).get("title", [])
             title_all    = title_rt_all[0].get("plain_text", "").strip().lower() if title_rt_all else ""
 
+            # Bundesland als Teil des Fingerprints – verhindert Kollisionen zwischen
+            # gleichen Adressen in verschiedenen Bundesländern (z.B. gleiche Straße in
+            # Wien und Graz)
+            bundesland_all = (props.get("Bundesland", {}).get("select") or {}).get("name", "").strip().lower()
+            titel_fp = f"{bundesland_all}|{title_all}" if bundesland_all else title_all
+
             if eid:
                 if ist_geschuetzt:
                     known[eid] = "(geschuetzt)"
@@ -1692,7 +1697,7 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
                     # Auch Titel-Fingerprint mit page_id speichern – damit ein neues Edikt
                     # zur selben Immobilie (neue Hash-ID) erkannt und geupdated werden kann.
                     if title_all:
-                        known[f"__titel__{title_all}"] = f"(geschuetzt_update:{page['id']})"
+                        known[f"__titel__{titel_fp}"] = f"(geschuetzt_update:{page['id']})"
                 elif ist_rot:
                     # Rot: Scraper legt keinen neuen Eintrag an (Duplikat-Schutz),
                     # aber die echte page_id bleibt gespeichert damit ein
@@ -1708,10 +1713,10 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             elif ist_geschuetzt or ist_rot:
                 if title_all:
                     if ist_geschuetzt:
-                        known[f"__titel__{title_all}"] = f"(geschuetzt_update:{page['id']})"
+                        known[f"__titel__{titel_fp}"] = f"(geschuetzt_update:{page['id']})"
                     else:
                         # Rot: echte ID damit Entfall immer greift
-                        known[f"__titel__{title_all}"] = page["id"]
+                        known[f"__titel__{titel_fp}"] = page["id"]
                     geschuetzt_count += 1
 
             page_count += 1
@@ -1802,7 +1807,9 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
     # Fängt den Fall ab, dass dasselbe Objekt mit neuer edikt_id auftaucht
     # (z.B. neuer Versteigerungstermin) und bereits manuell bearbeitet wurde.
     if known_ids is not None:
-        titel_key = f"__titel__{adresse_voll.strip().lower()}"
+        _bl_lower  = bundesland.strip().lower()
+        _adr_lower = adresse_voll.strip().lower()
+        titel_key  = f"__titel__{_bl_lower}|{_adr_lower}" if _bl_lower else f"__titel__{_adr_lower}"
         val = known_ids.get(titel_key, "")
         if val.startswith("(geschuetzt_update:"):
             existing_page_id = val[len("(geschuetzt_update:"):-1]
@@ -2392,7 +2399,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
                 )
             except Exception as exc:
                 print(f"  [Bereinigung] ⚠️  Fehler für {page_id[:8]}…: {exc}")
-            time.sleep(0.2)
+            time.sleep(0.4)
 
     if not to_fix and not to_reanalyze:
         print("  [Bereinigung] ✅ Keine falschen Einträge gefunden – alles in Ordnung")
@@ -2413,7 +2420,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
             fixed += 1
         except Exception as exc:
             print(f"  [Bereinigung] ⚠️  Fehler für {page_id[:8]}…: {exc}")
-        time.sleep(0.2)
+        time.sleep(0.4)
 
     print(f"[Bereinigung] ✅ {fixed} Gerichtsname-Einträge + {len(to_reanalyze)} adresslose Einträge zurückgesetzt")
     return fixed + len(to_reanalyze)
@@ -2523,7 +2530,7 @@ def notion_status_sync(notion: Client, db_id: str,
             updated += 1
         except Exception as exc:
             print(f"  [Status-Sync] ⚠️  Update fehlgeschlagen: {exc}")
-        time.sleep(0.2)
+        time.sleep(0.4)
 
     print(f"[Status-Sync] ✅ {updated} Einträge synchronisiert")
     return updated
@@ -2588,7 +2595,7 @@ def notion_qualitaetscheck(notion: Client, db_id: str,
         notizen_text = "".join(
             (b.get("text") or {}).get("content", "") for b in notizen_rt
         ).lower()
-        if "gescannt" in notizen_text or "kein pdf" in notizen_text or "nicht lesbar" in notizen_text:
+        if "gescannt" in notizen_text or "kein pdf" in notizen_text or "kein text lesbar" in notizen_text:
             continue
 
         # Felder prüfen
@@ -3056,7 +3063,7 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
                     print(f"  [Tote-URLs] ⚠️  Notiz-Update fehlgeschlagen: {exc2}")
             else:
                 print(f"  [Tote-URLs] ℹ️  Bereits alarmiert, kein erneuter Telegram-Alarm: {entry['titel'][:50]}")
-            time.sleep(0.2)
+            time.sleep(0.4)
             continue
 
         # ── Alle anderen: archivieren ──────────────────────────────────────
@@ -3088,7 +3095,7 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
         except Exception as exc2:
             print(f"  [Tote-URLs] ⚠️  Archivierung fehlgeschlagen: {exc2}")
 
-        time.sleep(0.2)
+        time.sleep(0.4)
 
     print(f"[Tote-URLs] ✅ {archived} tote URLs archiviert")
     return archived, alarm_lines
@@ -3173,7 +3180,8 @@ def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> byte
             for key, val in platzhalter.items():
                 new_text = new_text.replace(f"{{{{{key}}}}}", val)
             if new_text != full_text:
-                para.runs[0].text = new_text
+                # python-docx Runs unterstützen keine echten \n — ersetze durch Leerzeichen
+                para.runs[0].text = new_text.replace("\n", " ")
                 for r in para.runs[1:]:
                     r.text = ""
             return
@@ -3450,7 +3458,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             continue
         # Fallback: prüfe ob Notiz bereits "Brief erstellt am" enthält
         notizen_rt = props.get("Notizen", {}).get("rich_text", [])
-        notizen_text = "".join(t.get("plain_text", "") for t in notizen_rt)
+        notizen_text = "".join(t.get("text", {}).get("content", "") for t in notizen_rt)
         if "Brief erstellt am" in notizen_text:
             continue
         to_process.append(page)
@@ -3475,7 +3483,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     for page in to_process:
         props = page.get("properties", {})
         eigentuemer_list = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-        eigentuemer      = "".join(t.get("plain_text", "") for t in eigentuemer_list).strip()
+        eigentuemer      = "".join(t.get("text", {}).get("content", "") for t in eigentuemer_list).strip()
         # Normalisierter Key: Kleinbuchstaben, Leerzeichen zusammengefasst
         key = " ".join(eigentuemer.lower().split()) if eigentuemer else f"__leer_{page['id']}"
         gruppen[key].append(page)
@@ -3491,13 +3499,13 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         first_props = first_page.get("properties", {})
 
         eigentuemer_list = first_props.get("Verpflichtende Partei", {}).get("rich_text", [])
-        eigentuemer      = "".join(t.get("plain_text", "") for t in eigentuemer_list).strip()
+        eigentuemer      = "".join(t.get("text", {}).get("content", "") for t in eigentuemer_list).strip()
 
         adresse_list = first_props.get("Zustell Adresse", {}).get("rich_text", [])
-        adresse      = "".join(t.get("plain_text", "") for t in adresse_list).strip()
+        adresse      = "".join(t.get("text", {}).get("content", "") for t in adresse_list).strip()
 
         plz_ort_list = first_props.get("Zustell PLZ/Ort", {}).get("rich_text", [])
-        plz_ort      = "".join(t.get("plain_text", "") for t in plz_ort_list).strip()
+        plz_ort      = "".join(t.get("text", {}).get("content", "") for t in plz_ort_list).strip()
 
         bundesland = (first_props.get("Bundesland", {}).get("select") or {}).get("name", "")
 
@@ -3508,6 +3516,10 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         if not eigentuemer:
             print(f"  [Brief] ⏭  Überspringe Gruppe – kein Eigentümer")
             continue
+        # Fallback: wenn Zustell PLZ/Ort leer, versuche dediziertes Liegenschafts-PLZ-Feld
+        if not plz_ort:
+            plz_rt_fb   = first_props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
+            plz_ort     = "".join(t.get("text", {}).get("content", "") for t in plz_rt_fb).strip()
         if not adresse or not plz_ort:
             print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50]} – keine Zustelladresse")
             continue
@@ -3535,7 +3547,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
 
             # PLZ/Ort: zuerst dediziertes Feld, dann aus Adresse extrahieren
             plz_rt    = props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
-            t_plz_ort = "".join(x.get("plain_text", "") for x in plz_rt).strip()
+            t_plz_ort = "".join(x.get("text", {}).get("content", "") for x in plz_rt).strip()
 
             if not t_plz_ort:
                 # Versuche PLZ/Ort am Ende der Adresse zu finden (z.B. "Musterstr. 1, 1010 Wien")
@@ -3625,7 +3637,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 p_id = page["id"]
                 p_props = page.get("properties", {})
                 notizen_list = p_props.get("Notizen", {}).get("rich_text", [])
-                notizen_alt  = "".join(t.get("plain_text", "") for t in notizen_list).strip()
+                notizen_alt  = "".join(t.get("text", {}).get("content", "") for t in notizen_list).strip()
                 neue_notiz   = notizen_alt
                 if neue_notiz and not neue_notiz.endswith("\n"):
                     neue_notiz += "\n"
@@ -3657,7 +3669,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                             print(f"  [Brief] ⚠️  Notiz-Update fehlgeschlagen für {p_id[:8]}: {notiz_exc}")
                     else:
                         print(f"  [Brief] ⚠️  Notion-Update fehlgeschlagen für {p_id[:8]}: {notion_exc}")
-                time.sleep(0.2)
+                time.sleep(0.4)
 
             icon = "✉️" if email_ok else "📨"
             print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}{anzahl_str}")
@@ -3997,7 +4009,7 @@ async def main() -> None:
     if not neue_eintraege and not fehler \
             and not gutachten_enriched and not vision_enriched \
             and not tote_urls_archiviert and not tote_urls_alarme \
-            and not brief_erstellt and not edikt_updates:
+            and not edikt_updates and not brief_erstellt:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
