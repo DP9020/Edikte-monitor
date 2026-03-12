@@ -1686,12 +1686,14 @@ def notion_load_all_pages(notion: Client, db_id: str) -> list[dict]:
     return pages
 
 
-def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
+def notion_create_eintrag(notion: Client, db_id: str, data: dict,
+                          known_ids: dict | None = None) -> dict:
     """
     Legt einen neuen Eintrag in Notion an.
     Ruft die Detailseite ab, filtert nach Kategorie und befüllt alle Felder.
     Gibt den detail-Dict zurück (oder {} wenn Objekt gefiltert wurde).
-    Rückgabe None bedeutet: Objekt wurde durch Kategorie-Filter ausgeschlossen.
+    Rückgabe None bedeutet: Objekt wurde durch Kategorie-Filter ausgeschlossen
+    oder ist ein Titel-Duplikat eines bereits geschützten Eintrags.
     """
     bundesland   = data.get("bundesland", "Unbekannt")
     link         = data.get("link", "")
@@ -1718,6 +1720,15 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict) -> dict:
 
     titel    = adresse_voll
     objektart = kategorie or beschreibung[:200]
+
+    # ── Titel-Duplikat-Check: selbe Adresse bereits als geschützt bekannt? ───
+    # Fängt den Fall ab, dass dasselbe Objekt mit neuer edikt_id auftaucht
+    # (z.B. neuer Versteigerungstermin) und bereits manuell bearbeitet wurde.
+    if known_ids is not None:
+        titel_key = f"__titel__{adresse_voll.strip().lower()}"
+        if known_ids.get(titel_key) == "(geschuetzt)":
+            print(f"  [Notion] 🔒 Titel-Duplikat übersprungen (bereits geschützt): {adresse_voll[:60]}")
+            return None
 
     # ── Kern-Properties (existieren garantiert in jeder Notion-DB) ───────────
     properties: dict = {
@@ -3685,7 +3696,7 @@ async def main() -> None:
                     if known_ids.get(eid) == "(geschuetzt)":
                         print(f"  [Notion] 🔒 Geschützt (bereits bearbeitet): {eid}")
                     elif eid not in known_ids:
-                        result_tuple = notion_create_eintrag(notion, db_id, item)
+                        result_tuple = notion_create_eintrag(notion, db_id, item, known_ids=known_ids)
                         if result_tuple is None:
                             # Kategorie-Filter hat das Objekt ausgeschlossen
                             known_ids[eid] = "(gefiltert)"
@@ -3783,7 +3794,17 @@ async def main() -> None:
     except Exception as exc:
         print(f"  [WARN] Qualitäts-Check fehlgeschlagen (nicht kritisch): {exc}")
 
-    # ── 3e. Brief-Erstellung: relevant markierte Einträge → Brief erstellen ──────────────
+    # ── 3e. Google Drive: Unterlagen für Gelb-Einträge hochladen ────────────────
+    try:
+        _gdrive_service = gdrive_get_service()
+        if _gdrive_service:
+            gdrive_sync_gelb_entries(notion, db_id, _all_pages or [], _gdrive_service)
+        else:
+            print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
+    except Exception as exc:
+        print(f"  [WARN] Google Drive Sync fehlgeschlagen (nicht kritisch): {exc}")
+
+    # ── 3f. Brief-Erstellung: relevant markierte Einträge → Brief erstellen ──────────────
     # Betrifft: Einträge mit Phase '✅ Relevant – Brief vorbereiten'
     # bei denen 'Brief erstellt am' noch leer ist.
     brief_erstellt = 0
