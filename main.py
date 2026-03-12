@@ -3758,7 +3758,9 @@ async def main() -> None:
             # ── Google Drive: Unterlagen für alle Gelb-Einträge hochladen ────
             _gdrive_service = gdrive_get_service()
             if _gdrive_service:
-                gdrive_clear_placeholder_links(notion, db_id, _pages)
+                cleared = gdrive_clear_placeholder_links(notion, db_id, _pages)
+                if cleared:
+                    _pages = notion_load_all_pages(notion, db_id)
                 gdrive_sync_gelb_entries(notion, db_id, _pages, _gdrive_service)
             else:
                 print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
@@ -3923,7 +3925,9 @@ async def main() -> None:
     try:
         _gdrive_service = gdrive_get_service()
         if _gdrive_service:
-            gdrive_clear_placeholder_links(notion, db_id, _all_pages or [])
+            cleared = gdrive_clear_placeholder_links(notion, db_id, _all_pages or [])
+            if cleared:
+                _all_pages = notion_load_all_pages(notion, db_id)
             gdrive_sync_gelb_entries(notion, db_id, _all_pages or [], _gdrive_service)
         else:
             print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
