@@ -684,6 +684,15 @@ def gdrive_sync_gelb_entries(
         print("[GDrive] ℹ️  GOOGLE_DRIVE_FOLDER_ID nicht gesetzt – überspringe.")
         return 0
 
+    # Prüfen ob Parent-Ordner erreichbar ist
+    try:
+        folder_meta = service.files().get(fileId=parent_folder_id, fields="id,name").execute()
+        print(f"[GDrive] ✅ Parent-Ordner erreichbar: '{folder_meta.get('name', parent_folder_id)}'")
+    except Exception as e:
+        print(f"[GDrive] ❌ Parent-Ordner nicht erreichbar (GOOGLE_DRIVE_FOLDER_ID={parent_folder_id[:8]}…): {e}")
+        print("[GDrive] ℹ️  Bitte sicherstellen, dass der Service Account Zugriff auf den Ordner hat (Freigabe via Share).")
+        return 0
+
     kandidaten: list[dict] = []
     gelb_gesamt = 0
     for page in all_pages:
