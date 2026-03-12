@@ -31,6 +31,15 @@ except ImportError:
     _OpenAI = None
     OPENAI_AVAILABLE = False
 
+try:
+    from googleapiclient.discovery import build as _gdrive_build
+    from googleapiclient.http import MediaIoBaseUpload
+    from google.oauth2 import service_account as _gsa
+    import io as _io
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
+
 # =============================================================================
 # KONFIGURATION
 # =============================================================================
@@ -559,6 +568,155 @@ async def send_telegram(message: str, extra_chat_ids: list[str] | None = None) -
                         })
                     except Exception:
                         print(f"[Telegram] ⚠️  Nachricht an {extra_id} fehlgeschlagen: {e}")
+
+
+# =============================================================================
+# GOOGLE DRIVE – Unterlagen-Upload für "Gelb"-Einträge
+# =============================================================================
+
+def gdrive_get_service():
+    """Erstellt den Google Drive API Service via Service Account (Base64 oder raw JSON)."""
+    if not GDRIVE_AVAILABLE:
+        return None
+    key_raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY", "")
+    if not key_raw:
+        return None
+    try:
+        if not key_raw.strip().startswith("{"):
+            key_raw = base64.b64decode(key_raw).decode("utf-8")
+        creds_info = json.loads(key_raw)
+        creds = _gsa.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        return _gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        print(f"[GDrive] ⚠️  Service-Erstellung fehlgeschlagen: {exc}")
+        return None
+
+
+def gdrive_find_or_create_folder(service, name: str, parent_id: str) -> str:
+    """Gibt die ID eines Google-Drive-Ordners zurück – erstellt ihn falls nötig."""
+    safe_name = name.replace("'", "\\'")
+    query = (
+        f"name='{safe_name}' "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and '{parent_id}' in parents "
+        f"and trashed=false"
+    )
+    result = service.files().list(q=query, fields="files(id)", pageSize=1).execute()
+    files  = result.get("files", [])
+    if files:
+        return files[0]["id"]
+    meta   = {
+        "name":     name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents":  [parent_id],
+    }
+    folder = service.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+
+def gdrive_upload_file(service, data: bytes, filename: str, folder_id: str) -> str:
+    """Lädt Bytes als Datei in Google Drive hoch, gibt File-ID zurück."""
+    ext      = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    mime_map = {
+        "pdf":  "application/pdf",
+        "jpg":  "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png":  "image/png",
+    }
+    mime  = mime_map.get(ext, "application/octet-stream")
+    meta  = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(_io.BytesIO(data), mimetype=mime, resumable=False)
+    f     = service.files().create(body=meta, media_body=media, fields="id").execute()
+    return f["id"]
+
+
+def gdrive_sync_gelb_entries(
+    notion: Client, db_id: str, all_pages: list[dict], service
+) -> int:
+    """
+    Lädt für alle Einträge mit Status '🟡 Gelb' (und noch keinem Drive-Link)
+    alle Unterlagen von der Edikt-Seite in den konfigurierten Google-Drive-Ordner hoch.
+    Speichert den Ordner-Link danach im Notion-Feld 'Google Drive Link'.
+    Gibt die Anzahl erfolgreich bearbeiteter Einträge zurück.
+    """
+    parent_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+    if not parent_folder_id:
+        print("[GDrive] ℹ️  GOOGLE_DRIVE_FOLDER_ID nicht gesetzt – überspringe.")
+        return 0
+
+    kandidaten: list[dict] = []
+    for page in all_pages:
+        props       = page.get("properties", {})
+        status      = (props.get("Status", {}).get("select") or {}).get("name", "")
+        edikt_link  = props.get("Link", {}).get("url") or ""
+        drive_link  = props.get("Google Drive Link", {}).get("url") or ""
+        if status == "🟡 Gelb" and edikt_link and not drive_link:
+            kandidaten.append(page)
+
+    print(f"\n[GDrive] 🔍 {len(kandidaten)} Gelb-Eintrag/Einträge ohne Drive-Link gefunden")
+    if not kandidaten:
+        return 0
+
+    erledigt = 0
+    for page in kandidaten:
+        props = page.get("properties", {})
+
+        # Adresse (Title-Feld)
+        title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
+        adresse  = title_rt[0].get("plain_text", "").strip() if title_rt else ""
+
+        # Verpflichtende Partei (Eigentümer)
+        vp_rt    = props.get("Verpflichtende Partei", {}).get("rich_text", [])
+        vp_name  = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
+
+        edikt_url = props.get("Link", {}).get("url") or ""
+        page_id   = page["id"]
+
+        # Ordnernamen erstellen und für Drive bereinigen
+        raw_name    = f"{vp_name} - {adresse}" if vp_name else adresse
+        folder_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", raw_name)[:200].strip(" .-")
+        if not folder_name:
+            folder_name = page_id[:12]
+
+        print(f"\n[GDrive] 📁 Verarbeite: {folder_name}")
+        try:
+            # Ordner anlegen (oder vorhandenen verwenden)
+            folder_id  = gdrive_find_or_create_folder(service, folder_name, parent_folder_id)
+            folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+            # Alle Anhänge von der Edikt-Seite holen (PDFs + Bilder)
+            attachments  = gutachten_fetch_attachment_links(edikt_url)
+            all_files    = attachments.get("pdfs", []) + attachments.get("images", [])
+            print(f"  [GDrive] 📎 {len(all_files)} Datei(en) auf Edikt-Seite gefunden")
+
+            uploaded = 0
+            for att in all_files:
+                try:
+                    data = gutachten_download_pdf(att["url"])
+                    gdrive_upload_file(service, data, att["filename"], folder_id)
+                    print(f"  [GDrive] ✅ Hochgeladen: {att['filename']}")
+                    uploaded += 1
+                    time.sleep(0.3)
+                except Exception as up_exc:
+                    print(f"  [GDrive] ⚠️  Upload fehlgeschlagen ({att['filename']}): {up_exc}")
+
+            # Drive-Link in Notion speichern (verhindert erneuten Upload)
+            notion.pages.update(
+                page_id=page_id,
+                properties={"Google Drive Link": {"url": folder_url}},
+            )
+            print(f"  [GDrive] 💾 Drive-Link gespeichert ({uploaded}/{len(all_files)} Dateien)")
+            erledigt += 1
+
+        except Exception as exc:
+            print(f"  [GDrive] ❌ Fehler für '{folder_name}': {exc}")
+        time.sleep(0.5)
+
+    print(f"\n[GDrive] ✅ {erledigt}/{len(kandidaten)} Einträge verarbeitet")
+    return erledigt
 
 
 # =============================================================================
@@ -3464,6 +3622,14 @@ async def main() -> None:
             notion_status_sync(notion, db_id, all_pages=_pages)
             # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
             _pages = notion_load_all_pages(notion, db_id)
+
+            # ── Google Drive: Unterlagen für alle Gelb-Einträge hochladen ────
+            _gdrive_service = gdrive_get_service()
+            if _gdrive_service:
+                gdrive_sync_gelb_entries(notion, db_id, _pages, _gdrive_service)
+            else:
+                print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
+
             brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_pages)
             print(f"[Modus] ✅ BRIEF_ONLY fertig – {brief_erstellt} Brief(e) erstellt")
             if brief_erstellt == 0:

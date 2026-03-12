@@ -1,0 +1,12 @@
+# Google Service Account Keys – niemals committen!
+*service-account*.json
+*-credentials.json
+*.key.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Lokale Briefe / Ausgaben
+briefe/

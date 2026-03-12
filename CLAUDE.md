@@ -34,6 +34,8 @@ OPENAI_API_KEY=...
 SENDGRID_API_KEY=...
 SMTP_USER=...                  # Absender-E-Mail (in SendGrid verifiziert)
 BRIEF_ONLY=false               # "true" = nur Brief-Sync, kein Scraping
+GOOGLE_SERVICE_ACCOUNT_KEY=... # Base64-codiertes JSON eines Google Service Accounts
+GOOGLE_DRIVE_FOLDER_ID=...     # ID des Drive-Ordners "Immo-in-Not Edikte-Downloads"
 ```
 
 ### GitHub Actions (automatisch)
