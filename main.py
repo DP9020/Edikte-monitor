@@ -1611,10 +1611,18 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             if hash_rt:
                 eid = hash_rt[0].get("plain_text", "").strip().lower()
 
+            # Titel-Fingerprint für alle Einträge holen (wird unten gespeichert)
+            title_rt_all = props.get("Liegenschaftsadresse", {}).get("title", [])
+            title_all    = title_rt_all[0].get("plain_text", "").strip().lower() if title_rt_all else ""
+
             if eid:
                 if ist_geschuetzt:
                     known[eid] = "(geschuetzt)"
                     geschuetzt_count += 1
+                    # Auch Titel-Fingerprint mit page_id speichern – damit ein neues Edikt
+                    # zur selben Immobilie (neue Hash-ID) erkannt und geupdated werden kann.
+                    if title_all:
+                        known[f"__titel__{title_all}"] = f"(geschuetzt_update:{page['id']})"
                 elif ist_rot:
                     # Rot: Scraper legt keinen neuen Eintrag an (Duplikat-Schutz),
                     # aber die echte page_id bleibt gespeichert damit ein
@@ -1628,14 +1636,13 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             # Titel als Ersatz-Fingerprint speichern (verhindert Doppelanlage
             # bei manuell eingetragenen Immobilien ohne Hash-ID)
             elif ist_geschuetzt or ist_rot:
-                title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
-                title = title_rt[0].get("plain_text", "").strip().lower() if title_rt else ""
-                if title:
-                    # Grün/Gelb/Phase → Sentinel; Rot → echte ID damit Entfall immer greift
-                    known[f"__titel__{title}"] = "(geschuetzt)" if ist_geschuetzt else page["id"]
+                if title_all:
+                    if ist_geschuetzt:
+                        known[f"__titel__{title_all}"] = f"(geschuetzt_update:{page['id']})"
+                    else:
+                        # Rot: echte ID damit Entfall immer greift
+                        known[f"__titel__{title_all}"] = page["id"]
                     geschuetzt_count += 1
-                    # (Rot: echte ID gespeichert → Duplikat-Schutz trotzdem aktiv,
-                    #  da 'elif eid not in known_ids' bei bekannter UUID nicht greift)
 
             page_count += 1
 
@@ -1726,7 +1733,13 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
     # (z.B. neuer Versteigerungstermin) und bereits manuell bearbeitet wurde.
     if known_ids is not None:
         titel_key = f"__titel__{adresse_voll.strip().lower()}"
-        if known_ids.get(titel_key) == "(geschuetzt)":
+        val = known_ids.get(titel_key, "")
+        if val.startswith("(geschuetzt_update:"):
+            existing_page_id = val[len("(geschuetzt_update:"):-1]
+            print(f"  [Notion] 🔄 Neues Edikt für bekannte Immobilie: {adresse_voll[:60]}")
+            return ("__edikt_update__", existing_page_id, detail)
+        elif val == "(geschuetzt)":
+            # Altes Format ohne page_id – nur überspringen
             print(f"  [Notion] 🔒 Titel-Duplikat übersprungen (bereits geschützt): {adresse_voll[:60]}")
             return None
 
@@ -1813,6 +1826,42 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
     # Gibt (detail, page_id) zurück damit der Aufrufer das Gutachten anreichern kann
     new_page_id = created_page["id"] if created_page else None
     return detail, new_page_id
+
+
+def notion_update_edikt_eintrag(
+    notion: Client, page_id: str, item: dict, detail: dict
+) -> None:
+    """
+    Aktualisiert einen bestehenden Notion-Eintrag wenn dasselbe Objekt mit
+    einer neuen edikt_id erscheint (z.B. neuer Versteigerungstermin).
+    Aktualisiert: Link, Hash-ID, Versteigerungstermin, Verkehrswert, Notizen.
+    Schreibt NICHT die Phase oder den Status – diese bleiben unberührt.
+    """
+    new_eid  = item.get("edikt_id", "")
+    new_link = item.get("link", "")
+
+    props: dict = {}
+
+    if new_link:
+        props["Link"] = {"url": new_link}
+    if new_eid:
+        props["Hash-ID / Vergleichs-ID"] = {"rich_text": [{"text": {"content": new_eid}}]}
+
+    termin_iso = detail.get("termin_iso")
+    if termin_iso:
+        props["Versteigerungstermin"] = {"date": {"start": termin_iso}}
+
+    verkehrswert = detail.get("schaetzwert")
+    if verkehrswert is not None:
+        vk_str = f"{verkehrswert:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+        props["Verkehrswert"] = {"rich_text": [{"text": {"content": vk_str}}]}
+
+    if props:
+        try:
+            notion.pages.update(page_id=page_id, properties=props)
+            print(f"  [Notion] ✅ Edikt-Update gespeichert (neues Termin/Link/Wert)")
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Edikt-Update fehlgeschlagen: {exc}")
 
 
 def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
@@ -2904,27 +2953,39 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
 
         # ── Schutz-Status: nur alarmieren, NICHT archivieren ──────────────
         if entry["status"] in SCHUTZ_STATUS:
-            alarm_lines.append(
-                f"⚠️ Edikt verschwunden (Status {entry['status']}): "
-                f"<b>{entry['titel'][:80]}</b>"
-            )
-            # Notiz in Notion setzen ohne Phase zu ändern
+            # Notiz lesen um zu prüfen ob bereits alarmiert wurde (einmaliger Alarm)
+            bereits_alarmiert = False
+            notizen_alt = ""
             try:
-                page_data   = notion.pages.retrieve(page_id=entry["page_id"])
-                notizen_rt  = page_data["properties"].get("Notizen", {}).get("rich_text", [])
+                page_data  = notion.pages.retrieve(page_id=entry["page_id"])
+                notizen_rt = page_data["properties"].get("Notizen", {}).get("rich_text", [])
                 notizen_alt = "".join(
                     (b.get("text") or {}).get("content", "") for b in notizen_rt
                 ).strip()
+                bereits_alarmiert = "Edikt-Seite nicht mehr verfügbar" in notizen_alt
+            except Exception as exc2:
+                print(f"  [Tote-URLs] ⚠️  Notiz-Lesen fehlgeschlagen: {exc2}")
+
+            if not bereits_alarmiert:
+                # Erster Alarm: Telegram + Notion-Notiz setzen
+                alarm_lines.append(
+                    f"⚠️ Edikt verschwunden (Status {entry['status']}): "
+                    f"<b>{entry['titel'][:80]}</b>\n"
+                    f"<i>Bitte in Notion als gelöscht markieren.</i>"
+                )
                 notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
                               "⚠️ Edikt-Seite nicht mehr verfügbar (HTTP 404) – bitte manuell prüfen"
-                notion.pages.update(
-                    page_id=entry["page_id"],
-                    properties={
-                        "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
-                    }
-                )
-            except Exception as exc2:
-                print(f"  [Tote-URLs] ⚠️  Notiz-Update fehlgeschlagen: {exc2}")
+                try:
+                    notion.pages.update(
+                        page_id=entry["page_id"],
+                        properties={
+                            "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
+                        }
+                    )
+                except Exception as exc2:
+                    print(f"  [Tote-URLs] ⚠️  Notiz-Update fehlgeschlagen: {exc2}")
+            else:
+                print(f"  [Tote-URLs] ℹ️  Bereits alarmiert, kein erneuter Telegram-Alarm: {entry['titel'][:50]}")
             time.sleep(0.2)
             continue
 
@@ -3669,6 +3730,7 @@ async def main() -> None:
         return
 
     neue_eintraege:  list[dict] = []
+    edikt_updates:   list[str]  = []   # Telegram-Zeilen für Edikt-Updates
     fehler:          list[str]  = []
 
     # ── 1. Alle bekannten IDs einmalig laden (schnelle lokale Deduplizierung) ─
@@ -3698,8 +3760,19 @@ async def main() -> None:
                     elif eid not in known_ids:
                         result_tuple = notion_create_eintrag(notion, db_id, item, known_ids=known_ids)
                         if result_tuple is None:
-                            # Kategorie-Filter hat das Objekt ausgeschlossen
+                            # Kategorie-Filter oder Titel-Duplikat ohne Update-Info
                             known_ids[eid] = "(gefiltert)"
+                        elif isinstance(result_tuple, tuple) and result_tuple[0] == "__edikt_update__":
+                            # Selbe Immobilie, neue edikt_id → bestehenden Eintrag updaten
+                            _, existing_page_id, detail = result_tuple
+                            notion_update_edikt_eintrag(notion, existing_page_id, item, detail)
+                            known_ids[eid] = "(geschuetzt)"
+                            titel_rt = detail.get("adresse_voll") or item.get("beschreibung", "")[:60]
+                            termin   = detail.get("termin_iso", "")
+                            edikt_updates.append(
+                                f"🔄 <b>{titel_rt[:70]}</b>"
+                                + (f"\nNeuer Termin: {termin}" if termin else "")
+                            )
                         else:
                             detail, new_page_id = result_tuple
                             item["_detail"] = detail
@@ -3848,7 +3921,7 @@ async def main() -> None:
     if not neue_eintraege and not fehler \
             and not gutachten_enriched and not vision_enriched \
             and not tote_urls_archiviert and not tote_urls_alarme \
-            and not brief_erstellt:
+            and not brief_erstellt and not edikt_updates:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
@@ -3882,6 +3955,12 @@ async def main() -> None:
 
     if tote_urls_archiviert:
         lines.append(f"<b>🗑 Tote Edikte archiviert: {tote_urls_archiviert}</b>")
+        lines.append("")
+
+    if edikt_updates:
+        lines.append(f"<b>🔄 Edikt-Updates (gleiche Immobilie, neuer Termin): {len(edikt_updates)}</b>")
+        for upd in edikt_updates[:10]:
+            lines.append(f"• {upd}")
         lines.append("")
 
     if tote_urls_alarme:
