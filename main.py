@@ -713,6 +713,15 @@ def gdrive_sync_gelb_entries(
 
         except Exception as exc:
             print(f"  [GDrive] ❌ Fehler für '{folder_name}': {exc}")
+            # Platzhalter speichern damit dieser Eintrag nicht endlos wiederholt wird
+            try:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={"Google Drive Link": {"url": "https://drive.google.com/drive/folders/nicht-verfuegbar"}},
+                )
+                print(f"  [GDrive] ℹ️  Platzhalter-Link gesetzt (Edikt-Seite nicht erreichbar)")
+            except Exception:
+                pass
         time.sleep(0.5)
 
     print(f"\n[GDrive] ✅ {erledigt}/{len(kandidaten)} Einträge verarbeitet")
