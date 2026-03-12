@@ -589,7 +589,9 @@ def gdrive_get_service():
     print(f"[GDrive] 📁 GOOGLE_DRIVE_FOLDER_ID={'gesetzt ('+folder_id[:8]+'…)' if folder_id else 'NICHT GESETZT'}")
     try:
         if not key_raw.strip().startswith("{"):
-            key_raw = base64.b64decode(key_raw).decode("utf-8")
+            # Fehlende Padding-Zeichen ergänzen (= am Ende)
+            padded = key_raw.strip() + "=" * (4 - len(key_raw.strip()) % 4)
+            key_raw = base64.b64decode(padded).decode("utf-8")
         creds_info = json.loads(key_raw)
         print(f"[GDrive] 👤 Service Account: {creds_info.get('client_email', '?')}")
         creds = _gsa.Credentials.from_service_account_info(
