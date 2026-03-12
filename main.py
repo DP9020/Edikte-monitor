@@ -765,15 +765,22 @@ def gdrive_sync_gelb_entries(
             folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
 
             uploaded = 0
+            foto_nr = 1
             for att in all_files:
+                ext = att["filename"].rsplit(".", 1)[-1].lower() if "." in att["filename"] else ""
+                if ext in ("jpg", "jpeg", "png"):
+                    upload_name = f"Foto {foto_nr}.{ext}"
+                    foto_nr += 1
+                else:
+                    upload_name = att["filename"]
                 try:
                     data = gutachten_download_pdf(att["url"])
-                    gdrive_upload_file(service, data, att["filename"], folder_id)
-                    print(f"  [GDrive] ✅ Hochgeladen: {att['filename']}")
+                    gdrive_upload_file(service, data, upload_name, folder_id)
+                    print(f"  [GDrive] ✅ Hochgeladen: {upload_name}")
                     uploaded += 1
                     time.sleep(0.3)
                 except Exception as up_exc:
-                    print(f"  [GDrive] ⚠️  Upload fehlgeschlagen ({att['filename']}): {up_exc}")
+                    print(f"  [GDrive] ⚠️  Upload fehlgeschlagen ({upload_name}): {up_exc}")
 
             # Drive-Link in Notion speichern (verhindert erneuten Upload)
             notion.pages.update(
