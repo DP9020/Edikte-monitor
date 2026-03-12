@@ -647,6 +647,21 @@ def gdrive_upload_file(service, data: bytes, filename: str, folder_id: str) -> s
     return f["id"]
 
 
+def gdrive_file_exists(service, filename: str, folder_id: str) -> bool:
+    """Prüft ob eine Datei mit diesem Namen bereits im angegebenen Drive-Ordner existiert."""
+    safe_name = filename.replace("'", "\\'")
+    query = (
+        f"name='{safe_name}' "
+        f"and '{folder_id}' in parents "
+        f"and trashed=false"
+    )
+    result = service.files().list(
+        q=query, fields="files(id)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    return bool(result.get("files"))
+
+
 def gdrive_clear_placeholder_links(notion: Client, db_id: str, all_pages: list[dict]) -> int:
     """
     Entfernt fälschlicherweise gesetzte Platzhalter-Links
@@ -774,6 +789,10 @@ def gdrive_sync_gelb_entries(
                 else:
                     upload_name = att["filename"]
                 try:
+                    if gdrive_file_exists(service, upload_name, folder_id):
+                        print(f"  [GDrive] Bereits vorhanden: {upload_name}")
+                        uploaded += 1
+                        continue
                     data = gutachten_download_pdf(att["url"])
                     gdrive_upload_file(service, data, upload_name, folder_id)
                     print(f"  [GDrive] ✅ Hochgeladen: {upload_name}")
@@ -1491,7 +1510,10 @@ def gutachten_enrich_notion_page(
         print(f"    [Gutachten] ⚠️  Fehler beim Laden der Edikt-Seite: {exc}")
         notion.pages.update(
             page_id=page_id,
-            properties={"Gutachten analysiert?": {"checkbox": False}}
+            properties={
+                "Gutachten analysiert?": {"checkbox": True},
+                "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] Edikt-Seite nicht ladbar: {exc}"}}]},
+            }
         )
         return False
 
@@ -1516,7 +1538,10 @@ def gutachten_enrich_notion_page(
         print(f"    [Gutachten] ⚠️  Download-Fehler: {exc}")
         notion.pages.update(
             page_id=page_id,
-            properties={"Gutachten analysiert?": {"checkbox": False}}
+            properties={
+                "Gutachten analysiert?": {"checkbox": True},
+                "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] PDF-Download fehlgeschlagen: {exc}"}}]},
+            }
         )
         return False
 
@@ -1528,7 +1553,10 @@ def gutachten_enrich_notion_page(
         print(f"    [Gutachten] ⚠️  PDF-Text-Fehler: {exc}")
         notion.pages.update(
             page_id=page_id,
-            properties={"Gutachten analysiert?": {"checkbox": False}}
+            properties={
+                "Gutachten analysiert?": {"checkbox": True},
+                "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] PDF nicht lesbar: {exc}"}}]},
+            }
         )
         return False
 
@@ -1554,7 +1582,10 @@ def gutachten_enrich_notion_page(
             print(f"    [Gutachten] ⚠️  Parse-Fehler: {exc}")
             notion.pages.update(
                 page_id=page_id,
-                properties={"Gutachten analysiert?": {"checkbox": False}}
+                properties={
+                    "Gutachten analysiert?": {"checkbox": True},
+                    "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] Regex-Parse-Fehler: {exc}"}}]},
+                }
             )
             return False
 
@@ -1643,21 +1674,16 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     geschuetzt_count = 0
 
     while has_more:
-        kwargs: dict = {"filter": {"value": "page", "property": "object"}, "page_size": 100}
+        kwargs: dict = {"page_size": 100}
         if cursor:
             kwargs["start_cursor"] = cursor
         try:
-            resp = notion.search(**kwargs)
+            resp = notion.databases.query(database_id=db_id, **kwargs)
         except Exception as exc:
             print(f"  [Notion] ⚠️  Fehler beim Laden der IDs: {exc}")
             break
 
         for page in resp.get("results", []):
-            # Nur Pages aus unserer DB
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-
             props = page.get("properties", {})
 
             # Workflow-Phase prüfen
@@ -2056,30 +2082,25 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
 
     enriched = 0
 
-    # Alle Seiten via search() laden (notion-client v3 hat kein databases.query)
+    # Alle Seiten via databases.query() laden
     pages_without_url: list[dict] = []
     has_more = True
     start_cursor = None
 
     while has_more:
         kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
             "page_size": 100,
         }
         if start_cursor:
             kwargs["start_cursor"] = start_cursor
 
         try:
-            resp = notion.search(**kwargs)
+            resp = notion.databases.query(database_id=db_id, **kwargs)
         except Exception as exc:
             print(f"  [URL-Anreicherung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
             break
 
         for page in resp.get("results", []):
-            # Nur Pages aus unserer DB
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
             # Nur Pages ohne Link
             props    = page.get("properties", {})
             link_val = props.get("Link", {}).get("url")
@@ -2240,23 +2261,18 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
 
     while has_more:
         kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
             "page_size": 100,
         }
         if start_cursor:
             kwargs["start_cursor"] = start_cursor
 
         try:
-            resp = notion.search(**kwargs)
+            resp = notion.databases.query(database_id=db_id, **kwargs)
         except Exception as exc:
             print(f"  [Gutachten-Anreicherung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
             break
 
         for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-
             props = page.get("properties", {})
 
             # Nur Einträge in nicht-geschützter Phase
@@ -2295,6 +2311,16 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
                 enriched += 1
         except Exception as exc:
             print(f"  [Gutachten-Anreicherung] ❌ Fehler für {entry['page_id'][:8]}…: {exc}")
+            try:
+                notion.pages.update(
+                    page_id=entry["page_id"],
+                    properties={
+                        "Gutachten analysiert?": {"checkbox": True},
+                        "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] Unerwarteter Fehler: {exc}"}}]},
+                    }
+                )
+            except Exception:
+                pass  # Notion-Update schlug ebenfalls fehl – Eintrag bleibt offen
         time.sleep(0.3)   # kurze Pause um API-Limits zu schonen
 
     remaining = total_found - len(to_enrich)
@@ -2759,23 +2785,18 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
 
     while has_more:
         kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
             "page_size": 100,
         }
         if start_cursor:
             kwargs["start_cursor"] = start_cursor
 
         try:
-            resp = notion.search(**kwargs)
+            resp = notion.databases.query(database_id=db_id, **kwargs)
         except Exception as exc:
             print(f"  [Vision-Analyse] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
             break
 
         for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-
             props = page.get("properties", {})
 
             # Nur analysierte Einträge
@@ -3864,6 +3885,16 @@ async def main() -> None:
                                     )
                                 except Exception as ge:
                                     print(f"    [Gutachten] ⚠️  Anreicherung fehlgeschlagen: {ge}")
+                                    try:
+                                        notion.pages.update(
+                                            page_id=new_page_id,
+                                            properties={
+                                                "Gutachten analysiert?": {"checkbox": True},
+                                                "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] Unerwarteter Fehler: {ge}"}}]},
+                                            }
+                                        )
+                                    except Exception:
+                                        pass  # Notion-Update schlug ebenfalls fehl
                     else:
                         print(f"  [Notion] ⏭  Bereits vorhanden: {eid}")
 
