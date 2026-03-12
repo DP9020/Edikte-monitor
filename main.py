@@ -615,7 +615,10 @@ def gdrive_find_or_create_folder(service, name: str, parent_id: str) -> str:
         f"and '{parent_id}' in parents "
         f"and trashed=false"
     )
-    result = service.files().list(q=query, fields="files(id)", pageSize=1).execute()
+    result = service.files().list(
+        q=query, fields="files(id)", pageSize=1,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
     files  = result.get("files", [])
     if files:
         return files[0]["id"]
@@ -624,7 +627,7 @@ def gdrive_find_or_create_folder(service, name: str, parent_id: str) -> str:
         "mimeType": "application/vnd.google-apps.folder",
         "parents":  [parent_id],
     }
-    folder = service.files().create(body=meta, fields="id").execute()
+    folder = service.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
     return folder["id"]
 
 
@@ -640,7 +643,7 @@ def gdrive_upload_file(service, data: bytes, filename: str, folder_id: str) -> s
     mime  = mime_map.get(ext, "application/octet-stream")
     meta  = {"name": filename, "parents": [folder_id]}
     media = MediaIoBaseUpload(_io.BytesIO(data), mimetype=mime, resumable=False)
-    f     = service.files().create(body=meta, media_body=media, fields="id").execute()
+    f     = service.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
     return f["id"]
 
 
@@ -686,7 +689,7 @@ def gdrive_sync_gelb_entries(
 
     # Prüfen ob Parent-Ordner erreichbar ist
     try:
-        folder_meta = service.files().get(fileId=parent_folder_id, fields="id,name").execute()
+        folder_meta = service.files().get(fileId=parent_folder_id, fields="id,name", supportsAllDrives=True).execute()
         print(f"[GDrive] ✅ Parent-Ordner erreichbar: '{folder_meta.get('name', parent_folder_id)}'")
     except Exception as e:
         print(f"[GDrive] ❌ Parent-Ordner nicht erreichbar (GOOGLE_DRIVE_FOLDER_ID={parent_folder_id[:8]}…): {e}")
