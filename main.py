@@ -1743,23 +1743,16 @@ def notion_load_all_pages(notion: Client, db_id: str) -> list[dict]:
     start_cursor = None
 
     while has_more:
-        kwargs: dict = {
-            "filter": {"value": "page", "property": "object"},
-            "page_size": 100,
-        }
+        kwargs: dict = {"page_size": 100}
         if start_cursor:
             kwargs["start_cursor"] = start_cursor
         try:
-            resp = notion.search(**kwargs)
+            resp = notion.databases.query(database_id=db_id, **kwargs)
         except Exception as exc:
             print(f"  [Notion] ⚠️  Fehler beim Laden der Pages: {exc}")
             break
 
-        for page in resp.get("results", []):
-            parent = page.get("parent", {})
-            if parent.get("database_id", "").replace("-", "") != db_id.replace("-", ""):
-                continue
-            pages.append(page)
+        pages.extend(resp.get("results", []))
 
         has_more     = resp.get("has_more", False)
         start_cursor = resp.get("next_cursor")
