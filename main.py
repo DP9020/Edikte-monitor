@@ -644,6 +644,32 @@ def gdrive_upload_file(service, data: bytes, filename: str, folder_id: str) -> s
     return f["id"]
 
 
+def gdrive_clear_placeholder_links(notion: Client, db_id: str, all_pages: list[dict]) -> int:
+    """
+    Entfernt fälschlicherweise gesetzte Platzhalter-Links
+    ('nicht-verfuegbar') aus dem Google Drive Link Feld.
+    Wird einmalig nach einem fehlgeschlagenen Run benötigt.
+    """
+    PLACEHOLDER = "https://drive.google.com/drive/folders/nicht-verfuegbar"
+    cleared = 0
+    for page in all_pages:
+        props      = page.get("properties", {})
+        drive_link = props.get("Google Drive Link", {}).get("url") or ""
+        status     = (props.get("Status", {}).get("select") or {}).get("name", "")
+        if drive_link == PLACEHOLDER and status == "🟡 Gelb":
+            try:
+                notion.pages.update(
+                    page_id=page["id"],
+                    properties={"Google Drive Link": {"url": None}},
+                )
+                cleared += 1
+            except Exception as exc:
+                print(f"  [GDrive] ⚠️  Platzhalter-Bereinigung fehlgeschlagen: {exc}")
+    if cleared:
+        print(f"[GDrive] 🧹 {cleared} Platzhalter-Links bereinigt")
+    return cleared
+
+
 def gdrive_sync_gelb_entries(
     notion: Client, db_id: str, all_pages: list[dict], service
 ) -> int:
@@ -700,15 +726,31 @@ def gdrive_sync_gelb_entries(
             folder_name = page_id[:12]
 
         print(f"\n[GDrive] 📁 Verarbeite: {folder_name}")
+
+        # ── Schritt 1: Anhänge von Edikt-Seite holen (vor Drive-Zugriff) ──────
+        # Fehler hier = Edikt-Seite weg → Platzhalter setzen
         try:
-            # Ordner anlegen (oder vorhandenen verwenden)
+            attachments = gutachten_fetch_attachment_links(edikt_url)
+            all_files   = attachments.get("pdfs", []) + attachments.get("images", [])
+            print(f"  [GDrive] 📎 {len(all_files)} Datei(en) auf Edikt-Seite gefunden")
+        except Exception as fetch_exc:
+            print(f"  [GDrive] ⚠️  Edikt-Seite nicht erreichbar: {fetch_exc}")
+            try:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={"Google Drive Link": {"url": "https://drive.google.com/drive/folders/nicht-verfuegbar"}},
+                )
+                print(f"  [GDrive] ℹ️  Platzhalter-Link gesetzt (Edikt-Seite nicht erreichbar)")
+            except Exception:
+                pass
+            time.sleep(0.5)
+            continue
+
+        # ── Schritt 2: Drive-Ordner anlegen + Dateien hochladen ───────────────
+        # Fehler hier = Drive-API-Problem → KEIN Platzhalter, beim nächsten Run erneut versuchen
+        try:
             folder_id  = gdrive_find_or_create_folder(service, folder_name, parent_folder_id)
             folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
-
-            # Alle Anhänge von der Edikt-Seite holen (PDFs + Bilder)
-            attachments  = gutachten_fetch_attachment_links(edikt_url)
-            all_files    = attachments.get("pdfs", []) + attachments.get("images", [])
-            print(f"  [GDrive] 📎 {len(all_files)} Datei(en) auf Edikt-Seite gefunden")
 
             uploaded = 0
             for att in all_files:
@@ -730,16 +772,7 @@ def gdrive_sync_gelb_entries(
             erledigt += 1
 
         except Exception as exc:
-            print(f"  [GDrive] ❌ Fehler für '{folder_name}': {exc}")
-            # Platzhalter speichern damit dieser Eintrag nicht endlos wiederholt wird
-            try:
-                notion.pages.update(
-                    page_id=page_id,
-                    properties={"Google Drive Link": {"url": "https://drive.google.com/drive/folders/nicht-verfuegbar"}},
-                )
-                print(f"  [GDrive] ℹ️  Platzhalter-Link gesetzt (Edikt-Seite nicht erreichbar)")
-            except Exception:
-                pass
+            print(f"  [GDrive] ❌ Drive-Fehler für '{folder_name}' (wird beim nächsten Run erneut versucht): {exc}")
         time.sleep(0.5)
 
     print(f"\n[GDrive] ✅ {erledigt}/{len(kandidaten)} Einträge verarbeitet")
@@ -3725,6 +3758,7 @@ async def main() -> None:
             # ── Google Drive: Unterlagen für alle Gelb-Einträge hochladen ────
             _gdrive_service = gdrive_get_service()
             if _gdrive_service:
+                gdrive_clear_placeholder_links(notion, db_id, _pages)
                 gdrive_sync_gelb_entries(notion, db_id, _pages, _gdrive_service)
             else:
                 print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
@@ -3889,6 +3923,7 @@ async def main() -> None:
     try:
         _gdrive_service = gdrive_get_service()
         if _gdrive_service:
+            gdrive_clear_placeholder_links(notion, db_id, _all_pages or [])
             gdrive_sync_gelb_entries(notion, db_id, _all_pages or [], _gdrive_service)
         else:
             print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
