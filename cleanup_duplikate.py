@@ -14,6 +14,17 @@ Umgebungsvariablen nötig:
 
 import os
 import time
+
+# .env Datei einlesen falls vorhanden (lokale Ausführung ohne GitHub Actions)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 from notion_client import Client
 
 # ── Phasen-Priorität: höherer Index = wertvoller ────────────────────────────

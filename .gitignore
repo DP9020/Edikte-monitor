@@ -1,4 +1,5 @@
-# Google Service Account Keys – niemals committen!
+# Lokale Secrets – niemals committen!
+.env
 *service-account*.json
 *-credentials.json
 *.key.json
