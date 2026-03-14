@@ -1650,6 +1650,25 @@ def gutachten_enrich_notion_page(
 # NOTION
 # =============================================================================
 
+def _notion_query_with_retry(notion: "Client", db_id: str, **kwargs) -> dict:
+    """
+    Führt notion.databases.query() mit bis zu 3 Versuchen aus.
+    Wartet 5s nach dem 1. Fehler, 15s nach dem 2. Fehler.
+    Wirft bei dauerhaftem Fehler die letzte Exception.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return notion.databases.query(database_id=db_id, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                wait = 5 * (attempt + 1) * 3  # 5s, 15s
+                print(f"  [Notion] ⚠️  API-Fehler (Versuch {attempt+1}/3), warte {wait}s: {exc}")
+                time.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
 def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
     """
     Lädt ALLE bestehenden Einträge aus der Notion-DB und gibt ein Dict
@@ -1678,10 +1697,10 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
         if cursor:
             kwargs["start_cursor"] = cursor
         try:
-            resp = notion.databases.query(database_id=db_id, **kwargs)
+            resp = _notion_query_with_retry(notion, db_id, **kwargs)
         except Exception as exc:
-            print(f"  [Notion] ⚠️  Fehler beim Laden der IDs: {exc}")
-            break
+            print(f"  [Notion] ❌ Laden der IDs dauerhaft fehlgeschlagen (alle Retries erschöpft): {exc}")
+            raise  # Fehler nach oben weiterleiten – kein leeres known_ids verwenden!
 
         for page in resp.get("results", []):
             props = page.get("properties", {})
@@ -1773,10 +1792,10 @@ def notion_load_all_pages(notion: Client, db_id: str) -> list[dict]:
         if start_cursor:
             kwargs["start_cursor"] = start_cursor
         try:
-            resp = notion.databases.query(database_id=db_id, **kwargs)
+            resp = _notion_query_with_retry(notion, db_id, **kwargs)
         except Exception as exc:
-            print(f"  [Notion] ⚠️  Fehler beim Laden der Pages: {exc}")
-            break
+            print(f"  [Notion] ❌ Laden der Pages dauerhaft fehlgeschlagen (alle Retries erschöpft): {exc}")
+            raise
 
         pages.extend(resp.get("results", []))
 
@@ -3794,27 +3813,54 @@ async def main() -> None:
     # Kein Scraping, keine PDF-Analyse – läuft in ~30 Sekunden statt ~10 Minuten.
     if os.environ.get("BRIEF_ONLY", "").lower() == "true":
         print("[Modus] ⚡ BRIEF_ONLY – nur Status-Sync + Brief-Erstellung")
+
+        # ── Pages laden + Status-Sync ─────────────────────────────────────────
+        _pages: list[dict] | None = None
         try:
             _pages = notion_load_all_pages(notion, db_id)
-            notion_status_sync(notion, db_id, all_pages=_pages)
-            # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
-            _pages = notion_load_all_pages(notion, db_id)
+        except Exception as exc:
+            print(f"[Modus] ⚠️  Erstes Page-Laden fehlgeschlagen: {exc}")
 
-            # ── Google Drive: Unterlagen für alle Gelb-Einträge hochladen ────
+        try:
+            notion_status_sync(notion, db_id, all_pages=_pages)
+        except Exception as exc:
+            print(f"[Modus] ⚠️  Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
+
+        # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
+        try:
+            _pages = notion_load_all_pages(notion, db_id)
+        except Exception as exc:
+            print(f"[Modus] ⚠️  Zweites Page-Laden fehlgeschlagen – nutze alte Daten: {exc}")
+
+        # ── Google Drive ──────────────────────────────────────────────────────
+        try:
             _gdrive_service = gdrive_get_service()
             if _gdrive_service:
-                cleared = gdrive_clear_placeholder_links(notion, db_id, _pages)
+                cleared = gdrive_clear_placeholder_links(notion, db_id, _pages or [])
                 if cleared:
-                    _pages = notion_load_all_pages(notion, db_id)
-                gdrive_sync_gelb_entries(notion, db_id, _pages, _gdrive_service)
+                    try:
+                        _pages = notion_load_all_pages(notion, db_id)
+                    except Exception:
+                        pass
+                gdrive_sync_gelb_entries(notion, db_id, _pages or [], _gdrive_service)
             else:
                 print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
+        except Exception as exc:
+            print(f"[Modus] ⚠️  GDrive-Sync fehlgeschlagen (nicht kritisch): {exc}")
 
+        # ── Brief-Erstellung ──────────────────────────────────────────────────
+        brief_erstellt = 0
+        brief_telegram: list[str] = []
+        try:
             brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_pages)
             print(f"[Modus] ✅ BRIEF_ONLY fertig – {brief_erstellt} Brief(e) erstellt")
-            if brief_erstellt == 0:
-                print("[Modus] Keine neuen Briefe – kein Telegram-Versand.")
-            else:
+        except Exception as exc:
+            print(f"[Modus] ❌ Brief-Erstellung fehlgeschlagen: {exc}")
+
+        if brief_erstellt == 0:
+            print("[Modus] Keine neuen Briefe – kein Telegram-Versand.")
+        else:
+            try:
                 lines = [
                     "<b>📨 Neue Briefe erstellt</b>",
                     f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
@@ -3824,8 +3870,8 @@ async def main() -> None:
                 for bl in brief_telegram[:20]:
                     lines.append(f"• {bl}")
                 await send_telegram("\n".join(lines))
-        except Exception as exc:
-            print(f"[Modus] ❌ BRIEF_ONLY Fehler: {exc}")
+            except Exception as exc:
+                print(f"[Modus] ⚠️  Telegram-Versand fehlgeschlagen: {exc}")
         return
 
     neue_eintraege:  list[dict] = []
@@ -3836,8 +3882,16 @@ async def main() -> None:
     try:
         known_ids = notion_load_all_ids(notion, db_id)  # {edikt_id -> page_id}
     except Exception as exc:
-        print(f"  [ERROR] Konnte IDs nicht laden: {exc}")
-        known_ids = {}
+        err_msg = f"Konnte IDs nicht laden (alle Retries erschöpft): {exc}"
+        print(f"  [ERROR] {err_msg}")
+        # WICHTIG: Scraping ohne gültige known_ids würde ALLE Edikte als neu werten
+        # → Massen-Duplikate in Notion + falsche Telegram-Meldungen.
+        # Deshalb: Lauf sofort abbrechen und per Telegram melden.
+        try:
+            await send_telegram(f"<b>⚠️ Edikte-Monitor: Lauf abgebrochen</b>\n{err_msg}\n\n<i>Bitte GitHub Actions Log prüfen.</i>")
+        except Exception:
+            pass
+        return
 
     # ── 2. Edikte scrapen + in Notion eintragen ───────────────────────────────
     for bundesland, bl_value in BUNDESLAENDER.items():
