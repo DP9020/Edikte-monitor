@@ -3374,11 +3374,15 @@ def _brief_anrede(eigentuemer: str) -> str:
     return "Sehr geehrte Damen und Herren,"
 
 
-def _brief_send_email(kontakt_email: str, kontakt_name: str,
-                      eigentuemer: str, titel: str,
-                      docx_bytes: bytes, dateiname_docx: str) -> bool:
+def _brief_send_email_sammlung(
+    kontakt_email: str,
+    kontakt_name: str,
+    attachments: list[tuple[bytes, str]],  # [(docx_bytes, dateiname), ...]
+    eigentuemer_list: list[str],
+) -> bool:
     """
-    Sendet den Brief als DOCX-Anhang per E-Mail via SendGrid API.
+    Sendet ALLE Briefe eines Runs als Sammel-E-Mail (ein Mail, mehrere Anhänge)
+    via SendGrid API.
 
     Benötigte Umgebungsvariablen:
       SENDGRID_API_KEY  – API-Key (beginnt mit SG.)
@@ -3386,40 +3390,49 @@ def _brief_send_email(kontakt_email: str, kontakt_name: str,
 
     Gibt True bei Erfolg, False bei Fehler zurück.
     """
-    api_key   = os.environ.get("SENDGRID_API_KEY", "")
-    absender  = os.environ.get("SMTP_USER", "")
+    api_key  = os.environ.get("SENDGRID_API_KEY", "")
+    absender = os.environ.get("SMTP_USER", "")
 
     if not api_key or not absender:
         print("  [Brief] ℹ️  SendGrid nicht konfiguriert (SENDGRID_API_KEY/SMTP_USER fehlt)")
         return False
 
     try:
-        # DOCX als Base64
-        docx_b64 = base64.b64encode(docx_bytes).decode("utf-8")
-
+        anzahl = len(attachments)
+        auflistung = "\n".join(f"  • {e}" for e in eigentuemer_list)
         body_text = "\n".join([
             f"Hallo {kontakt_name},",
             "",
-            "anbei der Anschreiben-Entwurf für:",
-            f"  Eigentümer:   {eigentuemer}",
-            f"  Liegenschaft: {titel}",
+            f"anbei {anzahl} Anschreiben-Entwurf{'' if anzahl == 1 else 'e'} vom Edikte-Monitor:",
             "",
-            "Bitte ausdrucken und versenden.",
+            auflistung,
+            "",
+            "Einträge mit [BITTE ERGÄNZEN] müssen vor dem Versand noch manuell befüllt werden.",
             "",
             "Automatisch erstellt vom Edikte-Monitor.",
         ])
 
+        subject = (
+            f"Edikte-Monitor: {anzahl} neuer Anschreiben-Entwurf"
+            if anzahl == 1 else
+            f"Edikte-Monitor: {anzahl} neue Anschreiben-Entwürfe"
+        )
+
+        att_list = []
+        for docx_bytes, dateiname in attachments:
+            att_list.append({
+                "content":     base64.b64encode(docx_bytes).decode("utf-8"),
+                "type":        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "filename":    dateiname,
+                "disposition": "attachment",
+            })
+
         payload = {
             "personalizations": [{"to": [{"email": kontakt_email, "name": kontakt_name}]}],
             "from": {"email": absender},
-            "subject": f"Neuer Anschreiben-Entwurf: {eigentuemer[:60]}",
+            "subject": subject,
             "content": [{"type": "text/plain", "value": body_text}],
-            "attachments": [{
-                "content":     docx_b64,
-                "type":        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "filename":    dateiname_docx,
-                "disposition": "attachment",
-            }],
+            "attachments": att_list,
         }
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3436,7 +3449,7 @@ def _brief_send_email(kontakt_email: str, kontakt_name: str,
             status = r.getcode()
 
         if status in (200, 202):
-            print(f"  [Brief] ✉️  E-Mail gesendet an {kontakt_email}")
+            print(f"  [Brief] ✉️  Sammel-E-Mail ({anzahl} Anhänge) gesendet an {kontakt_email}")
             return True
         else:
             print(f"  [Brief] ⚠️  SendGrid HTTP {status}")
@@ -3503,6 +3516,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     erstellt = 0
     telegram_lines: list[str] = []
     from datetime import date
+    from collections import defaultdict
 
     # Ausgabe-Verzeichnis für DOCXs (wird als GitHub-Artifact hochgeladen)
     brief_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "briefe")
@@ -3510,7 +3524,6 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
 
     # ── Einträge nach Eigentümer gruppieren ───────────────────────────────────
     # Gleicher Eigentümer → ein Brief mit allen Liegenschaften aufgelistet
-    from collections import defaultdict
     gruppen: dict[str, list[dict]] = defaultdict(list)
 
     for page in to_process:
@@ -3525,6 +3538,10 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
 
     heute     = date.today()
     datum_str = heute.strftime("%d.%m.%Y")
+
+    # Sammel-Queue für E-Mail-Versand: pro Betreuer alle Anhänge sammeln
+    # {kontakt_email: {"kontakt": ..., "attachments": [...], "eigentuemer_list": [...]}}
+    email_queue: dict[str, dict] = {}
 
     for eigen_key, gruppe in gruppen.items():
         # ── Daten aus erstem Eintrag der Gruppe lesen ─────────────────────────
@@ -3542,23 +3559,33 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
 
         bundesland = (first_props.get("Bundesland", {}).get("select") or {}).get("name", "")
 
-        # ── Pflichtfelder prüfen ──────────────────────────────────────────────
         titel_list = first_props.get("Liegenschaftsadresse", {}).get("title", [])
         titel      = "".join(t.get("plain_text", "") for t in titel_list).strip()
 
-        if not eigentuemer:
-            print(f"  [Brief] ⏭  Überspringe Gruppe – kein Eigentümer")
-            continue
-        # Fallback: wenn Zustell PLZ/Ort leer, versuche dediziertes Liegenschafts-PLZ-Feld
-        if not plz_ort:
-            plz_rt_fb   = first_props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
-            plz_ort     = "".join(t.get("text", {}).get("content", "") for t in plz_rt_fb).strip()
-        if not adresse or not plz_ort:
-            print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50]} – keine Zustelladresse")
-            continue
         if not bundesland or bundesland not in KONTAKT_DATEN:
-            print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50]} – kein Kontakt für '{bundesland}'")
+            print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50] or '(kein Name)'} – kein Kontakt für '{bundesland}'")
             continue
+
+        # ── Fehlende Felder mit Platzhalter auffüllen (kein Skip mehr) ────────
+        fehlende_felder: list[str] = []
+        if not eigentuemer:
+            eigentuemer = "[NAME FEHLT – BITTE ERGÄNZEN]"
+            fehlende_felder.append("Eigentümer")
+
+        # Fallback: wenn Zustell PLZ/Ort leer, versuche Liegenschafts-PLZ-Feld
+        if not plz_ort:
+            plz_rt_fb = first_props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
+            plz_ort   = "".join(t.get("text", {}).get("content", "") for t in plz_rt_fb).strip()
+
+        if not adresse:
+            adresse = "[ZUSTELLADRESSE FEHLT – BITTE ERGÄNZEN]"
+            fehlende_felder.append("Zustelladresse")
+        if not plz_ort:
+            plz_ort = "[PLZ/ORT FEHLT – BITTE ERGÄNZEN]"
+            fehlende_felder.append("Zustell PLZ/Ort")
+
+        if fehlende_felder:
+            print(f"  [Brief] ⚠️  {eigentuemer[:50]} – fehlende Felder: {', '.join(fehlende_felder)} (Platzhalter eingefügt)")
 
         kontakt = KONTAKT_DATEN[bundesland]
 
@@ -3643,17 +3670,17 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             anzahl_str = f" ({len(liegenschaften)} Liegenschaften)" if len(liegenschaften) > 1 else ""
             print(f"  [Brief] 💾 DOCX gespeichert: {dateiname_docx}{anzahl_str}")
 
-            # ── E-Mail an Betreuer ────────────────────────────────────────────
-            email_ok = _brief_send_email(
-                kontakt_email  = kontakt["email"],
-                kontakt_name   = kontakt["name"],
-                eigentuemer    = eigentuemer,
-                titel          = titel if len(liegenschaften) == 1 else
-                                 f"{len(liegenschaften)} Liegenschaften: " +
-                                 ", ".join(l["adresse"][:30] for l in liegenschaften[:3]),
-                docx_bytes     = docx_bytes,
-                dateiname_docx = dateiname_docx,
-            )
+            # ── Brief in E-Mail-Queue einreihen (Sammelversand nach dem Loop) ──
+            eq_key = kontakt["email"]
+            if eq_key not in email_queue:
+                email_queue[eq_key] = {
+                    "kontakt":         kontakt,
+                    "attachments":     [],
+                    "eigentuemer_list": [],
+                }
+            hinweis = f" ⚠️ FEHLENDE FELDER: {', '.join(fehlende_felder)}" if fehlende_felder else ""
+            email_queue[eq_key]["attachments"].append((docx_bytes, dateiname_docx))
+            email_queue[eq_key]["eigentuemer_list"].append(f"{eigentuemer[:60]}{hinweis}")
 
             # ── Telegram-Dokument ─────────────────────────────────────────────
             tg_caption = (
@@ -3704,10 +3731,10 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                         print(f"  [Brief] ⚠️  Notion-Update fehlgeschlagen für {p_id[:8]}: {notion_exc}")
                 time.sleep(0.4)
 
-            icon = "✉️" if email_ok else "📨"
-            print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}{anzahl_str}")
+            warn_str = f" ⚠️ [{', '.join(fehlende_felder)}]" if fehlende_felder else ""
+            print(f"  [Brief] ✅ Erledigt: {eigentuemer[:40]} ({bundesland}) → {kontakt['name']}{anzahl_str}{warn_str}")
             telegram_lines.append(
-                f"{icon} {html_escape(eigentuemer[:35])} | {html_escape(bundesland)} "
+                f"📨 {html_escape(eigentuemer[:35])}{html_escape(warn_str)} | {html_escape(bundesland)} "
                 f"→ {html_escape(kontakt['name'])}{html_escape(anzahl_str)}"
             )
             erstellt += 1
@@ -3716,7 +3743,23 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         except Exception as exc:
             print(f"  [Brief] ❌ Fehler bei {eigentuemer[:50]}: {exc}")
 
-    print(f"[Brief] ✅ {erstellt} Brief(e) erstellt ({len(to_process)} Einträge)")
+    # ── Sammel-E-Mail pro Betreuer versenden ──────────────────────────────────
+    print(f"[Brief] 📬 Versende Sammel-E-Mails ({len(email_queue)} Betreuer) …")
+    emails_ok = 0
+    for eq_key, eq_data in email_queue.items():
+        try:
+            ok = _brief_send_email_sammlung(
+                kontakt_email   = eq_data["kontakt"]["email"],
+                kontakt_name    = eq_data["kontakt"]["name"],
+                attachments     = eq_data["attachments"],
+                eigentuemer_list = eq_data["eigentuemer_list"],
+            )
+            if ok:
+                emails_ok += 1
+        except Exception as exc:
+            print(f"  [Brief] ⚠️  Sammel-E-Mail an {eq_key} fehlgeschlagen: {exc}")
+
+    print(f"[Brief] ✅ {erstellt} Brief(e) erstellt, {emails_ok}/{len(email_queue)} Sammel-E-Mail(s) gesendet ({len(to_process)} Einträge)")
     return erstellt, telegram_lines
 
 
