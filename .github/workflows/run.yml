@@ -7,7 +7,6 @@ on:
     - cron: "0 10 * * 1-5"
     - cron: "0 13 * * 1-5"
     - cron: "*/10 * * * *"
-    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       brief_only:
@@ -80,9 +79,9 @@ jobs:
         run: |
           python main.py
 
-  # GDRIVE_ONLY: alle 30 Minuten – Google Drive Sync für Gelb-Einträge
+  # GDRIVE_ONLY: alle 10 Minuten – Google Drive Sync für Gelb-Einträge
   gdrive-sync:
-    if: github.event.schedule == '*/30 * * * *'
+    if: github.event.schedule == '*/10 * * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
