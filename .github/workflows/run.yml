@@ -7,6 +7,7 @@ on:
     - cron: "0 10 * * 1-5"
     - cron: "0 13 * * 1-5"
     - cron: "*/10 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       brief_only:
@@ -16,7 +17,7 @@ on:
 
 jobs:
 
-  # Vollständiger Run: Scraping + Gutachten + Briefe + Benjamin
+  # Vollständiger Run: Scraping + Gutachten-Analyse
   full-run:
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -75,8 +76,31 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
+          BRIEF_ONLY: "true"
+        run: |
+          python main.py
+
+  # GDRIVE_ONLY: alle 30 Minuten – Google Drive Sync für Gelb-Einträge
+  gdrive-sync:
+    if: github.event.schedule == '*/30 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run (GDrive-Sync)
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-          BRIEF_ONLY: "true"
+          GDRIVE_ONLY: "true"
         run: |
           python main.py

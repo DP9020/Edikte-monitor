@@ -3808,51 +3808,65 @@ async def main() -> None:
     notion = Client(auth=env("NOTION_TOKEN"))
     db_id  = clean_notion_db_id(env("NOTION_DATABASE_ID"))
 
-    # ── BRIEF_ONLY-Modus: nur Status-Sync + Brief-Erstellung ─────────────────
-    # Wird gesetzt wenn Env-Variable BRIEF_ONLY=true gesetzt ist.
-    # Kein Scraping, keine PDF-Analyse – läuft in ~30 Sekunden statt ~10 Minuten.
-    if os.environ.get("BRIEF_ONLY", "").lower() == "true":
-        print("[Modus] ⚡ BRIEF_ONLY – nur Status-Sync + Brief-Erstellung")
+    # ── GDRIVE_ONLY-Modus: nur Google Drive Sync für Gelb-Einträge ───────────
+    # Wird gesetzt wenn Env-Variable GDRIVE_ONLY=true gesetzt ist.
+    # Läuft alle 30 Minuten – unabhängig von Briefen und Scraping.
+    if os.environ.get("GDRIVE_ONLY", "").lower() == "true":
+        print("[Modus] ☁️  GDRIVE_ONLY – Google Drive Sync für Gelb-Einträge")
 
-        # ── Pages laden + Status-Sync ─────────────────────────────────────────
         _pages: list[dict] | None = None
         try:
             _pages = notion_load_all_pages(notion, db_id)
         except Exception as exc:
-            print(f"[Modus] ⚠️  Erstes Page-Laden fehlgeschlagen: {exc}")
+            print(f"[Modus] ⚠️  Page-Laden fehlgeschlagen: {exc}")
+            return
 
-        try:
-            notion_status_sync(notion, db_id, all_pages=_pages)
-        except Exception as exc:
-            print(f"[Modus] ⚠️  Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
-
-        # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
-        try:
-            _pages = notion_load_all_pages(notion, db_id)
-        except Exception as exc:
-            print(f"[Modus] ⚠️  Zweites Page-Laden fehlgeschlagen – nutze alte Daten: {exc}")
-
-        # ── Google Drive ──────────────────────────────────────────────────────
         try:
             _gdrive_service = gdrive_get_service()
             if _gdrive_service:
-                cleared = gdrive_clear_placeholder_links(notion, db_id, _pages or [])
+                cleared = gdrive_clear_placeholder_links(notion, db_id, _pages)
                 if cleared:
                     try:
                         _pages = notion_load_all_pages(notion, db_id)
                     except Exception:
                         pass
-                gdrive_sync_gelb_entries(notion, db_id, _pages or [], _gdrive_service)
+                count = gdrive_sync_gelb_entries(notion, db_id, _pages, _gdrive_service)
+                print(f"[Modus] ✅ GDRIVE_ONLY fertig – {count} Eintrag/Einträge verarbeitet")
             else:
                 print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
         except Exception as exc:
-            print(f"[Modus] ⚠️  GDrive-Sync fehlgeschlagen (nicht kritisch): {exc}")
+            print(f"[Modus] ❌ GDrive-Sync fehlgeschlagen: {exc}")
+        return
+
+    # ── BRIEF_ONLY-Modus: nur Status-Sync + Brief-Erstellung ─────────────────
+    # Wird gesetzt wenn Env-Variable BRIEF_ONLY=true gesetzt ist.
+    # Kein Scraping, kein GDrive, keine PDF-Analyse – läuft in ~30 Sekunden.
+    if os.environ.get("BRIEF_ONLY", "").lower() == "true":
+        print("[Modus] ⚡ BRIEF_ONLY – nur Status-Sync + Brief-Erstellung")
+
+        # ── Pages laden + Status-Sync ─────────────────────────────────────────
+        _pages2: list[dict] | None = None
+        try:
+            _pages2 = notion_load_all_pages(notion, db_id)
+        except Exception as exc:
+            print(f"[Modus] ⚠️  Erstes Page-Laden fehlgeschlagen: {exc}")
+
+        try:
+            notion_status_sync(notion, db_id, all_pages=_pages2)
+        except Exception as exc:
+            print(f"[Modus] ⚠️  Status-Sync fehlgeschlagen (nicht kritisch): {exc}")
+
+        # Seiten nach Sync neu laden damit aktualisierte Phasen sichtbar sind
+        try:
+            _pages2 = notion_load_all_pages(notion, db_id)
+        except Exception as exc:
+            print(f"[Modus] ⚠️  Zweites Page-Laden fehlgeschlagen – nutze alte Daten: {exc}")
 
         # ── Brief-Erstellung ──────────────────────────────────────────────────
         brief_erstellt = 0
         brief_telegram: list[str] = []
         try:
-            brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_pages)
+            brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_pages2)
             print(f"[Modus] ✅ BRIEF_ONLY fertig – {brief_erstellt} Brief(e) erstellt")
         except Exception as exc:
             print(f"[Modus] ❌ Brief-Erstellung fehlgeschlagen: {exc}")
@@ -4030,28 +4044,7 @@ async def main() -> None:
     except Exception as exc:
         print(f"  [WARN] Qualitäts-Check fehlgeschlagen (nicht kritisch): {exc}")
 
-    # ── 3e. Google Drive: Unterlagen für Gelb-Einträge hochladen ────────────────
-    try:
-        _gdrive_service = gdrive_get_service()
-        if _gdrive_service:
-            cleared = gdrive_clear_placeholder_links(notion, db_id, _all_pages or [])
-            if cleared:
-                _all_pages = notion_load_all_pages(notion, db_id)
-            gdrive_sync_gelb_entries(notion, db_id, _all_pages or [], _gdrive_service)
-        else:
-            print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
-    except Exception as exc:
-        print(f"  [WARN] Google Drive Sync fehlgeschlagen (nicht kritisch): {exc}")
-
-    # ── 3f. Brief-Erstellung: relevant markierte Einträge → Brief erstellen ──────────────
-    # Betrifft: Einträge mit Phase '✅ Relevant – Brief vorbereiten'
-    # bei denen 'Brief erstellt am' noch leer ist.
-    brief_erstellt = 0
-    brief_telegram: list[str] = []
-    try:
-        brief_erstellt, brief_telegram = notion_brief_erstellen(notion, db_id, all_pages=_all_pages)
-    except Exception as exc:
-        print(f"  [WARN] Brief-Erstellung fehlgeschlagen (nicht kritisch): {exc}")
+    # GDrive-Sync und Brief-Erstellung laufen in eigenen Jobs (gdrive-sync / brief-only).
 
     # ── 4. Gutachten-Anreicherung: Text-PDFs (LLM) ───────────────────────────
     # Betrifft: Einträge die eine URL haben aber noch nicht analysiert wurden.
@@ -4080,14 +4073,13 @@ async def main() -> None:
     print(f"🗑  Tote URLs archiviert:  {tote_urls_archiviert}")
     print(f"📄 Gutachten analysiert:  {gutachten_enriched}")
     print(f"🔭 Vision analysiert:     {vision_enriched}")
-    print(f"✉️  Briefe erstellt:      {brief_erstellt}")
     print(f"⚠️  Fehler:                {len(fehler)}")
     print("=" * 60)
 
     if not neue_eintraege and not fehler \
             and not gutachten_enriched and not vision_enriched \
             and not tote_urls_archiviert and not tote_urls_alarme \
-            and not edikt_updates and not brief_erstellt:
+            and not edikt_updates:
         print("Keine neuen relevanten Änderungen – kein Telegram-Versand.")
         return
 
@@ -4133,12 +4125,6 @@ async def main() -> None:
         lines.append("<b>🚨 Achtung – Edikt verschwunden (manuelle Prüfung!):</b>")
         for alarm in tote_urls_alarme:
             lines.append(f"• {alarm}")
-        lines.append("")
-
-    if brief_erstellt:
-        lines.append(f"<b>✉️ Briefe erstellt: {brief_erstellt}</b>")
-        for bl in brief_telegram[:10]:
-            lines.append(f"• {bl}")
         lines.append("")
 
     if gutachten_enriched:
