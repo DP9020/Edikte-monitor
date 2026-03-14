@@ -3563,13 +3563,15 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         titel      = "".join(t.get("plain_text", "") for t in titel_list).strip()
 
         if not bundesland or bundesland not in KONTAKT_DATEN:
-            print(f"  [Brief] ⏭  Überspringe {eigentuemer[:50] or '(kein Name)'} – kein Kontakt für '{bundesland}'")
-            continue
+            # Kein Betreuer ermittelbar → Steiermark als Fallback (Friedrich)
+            bundesland = bundesland or "(unbekannt)"
+            print(f"  [Brief] ⚠️  Kein Kontakt für Bundesland '{bundesland}' – verwende Fallback Friedrich")
+            bundesland = "Steiermark"
 
         # ── Fehlende Felder mit Platzhalter auffüllen (kein Skip mehr) ────────
         fehlende_felder: list[str] = []
         if not eigentuemer:
-            eigentuemer = "[NAME FEHLT – BITTE ERGÄNZEN]"
+            eigentuemer = "(Eigentümer)"
             fehlende_felder.append("Eigentümer")
 
         # Fallback: wenn Zustell PLZ/Ort leer, versuche Liegenschafts-PLZ-Feld
@@ -3578,10 +3580,10 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             plz_ort   = "".join(t.get("text", {}).get("content", "") for t in plz_rt_fb).strip()
 
         if not adresse:
-            adresse = "[ZUSTELLADRESSE FEHLT – BITTE ERGÄNZEN]"
+            adresse = "(Zustelladresse)"
             fehlende_felder.append("Zustelladresse")
         if not plz_ort:
-            plz_ort = "[PLZ/ORT FEHLT – BITTE ERGÄNZEN]"
+            plz_ort = ""
             fehlende_felder.append("Zustell PLZ/Ort")
 
         if fehlende_felder:
@@ -3692,7 +3694,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             send_telegram_document(docx_bytes, dateiname_docx, caption=tg_caption, bundesland=bundesland)
 
             # ── Notion: alle Seiten der Gruppe aktualisieren ──────────────────
-            versand_info = f"E-Mail an {kontakt['email']}" if email_ok else "Telegram"
+            versand_info = f"E-Mail an {kontakt['email']}"
             for page in gruppe:
                 p_id = page["id"]
                 p_props = page.get("properties", {})
