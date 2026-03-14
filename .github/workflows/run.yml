@@ -9,17 +9,17 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
-      brief_only:
-        description: "Nur Brief-Erstellung (kein Scraping)"
+      modus:
+        description: "Modus: full | brief | gdrive"
         required: false
-        default: "false"
+        default: "full"
 
 jobs:
 
   # Vollständiger Run: Scraping + Gutachten-Analyse
   full-run:
     if: |
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.modus == 'full' || github.event.inputs.modus == '')) ||
       github.event.schedule == '30 5 * * 1-5' ||
       github.event.schedule == '0 7 * * 1-5'  ||
       github.event.schedule == '0 10 * * 1-5' ||
@@ -53,7 +53,9 @@ jobs:
 
   # BRIEF_ONLY: alle 10 Minuten – nur Status-Sync + Brief-Erstellung
   brief-only:
-    if: github.event.schedule == '*/10 * * * *'
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'brief') ||
+      github.event.schedule == '*/10 * * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +83,9 @@ jobs:
 
   # GDRIVE_ONLY: alle 10 Minuten – Google Drive Sync für Gelb-Einträge
   gdrive-sync:
-    if: github.event.schedule == '*/10 * * * *'
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'gdrive') ||
+      github.event.schedule == '*/10 * * * *'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
