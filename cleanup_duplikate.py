@@ -40,7 +40,7 @@ PHASE_RANG = {
     "✅ Gekauft":                       8,
 }
 
-DRY_RUN = True  # Auf False setzen um wirklich zu archivieren
+DRY_RUN = False  # Auf False setzen um wirklich zu archivieren
 
 
 def env(key: str) -> str:
