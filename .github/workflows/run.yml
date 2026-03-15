@@ -7,6 +7,7 @@ on:
     - cron: "0 10 * * 1-5"
     - cron: "0 13 * * 1-5"
     - cron: "*/10 * * * *"
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       modus:
@@ -108,9 +109,11 @@ jobs:
         run: |
           python main.py
 
-  # CLEANUP: Duplikate in Notion-Datenbank archivieren (nur manuell)
+  # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Montag 06:00 UTC)
   cleanup-duplikate:
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'cleanup'
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'cleanup') ||
+      github.event.schedule == '0 6 * * 1'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

@@ -1751,14 +1751,6 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
                     geschuetzt_count += 1
                 else:
                     known[eid] = page["id"]
-                    # Auch für nicht-geschützte Einträge Titel-Fingerprint speichern –
-                    # verhindert Duplikate wenn dieselbe Immobilie mit neuer edikt_id
-                    # erneut gescrapt wird (z.B. neuer Versteigerungstermin).
-                    if title_all:
-                        existing = known.get(f"__titel__{titel_fp}", "")
-                        # Nur setzen wenn noch kein geschützter Eintrag diesen Titel hat
-                        if not existing.startswith("(geschuetzt"):
-                            known[f"__titel__{titel_fp}"] = f"(duplikat:{page['id']})"
 
             # Einträge OHNE Hash-ID aber MIT fortgeschrittener Phase:
             # Titel als Ersatz-Fingerprint speichern (verhindert Doppelanlage
@@ -1864,10 +1856,6 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
         elif val == "(geschuetzt)":
             # Altes Format ohne page_id – nur überspringen
             print(f"  [Notion] 🔒 Titel-Duplikat übersprungen (bereits geschützt): {adresse_voll[:60]}")
-            return None
-        elif val.startswith("(duplikat:"):
-            # Nicht-geschützter Eintrag mit gleicher Adresse – Duplikat überspringen
-            print(f"  [Notion] ♻️  Duplikat übersprungen (gleiche Adresse bereits vorhanden): {adresse_voll[:60]}")
             return None
 
     # ── Kern-Properties (existieren garantiert in jeder Notion-DB) ───────────
