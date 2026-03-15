@@ -104,65 +104,37 @@ def page_rang(page: dict) -> int:
     return rang
 
 
-def main():
-    notion = Client(auth=env("NOTION_TOKEN"))
-    db_id  = clean_db_id(env("NOTION_DATABASE_ID"))
+def get_titel(page: dict) -> str:
+    titel_rt = page.get("properties", {}).get("Liegenschaftsadresse", {}).get("title", [])
+    return titel_rt[0].get("plain_text", "").strip() if titel_rt else ""
 
-    pages = load_all_pages(notion, db_id)
 
-    # ── Gruppieren nach Hash-ID ───────────────────────────────────────────────
-    gruppen: dict[str, list[dict]] = {}
-    ohne_hash = 0
+def normalize_titel(titel: str) -> str:
+    """Normalisiert Adressen für Vergleich: Kleinbuchstaben, Leerzeichen vereinheitlichen."""
+    import re
+    t = titel.lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
 
-    for page in pages:
-        props    = page.get("properties", {})
-        hash_rt  = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
-        hash_id  = hash_rt[0].get("plain_text", "").strip().lower() if hash_rt else ""
 
-        if not hash_id:
-            ohne_hash += 1
-            continue
-
-        gruppen.setdefault(hash_id, []).append(page)
-
-    duplikat_gruppen = {k: v for k, v in gruppen.items() if len(v) > 1}
-
-    print(f"\n📊 Statistik:")
-    print(f"   Gesamt:          {len(pages)}")
-    print(f"   Ohne Hash-ID:    {ohne_hash}")
-    print(f"   Duplikat-Gruppen:{len(duplikat_gruppen)}")
-    duplikat_count = sum(len(v) - 1 for v in duplikat_gruppen.values())
-    print(f"   Zu archivierende:{duplikat_count}")
-
-    if not duplikat_gruppen:
-        print("\n✅ Keine Duplikate gefunden!")
-        return
-
-    if DRY_RUN:
-        print("\n⚠️  DRY RUN – es wird nichts geändert. DRY_RUN = False setzen zum Ausführen.\n")
-
+def archiviere_duplikate(notion, duplikat_gruppen: dict, label: str) -> int:
     archiviert = 0
-    for hash_id, gruppe in duplikat_gruppen.items():
-        # Besten Eintrag bestimmen
+    for key, gruppe in duplikat_gruppen.items():
         gruppe_sortiert = sorted(gruppe, key=page_rang, reverse=True)
-        behalten  = gruppe_sortiert[0]
-        loeschen  = gruppe_sortiert[1:]
+        behalten = gruppe_sortiert[0]
+        loeschen = gruppe_sortiert[1:]
 
-        behalten_props = behalten.get("properties", {})
-        behalten_titel = ""
-        titel_rt = behalten_props.get("Liegenschaftsadresse", {}).get("title", [])
-        if titel_rt:
-            behalten_titel = titel_rt[0].get("plain_text", "")
-        behalten_phase = (behalten_props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        behalten_titel = get_titel(behalten)
+        behalten_phase = (behalten.get("properties", {}).get("Workflow-Phase", {}).get("select") or {}).get("name", "")
 
-        print(f"\n🔑 Hash: {hash_id[:16]}… | Behalten: '{behalten_titel[:50]}' [{behalten_phase}]")
+        print(f"\n🔑 {label}: {str(key)[:20]}… | Behalten: '{behalten_titel[:50]}' [{behalten_phase}]")
 
         for dup in loeschen:
             dup_props = dup.get("properties", {})
             dup_phase = (dup_props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
             dup_id    = dup["id"]
 
-            print(f"   🗑  Archiviere Duplikat [{dup_phase}] page_id={dup_id[:8]}…")
+            print(f"   🗑  Archiviere [{dup_phase}] page_id={dup_id[:8]}…")
 
             if not DRY_RUN:
                 try:
@@ -182,8 +154,74 @@ def main():
                     print(f"   ⚠️  Fehler: {exc}")
             else:
                 archiviert += 1
+    return archiviert
 
-    print(f"\n{'[DRY RUN] Würde' if DRY_RUN else '✅'} {archiviert} Duplikat(e) archiviert")
+
+def main():
+    notion = Client(auth=env("NOTION_TOKEN"))
+    db_id  = clean_db_id(env("NOTION_DATABASE_ID"))
+
+    pages = load_all_pages(notion, db_id)
+
+    if DRY_RUN:
+        print("\n⚠️  DRY RUN – es wird nichts geändert. DRY_RUN = False setzen zum Ausführen.\n")
+
+    # ── Pass 1: Gruppieren nach Hash-ID ──────────────────────────────────────
+    hash_gruppen: dict[str, list[dict]] = {}
+    ohne_hash = 0
+
+    for page in pages:
+        props   = page.get("properties", {})
+        hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
+        hash_id = hash_rt[0].get("plain_text", "").strip().lower() if hash_rt else ""
+
+        if not hash_id:
+            ohne_hash += 1
+            continue
+
+        # Bereits archivierte überspringen
+        if props.get("Archiviert", {}).get("checkbox", False):
+            continue
+
+        hash_gruppen.setdefault(hash_id, []).append(page)
+
+    dup_hash = {k: v for k, v in hash_gruppen.items() if len(v) > 1}
+
+    print(f"\n📊 Pass 1 – Duplikate nach Hash-ID:")
+    print(f"   Aktive Pages:    {sum(len(v) for v in hash_gruppen.values())}")
+    print(f"   Duplikat-Gruppen:{len(dup_hash)}")
+    print(f"   Zu archivieren:  {sum(len(v)-1 for v in dup_hash.values())}")
+
+    archiviert1 = archiviere_duplikate(notion, dup_hash, "Hash")
+
+    # ── Pass 2: Gruppieren nach normalisiertem Titel (gleiche Adresse) ───────
+    # Pages neu laden damit archivierte nicht mehr auftauchen
+    pages2 = load_all_pages(notion, db_id)
+    titel_gruppen: dict[str, list[dict]] = {}
+
+    for page in pages2:
+        props = page.get("properties", {})
+        if props.get("Archiviert", {}).get("checkbox", False):
+            continue
+
+        titel = normalize_titel(get_titel(page))
+        if not titel:
+            continue
+
+        titel_gruppen.setdefault(titel, []).append(page)
+
+    dup_titel = {k: v for k, v in titel_gruppen.items() if len(v) > 1}
+
+    print(f"\n📊 Pass 2 – Duplikate nach Adresse/Titel:")
+    print(f"   Aktive Pages:    {sum(len(v) for v in titel_gruppen.values())}")
+    print(f"   Duplikat-Gruppen:{len(dup_titel)}")
+    print(f"   Zu archivieren:  {sum(len(v)-1 for v in dup_titel.values())}")
+
+    archiviert2 = archiviere_duplikate(notion, dup_titel, "Titel")
+
+    print(f"\n{'[DRY RUN] Würde' if DRY_RUN else '✅'} {archiviert1 + archiviert2} Duplikat(e) archiviert")
+    print(f"   Pass 1 (Hash-ID): {archiviert1}")
+    print(f"   Pass 2 (Adresse): {archiviert2}")
 
 
 if __name__ == "__main__":
