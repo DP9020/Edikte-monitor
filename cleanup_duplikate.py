@@ -50,14 +50,14 @@ def env(key: str) -> str:
     return val
 
 
-def clean_db_id(db_id: str) -> str:
-    db_id = db_id.strip()
-    if "notion.so" in db_id:
-        db_id = db_id.split("/")[-1].split("?")[0]
-    db_id = db_id.replace("-", "")
-    if len(db_id) == 32:
-        db_id = f"{db_id[:8]}-{db_id[8:12]}-{db_id[12:16]}-{db_id[16:20]}-{db_id[20:]}"
-    return db_id
+def clean_db_id(raw: str) -> str:
+    import re
+    raw = raw.split("?")[0].strip()
+    raw = raw.rstrip("/").split("/")[-1]
+    clean = re.sub(r"[^0-9a-fA-F]", "", raw)
+    if len(clean) == 32:
+        return f"{clean[0:8]}-{clean[8:12]}-{clean[12:16]}-{clean[16:20]}-{clean[20:32]}"
+    return raw
 
 
 def load_all_pages(notion: Client, db_id: str) -> list[dict]:
