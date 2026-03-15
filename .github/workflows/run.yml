@@ -19,6 +19,9 @@ jobs:
 
   # Vollständiger Run: Scraping + Gutachten-Analyse
   full-run:
+    concurrency:
+      group: full-run
+      cancel-in-progress: false
     if: |
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.modus == 'full' || github.event.inputs.modus == '')) ||
       github.event.schedule == '30 5 * * 1-5' ||
