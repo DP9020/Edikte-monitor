@@ -117,9 +117,41 @@ def normalize_titel(titel: str) -> str:
     return t
 
 
-def archiviere_duplikate(notion, duplikat_gruppen: dict, label: str) -> int:
+def get_gericht_az(page: dict) -> tuple[str, str]:
+    """Gibt (Gericht, Aktenzeichen) einer Page zurück, jeweils leer falls nicht vorhanden."""
+    props = page.get("properties", {})
+    gericht_rt = props.get("Gericht", {}).get("rich_text", [])
+    gericht = gericht_rt[0].get("plain_text", "").strip() if gericht_rt else ""
+    az_rt = props.get("Aktenzeichen", {}).get("rich_text", [])
+    aktenzeichen = az_rt[0].get("plain_text", "").strip() if az_rt else ""
+    return gericht, aktenzeichen
+
+
+def archiviere_duplikate(notion, duplikat_gruppen: dict, label: str, pass2: bool = False) -> int:
     archiviert = 0
     for key, gruppe in duplikat_gruppen.items():
+        # ── Pass-2-Schutz: nur archivieren wenn Gericht oder Aktenzeichen übereinstimmen ──
+        if pass2:
+            gerichte_count: dict[str, int] = {}
+            az_count: dict[str, int] = {}
+            for p in gruppe:
+                g, az = get_gericht_az(p)
+                if g:
+                    gerichte_count[g] = gerichte_count.get(g, 0) + 1
+                if az:
+                    az_count[az] = az_count.get(az, 0) + 1
+
+            hat_irgendwas = bool(gerichte_count or az_count)
+            if not hat_irgendwas:
+                print(f"   ⚠️  Pass 2 übersprungen (kein Gericht/AZ vorhanden): {str(key)[:80]}")
+                continue
+
+            gemeinsames_gericht = any(c > 1 for c in gerichte_count.values())
+            gemeinsames_az = any(c > 1 for c in az_count.values())
+            if not gemeinsames_gericht and not gemeinsames_az:
+                print(f"   ⚠️  Pass 2 übersprungen (kein gemeinsames Gericht/AZ): {str(key)[:80]}")
+                continue
+
         gruppe_sortiert = sorted(gruppe, key=page_rang, reverse=True)
         behalten = gruppe_sortiert[0]
         loeschen = gruppe_sortiert[1:]
@@ -215,9 +247,9 @@ def main():
     print(f"\n📊 Pass 2 – Duplikate nach Adresse/Titel:")
     print(f"   Aktive Pages:    {sum(len(v) for v in titel_gruppen.values())}")
     print(f"   Duplikat-Gruppen:{len(dup_titel)}")
-    print(f"   Zu archivieren:  {sum(len(v)-1 for v in dup_titel.values())}")
+    print(f"   Zu archivieren:  {sum(len(v)-1 for v in dup_titel.values())} (vor Gericht/AZ-Prüfung)")
 
-    archiviert2 = archiviere_duplikate(notion, dup_titel, "Titel")
+    archiviert2 = archiviere_duplikate(notion, dup_titel, "Titel", pass2=True)
 
     print(f"\n{'[DRY RUN] Würde' if DRY_RUN else '✅'} {archiviert1 + archiviert2} Duplikat(e) archiviert")
     print(f"   Pass 1 (Hash-ID): {archiviert1}")

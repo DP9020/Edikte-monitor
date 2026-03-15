@@ -338,6 +338,26 @@ def _clean_adresse(adr: str) -> str:
     return adr
 
 
+def notion_with_retry(fn, *args, max_retries: int = 3, **kwargs):
+    """
+    Führt eine Notion-API-Funktion mit automatischem Retry bei Rate-Limit (429) aus.
+    Wartet bei 429: 5s, 15s, 30s (exponential backoff).
+    """
+    delays = [5, 15, 30]
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            err_str = str(exc).lower()
+            is_rate_limit = "429" in err_str or "rate_limited" in err_str or "rate limit" in err_str
+            if is_rate_limit and attempt < max_retries - 1:
+                wait = delays[attempt]
+                print(f"  [Notion] ⏳ Rate-Limit (429) – warte {wait}s (Versuch {attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+
+
 # =============================================================================
 # TELEGRAM
 # =============================================================================
@@ -1637,7 +1657,7 @@ def gutachten_enrich_notion_page(
         print("    [Gutachten] ⚠️  Kein Eigentümer gefunden (gescanntes Dokument?)")
 
     try:
-        notion.pages.update(page_id=page_id, properties=properties)
+        notion_with_retry(notion.pages.update, page_id=page_id, properties=properties)
         print("    [Gutachten] ✅ Notion aktualisiert")
     except Exception as exc:
         print(f"    [Gutachten] ⚠️  Notion-Update-Fehler: {exc}")
@@ -1915,7 +1935,7 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
     # werden sie weggelassen und der Eintrag trotzdem angelegt.
     created_page = None
     try:
-        created_page = notion.pages.create(parent={"database_id": db_id}, properties=properties)
+        created_page = notion_with_retry(notion.pages.create, parent={"database_id": db_id}, properties=properties)
         print(f"  [Notion] ✅ Erstellt: {titel[:80]}")
     except Exception as e:
         err_str = str(e)
@@ -1931,7 +1951,7 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
         if removed:
             print(f"  [Notion] ⚠️  Felder nicht gefunden, übersprungen: {removed}")
             try:
-                created_page = notion.pages.create(parent={"database_id": db_id}, properties=properties)
+                created_page = notion_with_retry(notion.pages.create, parent={"database_id": db_id}, properties=properties)
                 print(f"  [Notion] ✅ Erstellt (ohne {removed}): {titel[:80]}")
             except Exception as e2:
                 raise e2  # Wirklicher Fehler → nach oben weitergeben
@@ -2563,7 +2583,7 @@ def notion_status_sync(notion: Client, db_id: str,
     updated = 0
     for entry in to_update:
         try:
-            notion.pages.update(page_id=entry["page_id"], properties=entry["update_props"])
+            notion_with_retry(notion.pages.update, page_id=entry["page_id"], properties=entry["update_props"])
             print(f"  [Status-Sync] ✅ {entry['label']}")
             updated += 1
         except Exception as exc:
@@ -2955,7 +2975,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
             notiz_parts.append("(Via GPT-4o Vision analysiert – gescanntes Dokument)")
             properties["Notizen"] = _rt("\n".join(notiz_parts))
 
-            notion.pages.update(page_id=entry["page_id"], properties=properties)
+            notion_with_retry(notion.pages.update, page_id=entry["page_id"], properties=properties)
             print(f"    [Vision] ✅ Notion aktualisiert")
             enriched += 1
 
@@ -4253,6 +4273,74 @@ async def main() -> None:
         except Exception as exc:
             print(f"[ERROR] Telegram Christopher fehlgeschlagen: {exc}")
 
+    # ── Run-Statistik (Phasen-Übersicht) ──────────────────────────────────────
+    try:
+        phase_counts: dict[str, int] = {}
+        stat_cursor = None
+        while True:
+            stat_kwargs: dict = {"page_size": 100}
+            if stat_cursor:
+                stat_kwargs["start_cursor"] = stat_cursor
+            stat_resp = notion.databases.query(database_id=db_id, **stat_kwargs)
+            for stat_page in stat_resp.get("results", []):
+                stat_props = stat_page.get("properties", {})
+                if stat_props.get("Archiviert", {}).get("checkbox", False):
+                    continue
+                phase_sel  = stat_props.get("Workflow-Phase", {}).get("select") or {}
+                phase_name = phase_sel.get("name", "Unbekannt")
+                phase_counts[phase_name] = phase_counts.get(phase_name, 0) + 1
+            if not stat_resp.get("has_more"):
+                break
+            stat_cursor = stat_resp.get("next_cursor")
+
+        total_aktiv = sum(phase_counts.values())
+        stat_lines = [
+            "<b>📊 Edikte-Monitor Statistik</b>",
+            f"<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
+            "",
+            f"<b>Aktive Einträge gesamt: {total_aktiv}</b>",
+            "",
+        ]
+        phase_order = [
+            "🆕 Neu eingelangt", "🔎 In Prüfung", "📊 Gutachten analysiert",
+            "✅ Relevant – Brief vorbereiten", "📩 Brief versendet",
+            "🟡 Beobachten", "✅ Gekauft", "❌ Nicht relevant",
+        ]
+        for phase in phase_order:
+            count = phase_counts.get(phase, 0)
+            if count > 0:
+                stat_lines.append(f"• {html_escape(phase)}: {count}")
+        await send_telegram("\n".join(stat_lines))
+        print("[Statistik] ✅ Phasen-Übersicht gesendet")
+    except Exception as stat_exc:
+        print(f"[Statistik] ⚠️ Fehler beim Erstellen: {stat_exc}")
+
+
+async def _safe_main() -> None:
+    """Wrapper um main() – sendet bei unkontrolliertem Absturz eine Telegram-Warnung."""
+    try:
+        await main()
+    except Exception as main_exc:
+        print(f"[FATAL] Unbehandelter Fehler in main(): {main_exc}")
+        try:
+            token   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+            chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+            if token and chat_id:
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                _telegram_send_raw(url, {
+                    "chat_id":                  chat_id,
+                    "text":                     (
+                        f"🚨 <b>Edikte-Monitor FEHLER</b>\n"
+                        f"{datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                        f"{html_escape(str(main_exc)[:500])}"
+                    ),
+                    "parse_mode":               "HTML",
+                    "disable_web_page_preview": True,
+                })
+        except Exception:
+            pass
+        raise
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_safe_main())
