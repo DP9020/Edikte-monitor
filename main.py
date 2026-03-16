@@ -3515,9 +3515,18 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     to_process: list[dict] = []
     for page in pages:
         props = page.get("properties", {})
-        phase = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
-        if phase != ZIEL_PHASE:
+        phase    = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+        relevant = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
+        archiviert = props.get("Archiviert", {}).get("checkbox", False)
+
+        # Qualifiziert wenn Phase gesetzt ODER "Für uns relevant?" = Ja
+        # (zweite Bedingung verhindert Race-Condition: wenn "Ja" während des
+        #  Status-Sync gesetzt wurde, hat die Phase u.U. noch nicht aktualisiert)
+        phase_match    = phase == ZIEL_PHASE
+        relevant_match = relevant == "Ja" and not archiviert
+        if not phase_match and not relevant_match:
             continue
+
         # Überspringe wenn Brief bereits erstellt (per Datumsfeld ODER Notiz-Marker)
         brief_datum = props.get("Brief erstellt am", {}).get("date")
         if brief_datum and brief_datum.get("start"):
