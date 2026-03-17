@@ -1869,7 +1869,11 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
         _adr_lower = adresse_voll.strip().lower()
         titel_key  = f"__titel__{_bl_lower}|{_adr_lower}" if _bl_lower else f"__titel__{_adr_lower}"
         val = known_ids.get(titel_key, "")
-        if val.startswith("(geschuetzt_update:"):
+        if val.startswith("(neu_titel:"):
+            # Im selben Run bereits angelegt – einfach überspringen
+            print(f"  [Notion] ⏭  Titel-Duplikat übersprungen (bereits in diesem Run angelegt): {adresse_voll[:60]}")
+            return None
+        elif val.startswith("(geschuetzt_update:"):
             existing_page_id = val[len("(geschuetzt_update:"):-1]
             print(f"  [Notion] 🔄 Neues Edikt für bekannte Immobilie: {adresse_voll[:60]}")
             return ("__edikt_update__", existing_page_id, detail)
@@ -4019,6 +4023,15 @@ async def main() -> None:
                             item["_detail"] = detail
                             neue_eintraege.append(item)
                             known_ids[eid] = "(neu)"  # sofort als bekannt markieren
+                            # ── Titel-Fingerprint setzen: verhindert Duplikate bei
+                            # mehreren edikt_ids für dieselbe Immobilie (z.B.
+                            # verschiedene EZ im selben Versteigerungsverfahren)
+                            _adr = detail.get("adresse_voll", "").strip().lower()
+                            _bl  = item.get("bundesland", "").strip().lower()
+                            if _adr:
+                                _tfp = f"__titel__{_bl}|{_adr}" if _bl else f"__titel__{_adr}"
+                                if _tfp not in known_ids:
+                                    known_ids[_tfp] = f"(neu_titel:{new_page_id})"
                             # ── Gutachten sofort anreichern ──────────────────
                             if new_page_id and item.get("link") and FITZ_AVAILABLE:
                                 try:
