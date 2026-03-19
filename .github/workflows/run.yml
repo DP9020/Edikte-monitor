@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       modus:
-        description: "Modus: full | brief | gdrive | cleanup"
+        description: "Modus: full | brief | gdrive | cleanup | telegram-test"
         required: false
         default: "full"
 
@@ -115,6 +115,40 @@ jobs:
           GDRIVE_ONLY: "true"
         run: |
           python main.py
+
+  # TELEGRAM-TEST: Testnachricht an alle Betreuer senden
+  telegram-test:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'telegram-test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Testnachricht senden
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID_BENJAMIN: ${{ secrets.TELEGRAM_CHAT_ID_BENJAMIN }}
+          TELEGRAM_CHAT_ID_CHRISTOPHER: ${{ secrets.TELEGRAM_CHAT_ID_CHRISTOPHER }}
+        run: |
+          python3 -c "
+          import urllib.request, json, os
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          url = f'https://api.telegram.org/bot{token}/sendMessage'
+          ids = {
+              'Friedrich': os.environ.get('TELEGRAM_CHAT_ID', ''),
+              'Benjamin': os.environ.get('TELEGRAM_CHAT_ID_BENJAMIN', ''),
+              'Christopher': os.environ.get('TELEGRAM_CHAT_ID_CHRISTOPHER', ''),
+          }
+          for name, cid in ids.items():
+              if not cid:
+                  print(f'SKIP {name}: keine Chat-ID gesetzt')
+                  continue
+              try:
+                  data = json.dumps({'chat_id': cid, 'text': f'Testnachricht Edikte-Monitor an {name}'}).encode()
+                  req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      print(f'OK {name} ({cid}): {r.status}')
+              except Exception as e:
+                  print(f'FEHLER {name} ({cid}): {e}')
+          "
 
   # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Montag 06:00 UTC)
   cleanup-duplikate:
