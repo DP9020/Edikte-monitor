@@ -3650,6 +3650,10 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 if len(t_parts) == 2 and re.match(r"\s*\d{4}", t_parts[1]):
                     t_adresse = t_parts[0].strip()
                     t_plz_ort = t_parts[1].strip()
+            else:
+                # PLZ/Ort aus Notion-Feld vorhanden → aus Adresse entfernen falls doppelt
+                if t_plz_ort and t_adresse.endswith(t_plz_ort):
+                    t_adresse = t_adresse[:-len(t_plz_ort)].rstrip(" ,").strip()
 
             liegenschaften.append({
                 "adresse": t_adresse,
