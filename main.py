@@ -1969,15 +1969,33 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
 
 def notion_update_edikt_eintrag(
     notion: Client, page_id: str, item: dict, detail: dict
-) -> None:
+) -> bool:
     """
     Aktualisiert einen bestehenden Notion-Eintrag wenn dasselbe Objekt mit
     einer neuen edikt_id erscheint (z.B. neuer Versteigerungstermin).
     Aktualisiert: Link, Hash-ID, Versteigerungstermin, Verkehrswert, Notizen.
     Schreibt NICHT die Phase oder den Status – diese bleiben unberührt.
+
+    Gibt True zurück wenn sich inhaltlich etwas geändert hat (Termin oder
+    Verkehrswert), sodass eine Telegram-Benachrichtigung sinnvoll ist.
+    Gibt False zurück wenn nur Hash-ID/Link aktualisiert wurden (keine
+    erneute Benachrichtigung nötig).
     """
     new_eid  = item.get("edikt_id", "")
     new_link = item.get("link", "")
+
+    # ── Bestehende Werte lesen um echte Änderungen zu erkennen ──────────────
+    hat_echte_aenderung = False
+    try:
+        page = notion.pages.retrieve(page_id=page_id)
+        existing_props = page.get("properties", {})
+        existing_termin_obj = existing_props.get("Versteigerungstermin", {}).get("date") or {}
+        existing_termin = existing_termin_obj.get("start", "")
+        existing_vk_rt = existing_props.get("Verkehrswert", {}).get("rich_text", [])
+        existing_vk = existing_vk_rt[0].get("plain_text", "").strip() if existing_vk_rt else ""
+    except Exception:
+        existing_termin = ""
+        existing_vk = ""
 
     props: dict = {}
 
@@ -1989,18 +2007,28 @@ def notion_update_edikt_eintrag(
     termin_iso = detail.get("termin_iso")
     if termin_iso:
         props["Versteigerungstermin"] = {"date": {"start": termin_iso}}
+        if termin_iso != existing_termin:
+            hat_echte_aenderung = True
 
     verkehrswert = detail.get("schaetzwert")
     if verkehrswert is not None:
         vk_str = f"{verkehrswert:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
         props["Verkehrswert"] = {"rich_text": [{"text": {"content": vk_str}}]}
+        if vk_str != existing_vk:
+            hat_echte_aenderung = True
 
     if props:
         try:
             notion.pages.update(page_id=page_id, properties=props)
-            print(f"  [Notion] ✅ Edikt-Update gespeichert (neues Termin/Link/Wert)")
+            if hat_echte_aenderung:
+                print(f"  [Notion] ✅ Edikt-Update gespeichert (Termin/Wert geändert)")
+            else:
+                print(f"  [Notion] ✅ Edikt-Update gespeichert (nur Hash-ID/Link, keine inhaltliche Änderung)")
         except Exception as exc:
             print(f"  [Notion] ⚠️  Edikt-Update fehlgeschlagen: {exc}")
+            return False
+
+    return hat_echte_aenderung
 
 
 def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
@@ -4014,14 +4042,16 @@ async def main() -> None:
                         elif isinstance(result_tuple, tuple) and result_tuple[0] == "__edikt_update__":
                             # Selbe Immobilie, neue edikt_id → bestehenden Eintrag updaten
                             _, existing_page_id, detail = result_tuple
-                            notion_update_edikt_eintrag(notion, existing_page_id, item, detail)
+                            hat_aenderung = notion_update_edikt_eintrag(notion, existing_page_id, item, detail)
                             known_ids[eid] = "(geschuetzt)"
-                            titel_rt = detail.get("adresse_voll") or item.get("beschreibung", "")[:60]
-                            termin   = detail.get("termin_iso", "")
-                            edikt_updates.append(
-                                f"🔄 <b>{titel_rt[:70]}</b>"
-                                + (f"\nNeuer Termin: {termin}" if termin else "")
-                            )
+                            # Telegram nur bei echten inhaltlichen Änderungen (Termin/Wert)
+                            if hat_aenderung:
+                                titel_rt = detail.get("adresse_voll") or item.get("beschreibung", "")[:60]
+                                termin   = detail.get("termin_iso", "")
+                                edikt_updates.append(
+                                    f"🔄 <b>{titel_rt[:70]}</b>"
+                                    + (f"\nNeuer Termin: {termin}" if termin else "")
+                                )
                         else:
                             detail, new_page_id = result_tuple
                             item["_detail"] = detail
