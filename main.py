@@ -2006,9 +2006,15 @@ def notion_update_edikt_eintrag(
 
     termin_iso = detail.get("termin_iso")
     if termin_iso:
-        props["Versteigerungstermin"] = {"date": {"start": termin_iso}}
-        if termin_iso != existing_termin:
-            hat_echte_aenderung = True
+        # Nur aktualisieren wenn der neue Termin NEUER ist als der bestehende.
+        # Verhindert Ping-Pong zwischen Versteigerung- und Verschiebung-Edikten,
+        # die sich gegenseitig den Termin überschreiben würden.
+        if existing_termin and termin_iso < existing_termin:
+            print(f"  [Notion] ℹ️  Älterer Termin ignoriert ({termin_iso} < {existing_termin})")
+        else:
+            props["Versteigerungstermin"] = {"date": {"start": termin_iso}}
+            if termin_iso != existing_termin:
+                hat_echte_aenderung = True
 
     verkehrswert = detail.get("schaetzwert")
     if verkehrswert is not None:
@@ -4044,6 +4050,15 @@ async def main() -> None:
                             _, existing_page_id, detail = result_tuple
                             hat_aenderung = notion_update_edikt_eintrag(notion, existing_page_id, item, detail)
                             known_ids[eid] = "(geschuetzt)"
+                            # Titel-Fingerprint auf "(geschuetzt)" setzen, damit weitere
+                            # edikt_ids für dieselbe Immobilie im selben Run keine
+                            # erneute Update-Benachrichtigung auslösen (verhindert
+                            # Ping-Pong zwischen Versteigerung/Verschiebung-Edikten).
+                            _adr_upd = detail.get("adresse_voll", "").strip().lower()
+                            _bl_upd  = item.get("bundesland", "").strip().lower()
+                            if _adr_upd:
+                                _tfp_upd = f"__titel__{_bl_upd}|{_adr_upd}" if _bl_upd else f"__titel__{_adr_upd}"
+                                known_ids[_tfp_upd] = "(geschuetzt)"
                             # Telegram nur bei echten inhaltlichen Änderungen (Termin/Wert)
                             if hat_aenderung:
                                 titel_rt = detail.get("adresse_voll") or item.get("beschreibung", "")[:60]
