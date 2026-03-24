@@ -1771,6 +1771,15 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
                     geschuetzt_count += 1
                 else:
                     known[eid] = page["id"]
+                    # Titel-Fingerprint auch für normale (nicht-geschützte) Einträge
+                    # speichern – verhindert Doppelanlage wenn dieselbe Immobilie mit
+                    # einer neuen edikt_id erscheint, aber noch in "🆕 Neu eingelangt".
+                    # Sentinel "(vorhanden:...)" → kein Telegram, nur Hash-ID-Update.
+                    # Geschützte Einträge überschreiben diesen Wert (Priorität).
+                    if title_all:
+                        tfp_key = f"__titel__{titel_fp}"
+                        if not known.get(tfp_key, "").startswith("(geschuetzt"):
+                            known[tfp_key] = f"(vorhanden:{page['id']})"
 
             # Einträge OHNE Hash-ID aber MIT fortgeschrittener Phase:
             # Titel als Ersatz-Fingerprint speichern (verhindert Doppelanlage
@@ -1880,6 +1889,16 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
         elif val == "(geschuetzt)":
             # Altes Format ohne page_id – nur überspringen
             print(f"  [Notion] 🔒 Titel-Duplikat übersprungen (bereits geschützt): {adresse_voll[:60]}")
+            return None
+        elif val.startswith("(vorhanden:"):
+            # Eintrag existiert noch in "🆕 Neu eingelangt" – Hash-ID still aktualisieren,
+            # aber KEINE Telegram-Benachrichtigung (wurde bereits beim ersten Mal gemeldet).
+            existing_page_id = val[len("(vorhanden:"):-1]
+            print(f"  [Notion] 🔄 Neue edikt_id für bekannten (noch unbearbeiteten) Eintrag: {adresse_voll[:60]}")
+            return ("__vorhanden_update__", existing_page_id, detail)
+        elif val == "(vorhanden)":
+            # Wurde im selben Run bereits still aktualisiert
+            print(f"  [Notion] ⏭  Vorhanden-Duplikat übersprungen (bereits in diesem Run aktualisiert): {adresse_voll[:60]}")
             return None
 
     # ── Kern-Properties (existieren garantiert in jeder Notion-DB) ───────────
@@ -2025,13 +2044,13 @@ def notion_update_edikt_eintrag(
 
     if props:
         try:
-            notion.pages.update(page_id=page_id, properties=props)
+            notion_with_retry(notion.pages.update, page_id=page_id, properties=props)
             if hat_echte_aenderung:
                 print(f"  [Notion] ✅ Edikt-Update gespeichert (Termin/Wert geändert)")
             else:
                 print(f"  [Notion] ✅ Edikt-Update gespeichert (nur Hash-ID/Link, keine inhaltliche Änderung)")
         except Exception as exc:
-            print(f"  [Notion] ⚠️  Edikt-Update fehlgeschlagen: {exc}")
+            print(f"  [Notion] ⚠️  Edikt-Update fehlgeschlagen (auch nach Retry): {exc}")
             return False
 
     return hat_echte_aenderung
@@ -4067,6 +4086,19 @@ async def main() -> None:
                                     f"🔄 <b>{titel_rt[:70]}</b>"
                                     + (f"\nNeuer Termin: {termin}" if termin else "")
                                 )
+                        elif isinstance(result_tuple, tuple) and result_tuple[0] == "__vorhanden_update__":
+                            # Eintrag noch in "🆕 Neu eingelangt" → Hash-ID still aktualisieren,
+                            # aber KEINE Telegram-Benachrichtigung (wurde bereits gemeldet).
+                            _, existing_page_id, detail = result_tuple
+                            notion_update_edikt_eintrag(notion, existing_page_id, item, detail)
+                            known_ids[eid] = "(vorhanden)"
+                            # Titel-Fingerprint auf "(vorhanden)" setzen (ohne page_id) –
+                            # verhindert weitere Duplikate für dieselbe Immobilie in diesem Run.
+                            _adr_upd = detail.get("adresse_voll", "").strip().lower()
+                            _bl_upd  = item.get("bundesland", "").strip().lower()
+                            if _adr_upd:
+                                _tfp_upd = f"__titel__{_bl_upd}|{_adr_upd}" if _bl_upd else f"__titel__{_adr_upd}"
+                                known_ids[_tfp_upd] = "(vorhanden)"
                         else:
                             detail, new_page_id = result_tuple
                             item["_detail"] = detail
