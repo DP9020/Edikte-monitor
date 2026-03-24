@@ -3703,10 +3703,19 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 if len(t_parts) == 2 and re.match(r"\s*\d{4}", t_parts[1]):
                     t_adresse = t_parts[0].strip()
                     t_plz_ort = t_parts[1].strip()
+                else:
+                    # Kein Komma, aber PLZ/Ort am Ende via Regex (z.B. "Musterstr. 1 1010 Wien")
+                    m = re.search(r'\s+(\d{4}\s+\S.*)$', t_adresse)
+                    if m:
+                        t_adresse = t_adresse[:m.start()].strip()
+                        t_plz_ort = m.group(1).strip()
             else:
                 # PLZ/Ort aus Notion-Feld vorhanden → aus Adresse entfernen falls doppelt
-                if t_plz_ort and t_adresse.endswith(t_plz_ort):
-                    t_adresse = t_adresse[:-len(t_plz_ort)].rstrip(" ,").strip()
+                # Normalisiere Leerzeichen vor Vergleich (robust gegen Whitespace-Unterschiede)
+                plz_norm  = re.sub(r'\s+', ' ', t_plz_ort).strip()
+                addr_norm = re.sub(r'\s+', ' ', t_adresse).strip()
+                if addr_norm.endswith(plz_norm):
+                    t_adresse = addr_norm[:-len(plz_norm)].rstrip(" ,").strip()
 
             liegenschaften.append({
                 "adresse": t_adresse,
