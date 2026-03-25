@@ -8,11 +8,12 @@ on:
     - cron: "0 13 * * 1-5"
     - cron: "*/10 * * * *"
     - cron: "*/30 * * * *"
+    - cron: "0 4 * * 1"
     - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       modus:
-        description: "Modus: full | brief | gdrive | cleanup | telegram-test"
+        description: "Modus: full | brief | gdrive | cleanup | telegram-test | wochenbericht"
         required: false
         default: "full"
 
@@ -20,6 +21,7 @@ jobs:
 
   # Vollständiger Run: Scraping + Gutachten-Analyse
   full-run:
+    timeout-minutes: 45
     concurrency:
       group: full-run
       cancel-in-progress: false
@@ -55,12 +57,35 @@ jobs:
           BRIEF_ONLY: "false"
         run: |
           python main.py
+      - name: Fehler-Benachrichtigung (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          python3 << 'EOF'
+          import urllib.request, json, os
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
+          run_url = os.environ.get('GH_RUN_URL', '')
+          url = f'https://api.telegram.org/bot{token}/sendMessage'
+          msg = f'❌ Edikte-Monitor Fehler\nJob: full-run\n{run_url}'
+          data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
+          req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+          try:
+              urllib.request.urlopen(req, timeout=10)
+              print('Telegram-Alert gesendet')
+          except Exception as e:
+              print(f'Telegram-Alert fehlgeschlagen: {e}')
+          EOF
 
   # BRIEF_ONLY: alle 10 Minuten – nur Status-Sync + Brief-Erstellung
   brief-only:
+    timeout-minutes: 10
     concurrency:
       group: brief-only
-      cancel-in-progress: false
+      cancel-in-progress: true
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'brief') ||
       github.event.schedule == '*/10 * * * *'
@@ -91,6 +116,7 @@ jobs:
 
   # GDRIVE_ONLY: alle 30 Minuten – Google Drive Sync für Gelb-Einträge
   gdrive-sync:
+    timeout-minutes: 15
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'gdrive') ||
       github.event.schedule == '*/30 * * * *'
@@ -115,6 +141,28 @@ jobs:
           GDRIVE_ONLY: "true"
         run: |
           python main.py
+      - name: Fehler-Benachrichtigung (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          python3 << 'EOF'
+          import urllib.request, json, os
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
+          run_url = os.environ.get('GH_RUN_URL', '')
+          url = f'https://api.telegram.org/bot{token}/sendMessage'
+          msg = f'❌ Edikte-Monitor Fehler\nJob: gdrive-sync\n{run_url}'
+          data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
+          req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+          try:
+              urllib.request.urlopen(req, timeout=10)
+              print('Telegram-Alert gesendet')
+          except Exception as e:
+              print(f'Telegram-Alert fehlgeschlagen: {e}')
+          EOF
 
   # TELEGRAM-TEST: Testnachricht an alle Betreuer senden
   telegram-test:
@@ -122,6 +170,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Testnachricht senden
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -150,11 +199,12 @@ jobs:
                   print(f'FEHLER {name} ({cid}): {e}')
           "
 
-  # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Montag 06:00 UTC)
+  # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Montag 04:00 UTC)
   cleanup-duplikate:
+    timeout-minutes: 10
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'cleanup') ||
-      github.event.schedule == '0 6 * * 1'
+      github.event.schedule == '0 4 * * 1'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -171,3 +221,31 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
           python cleanup_duplikate.py
+
+  # WOCHENBERICHT: Wöchentliche Zusammenfassung (Mo 06:00 UTC = 07:00/08:00 Wien)
+  wochenbericht:
+    timeout-minutes: 10
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'wochenbericht') ||
+      github.event.schedule == '0 6 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Wochenbericht senden
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID_BENJAMIN: ${{ secrets.TELEGRAM_CHAT_ID_BENJAMIN }}
+          TELEGRAM_CHAT_ID_CHRISTOPHER: ${{ secrets.TELEGRAM_CHAT_ID_CHRISTOPHER }}
+          WOCHENBERICHT: "true"
+        run: |
+          python main.py

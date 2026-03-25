@@ -358,6 +358,26 @@ def notion_with_retry(fn, *args, max_retries: int = 3, **kwargs):
                 raise
 
 
+def _openai_with_retry(fn, *args, max_retries: int = 3, **kwargs):
+    """
+    Führt einen OpenAI-API-Call mit automatischem Retry bei Rate-Limit (429) aus.
+    Wartet bei 429: 10s, 30s, 60s.
+    """
+    delays = [10, 30, 60]
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            err_str = str(exc).lower()
+            is_rate_limit = "429" in err_str or "rate_limit" in err_str or "rate limit" in err_str
+            if is_rate_limit and attempt < max_retries - 1:
+                wait = delays[attempt]
+                print(f"  [OpenAI] ⏳ Rate-Limit (429) – warte {wait}s (Versuch {attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+
+
 # =============================================================================
 # TELEGRAM
 # =============================================================================
@@ -1080,7 +1100,8 @@ Wichtige Regeln:
 
     try:
         client = _OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
+        response = _openai_with_retry(
+            client.chat.completions.create,
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": prompt},
@@ -1117,9 +1138,12 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
     if not FITZ_AVAILABLE:
         return {}
 
-    doc      = fitz.open(stream=pdf_bytes, filetype="pdf")
-    all_text = [p.get_text() for p in doc if p.get_text().strip()]
-    full_text = "\n".join(all_text)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        all_text = [p.get_text() for p in doc if p.get_text().strip()]
+        full_text = "\n".join(all_text)
+    finally:
+        doc.close()
 
     result = {
         "eigentümer_name":    "",
@@ -1567,8 +1591,11 @@ def gutachten_enrich_notion_page(
 
     # ── Text aus PDF extrahieren ─────────────────────────────────────────────
     try:
-        doc       = fitz.open(stream=pdf_bytes, filetype="pdf")
-        full_text = "\n".join(p.get_text() for p in doc if p.get_text().strip())
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            full_text = "\n".join(p.get_text() for p in doc if p.get_text().strip())
+        finally:
+            doc.close()
     except Exception as exc:
         print(f"    [Gutachten] ⚠️  PDF-Text-Fehler: {exc}")
         notion.pages.update(
@@ -2408,10 +2435,10 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
         except Exception as exc:
             print(f"  [Gutachten-Anreicherung] ❌ Fehler für {entry['page_id'][:8]}…: {exc}")
             try:
+                # Checkbox NICHT auf True setzen – Eintrag soll beim nächsten Run neu verarbeitet werden
                 notion.pages.update(
                     page_id=entry["page_id"],
                     properties={
-                        "Gutachten analysiert?": {"checkbox": True},
                         "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] Unerwarteter Fehler: {exc}"}}]},
                     }
                 )
@@ -2780,16 +2807,19 @@ def gutachten_extract_info_vision(pdf_bytes: bytes, pdf_url: str) -> dict:
     # Erste 8 Seiten als Bilder rendern – Eigentümer steht oft erst auf Seite 4–8
     # 2.5x Zoom = ~190 DPI → bessere Lesbarkeit für gescannte Dokumente
     images_b64: list[str] = []
-    for page_num in range(min(8, len(doc))):
-        try:
-            page = doc[page_num]
-            mat  = fitz.Matrix(2.5, 2.5)   # 2.5x Zoom = ~190 DPI
-            pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-            img_bytes = pix.tobytes("jpeg", jpg_quality=80)
-            images_b64.append(base64.b64encode(img_bytes).decode("utf-8"))
-        except Exception as exc:
-            print(f"    [Vision] ⚠️  Seite {page_num+1} konnte nicht gerendert werden: {exc}")
-            continue
+    try:
+        for page_num in range(min(8, len(doc))):
+            try:
+                page = doc[page_num]
+                mat  = fitz.Matrix(2.5, 2.5)   # 2.5x Zoom = ~190 DPI
+                pix  = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+                img_bytes = pix.tobytes("jpeg", jpg_quality=80)
+                images_b64.append(base64.b64encode(img_bytes).decode("utf-8"))
+            except Exception as exc:
+                print(f"    [Vision] ⚠️  Seite {page_num+1} konnte nicht gerendert werden: {exc}")
+                continue
+    finally:
+        doc.close()
 
     if not images_b64:
         print("    [Vision] ⚠️  Keine Seiten gerendert")
@@ -2829,7 +2859,8 @@ Wichtige Regeln:
 
     try:
         client   = _OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
+        response = _openai_with_retry(
+            client.chat.completions.create,
             model="gpt-4o",            # Vision-fähiges Modell (nicht mini!)
             messages=[
                 {"role": "system", "content": prompt},
@@ -3047,6 +3078,67 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
 # =============================================================================
 # SCHRITT 3: TOTE URLs – HTTP 404 → automatisch archivieren
 # =============================================================================
+
+def notion_archiviere_inaktive(notion: Client, db_id: str,
+                                all_pages: list[dict] | None = None) -> int:
+    """
+    Archiviert inaktive Einträge automatisch nach Phase + Inaktivitätsdauer:
+      - '❌ Nicht relevant': nach 90 Tagen ohne Änderung
+      - '📩 Brief versendet': nach 180 Tagen ohne Änderung
+
+    Nutzt last_edited_time aus der Notion-Page (automatisch gepflegt von Notion).
+    Gibt die Anzahl der archivierten Einträge zurück.
+    """
+    from datetime import timezone
+
+    ARCHIVIERUNGS_REGELN: dict[str, int] = {
+        "❌ Nicht relevant":   90,
+        "📩 Brief versendet": 180,
+    }
+
+    pages   = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
+    jetzt   = datetime.now(timezone.utc)
+    archiviert = 0
+
+    for page in pages:
+        props = page.get("properties", {})
+
+        if props.get("Archiviert", {}).get("checkbox", False):
+            continue
+
+        phase_sel = props.get("Workflow-Phase", {}).get("select") or {}
+        phase     = phase_sel.get("name", "")
+        if phase not in ARCHIVIERUNGS_REGELN:
+            continue
+
+        tage_limit    = ARCHIVIERUNGS_REGELN[phase]
+        last_edited   = page.get("last_edited_time", "")
+        if not last_edited:
+            continue
+
+        last_edited_dt = datetime.fromisoformat(last_edited.replace("Z", "+00:00"))
+        alter_tage     = (jetzt - last_edited_dt).days
+        if alter_tage < tage_limit:
+            continue
+
+        try:
+            notion_with_retry(
+                notion.pages.update,
+                page_id=page["id"],
+                properties={"Archiviert": {"checkbox": True}},
+            )
+            archiviert += 1
+            title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
+            title    = title_rt[0].get("plain_text", "")[:40] if title_rt else page["id"][:8]
+            print(f"  [Archivierung] 📦 Archiviert nach {alter_tage}d: {title} ({phase})")
+            time.sleep(0.3)
+        except Exception as exc:
+            print(f"  [Archivierung] ⚠️  Fehler bei {page['id'][:8]}: {exc}")
+
+    if archiviert:
+        print(f"[Archivierung] ✅ {archiviert} inaktive Einträge archiviert")
+    return archiviert
+
 
 def notion_archiviere_tote_urls(notion: Client, db_id: str,
                                 all_pages: list[dict] | None = None) -> tuple[int, list[str]]:
@@ -3290,10 +3382,32 @@ def _brief_fill_template(vorlage_path: str, platzhalter: dict[str, str]) -> byte
             for key, val in platzhalter.items():
                 new_text = new_text.replace(f"{{{{{key}}}}}", val)
             if new_text != full_text:
-                # python-docx Runs unterstützen keine echten \n — ersetze durch Leerzeichen
-                para.runs[0].text = new_text.replace("\n", " ")
-                for r in para.runs[1:]:
-                    r.text = ""
+                if "\n" in new_text:
+                    # Mehrere Zeilen: erste Zeile als Text, weitere mit w:br Zeilenumbruch
+                    from docx.oxml import OxmlElement
+                    parts = new_text.split("\n")
+                    run = para.runs[0]
+                    r_elem = run._r
+                    W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    for t_elem in r_elem.findall(f"{{{W}}}t"):
+                        r_elem.remove(t_elem)
+                    for br_elem in r_elem.findall(f"{{{W}}}br"):
+                        r_elem.remove(br_elem)
+                    for i, part in enumerate(parts):
+                        if i > 0:
+                            br = OxmlElement("w:br")
+                            r_elem.append(br)
+                        t = OxmlElement("w:t")
+                        t.text = part
+                        if part.startswith(" ") or part.endswith(" "):
+                            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                        r_elem.append(t)
+                    for r in para.runs[1:]:
+                        r.text = ""
+                else:
+                    para.runs[0].text = new_text
+                    for r in para.runs[1:]:
+                        r.text = ""
             return
 
         # --- Variante 2: Hyperlink-Struktur (keine Runs) ---
@@ -3336,7 +3450,8 @@ def _geschlecht_via_gpt(vorname: str) -> str | None:
             return None
 
         client = _OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
+        response = _openai_with_retry(
+            client.chat.completions.create,
             model="gpt-4o-mini",
             messages=[{
                 "role": "user",
@@ -3809,7 +3924,8 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 neue_notiz = neue_notiz[:2000]
 
                 try:
-                    notion.pages.update(
+                    notion_with_retry(
+                        notion.pages.update,
                         page_id=p_id,
                         properties={
                             "Brief erstellt am": {"date": {"start": heute.isoformat()}},
@@ -3820,7 +3936,8 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                     err_str = str(notion_exc)
                     if "Brief erstellt am" in err_str and "not a property" in err_str:
                         try:
-                            notion.pages.update(
+                            notion_with_retry(
+                                notion.pages.update,
                                 page_id=p_id,
                                 properties={
                                     "Notizen": {"rich_text": [{"type": "text", "text": {"content": neue_notiz}}]},
@@ -3941,6 +4058,154 @@ def fetch_results_for_state(bundesland: str, bl_value: str) -> list[dict]:
 
 
 # =============================================================================
+# WOCHENBERICHT
+# =============================================================================
+
+async def send_wochenzusammenfassung(notion: Client, db_id: str) -> None:
+    """
+    Sendet eine wöchentliche Zusammenfassung an Friedrich, Benjamin und Christopher.
+    Aufgerufen wenn WOCHENBERICHT=true gesetzt ist (separater GitHub Actions Job).
+
+    Enthält:
+      - Neue Edikte der letzten 7 Tage (aufgeschlüsselt nach Betreuer)
+      - Briefe verschickt diese Woche
+      - Auto-archivierte Einträge diese Woche
+      - Offene Analyse-Fehler
+      - Aktive Einträge nach Phase
+    """
+    from datetime import timedelta, timezone
+    print("[Wochenbericht] 📊 Erstelle Wochenzusammenfassung …")
+
+    pages        = notion_load_all_pages(notion, db_id)
+    jetzt        = datetime.now(timezone.utc)
+    vor_7_tagen  = jetzt - timedelta(days=7)
+    heute_date   = datetime.now().date()
+
+    neue_eintraege: dict[str, int] = {}   # Bundesland → Anzahl
+    briefe_diese_woche     = 0
+    archiviert_diese_woche = 0
+    analyse_fehler         = 0
+    phase_counts: dict[str, int] = {}
+
+    for page in pages:
+        props          = page.get("properties", {})
+        ist_archiviert = props.get("Archiviert", {}).get("checkbox", False)
+        bl_sel         = props.get("Bundesland", {}).get("select") or {}
+        bundesland     = bl_sel.get("name", "Sonstige")
+        phase_sel      = props.get("Workflow-Phase", {}).get("select") or {}
+        phase          = phase_sel.get("name", "Unbekannt")
+
+        # Neue Einträge dieser Woche
+        created_str = page.get("created_time", "")
+        if created_str and not ist_archiviert:
+            try:
+                created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                if created_dt >= vor_7_tagen:
+                    neue_eintraege[bundesland] = neue_eintraege.get(bundesland, 0) + 1
+            except Exception:
+                pass
+
+        # Briefe diese Woche
+        brief_datum = (props.get("Brief erstellt am", {}).get("date") or {}).get("start", "")
+        if brief_datum:
+            try:
+                brief_date = datetime.fromisoformat(brief_datum).date()
+                if (heute_date - brief_date).days <= 7:
+                    briefe_diese_woche += 1
+            except Exception:
+                pass
+
+        # Auto-archiviert diese Woche
+        if ist_archiviert:
+            last_edited_str = page.get("last_edited_time", "")
+            if last_edited_str:
+                try:
+                    last_dt = datetime.fromisoformat(last_edited_str.replace("Z", "+00:00"))
+                    if last_dt >= vor_7_tagen:
+                        archiviert_diese_woche += 1
+                except Exception:
+                    pass
+
+        # Offene Analyse-Fehler
+        notizen_rt   = props.get("Notizen", {}).get("rich_text", [])
+        notizen_text = "".join(t.get("text", {}).get("content", "") for t in notizen_rt)
+        if "[Analyse fehlgeschlagen]" in notizen_text and not ist_archiviert:
+            analyse_fehler += 1
+
+        # Phase-Counts (nur aktive)
+        if not ist_archiviert:
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+
+    total_aktiv = sum(phase_counts.values())
+    total_neu   = sum(neue_eintraege.values())
+
+    def _bl_count(bundeslaender: set) -> int:
+        return sum(neue_eintraege.get(bl, 0) for bl in bundeslaender)
+
+    benjamin_neu    = _bl_count(BENJAMIN_BUNDESLAENDER)
+    christopher_neu = _bl_count(CHRISTOPHER_BUNDESLAENDER)
+    friedrich_neu   = total_neu - benjamin_neu - christopher_neu
+
+    kw  = datetime.now().isocalendar()[1]
+    von = (datetime.now() - timedelta(days=7)).strftime("%d.%m.")
+    bis = datetime.now().strftime("%d.%m.%Y")
+
+    lines = [
+        "<b>📊 Edikte-Monitor Wochenbericht</b>",
+        f"<i>KW {kw} ({von} – {bis})</i>",
+        "",
+        f"🆕 <b>Neue Edikte: {total_neu}</b>",
+    ]
+    if total_neu > 0:
+        lines += [
+            f"  • Wien/OÖ (Benjamin): {benjamin_neu}",
+            f"  • NÖ/Bgld (Christopher): {christopher_neu}",
+            f"  • Stmk/Knt/Sbg/Tir/Vbg (Friedrich): {friedrich_neu}",
+        ]
+    lines += [
+        "",
+        f"✉️ Briefe verschickt: {briefe_diese_woche}",
+        f"📦 Auto-archiviert: {archiviert_diese_woche}",
+    ]
+    if analyse_fehler > 0:
+        lines.append(f"⚠️ Analyse-Fehler (offen): {analyse_fehler}")
+    lines += [
+        "",
+        f"<b>Aktive Einträge gesamt: {total_aktiv}</b>",
+    ]
+    phase_order = [
+        "🆕 Neu eingelangt", "🔎 In Prüfung", "📊 Gutachten analysiert",
+        "✅ Relevant – Brief vorbereiten", "📩 Brief versendet",
+        "🟡 Beobachten", "✅ Gekauft", "❌ Nicht relevant",
+    ]
+    for ph in phase_order:
+        count = phase_counts.get(ph, 0)
+        if count > 0:
+            lines.append(f"  • {html_escape(ph)}: {count}")
+
+    msg = "\n".join(lines)
+
+    # An Friedrich (Haupt-Chat)
+    await send_telegram(msg)
+
+    # An Benjamin und Christopher direkt via _telegram_send_raw (kein extra_chat_ids wegen HTTP 400)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    url   = f"https://api.telegram.org/bot{token}/sendMessage"
+    for chat_id in filter(None, [_get_benjamin_chat_id(), _get_christopher_chat_id()]):
+        try:
+            _telegram_send_raw(url, {
+                "chat_id":                  chat_id,
+                "text":                     msg,
+                "parse_mode":               "HTML",
+                "disable_web_page_preview": True,
+            })
+        except Exception as exc:
+            print(f"[Wochenbericht] ⚠️  Senden an {chat_id} fehlgeschlagen: {exc}")
+
+    print(f"[Wochenbericht] ✅ Bericht gesendet ({total_neu} neue, {total_aktiv} aktiv)")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -4030,6 +4295,15 @@ async def main() -> None:
                 await send_telegram("\n".join(lines))
             except Exception as exc:
                 print(f"[Modus] ⚠️  Telegram-Versand fehlgeschlagen: {exc}")
+        return
+
+    # ── WOCHENBERICHT-Modus: Wöchentliche Zusammenfassung senden ─────────────
+    if os.environ.get("WOCHENBERICHT", "").lower() == "true":
+        print("[Modus] 📊 WOCHENBERICHT – Wöchentliche Zusammenfassung")
+        try:
+            await send_wochenzusammenfassung(notion, db_id)
+        except Exception as exc:
+            print(f"[Modus] ❌ Wochenbericht fehlgeschlagen: {exc}")
         return
 
     neue_eintraege:  list[dict] = []
@@ -4221,6 +4495,14 @@ async def main() -> None:
     except Exception as exc:
         print(f"  [WARN] Qualitäts-Check fehlgeschlagen (nicht kritisch): {exc}")
 
+    # ── 3e. Inaktive Einträge automatisch archivieren ─────────────────────────
+    # '❌ Nicht relevant' nach 90 Tagen, '📩 Brief versendet' nach 180 Tagen.
+    inaktiv_archiviert = 0
+    try:
+        inaktiv_archiviert = notion_archiviere_inaktive(notion, db_id, all_pages=_all_pages)
+    except Exception as exc:
+        print(f"  [WARN] Auto-Archivierung fehlgeschlagen (nicht kritisch): {exc}")
+
     # GDrive-Sync und Brief-Erstellung laufen in eigenen Jobs (gdrive-sync / brief-only).
 
     # ── 4. Gutachten-Anreicherung: Text-PDFs (LLM) ───────────────────────────
@@ -4248,6 +4530,7 @@ async def main() -> None:
     print(f"✅ Neue Einträge:         {len(neue_eintraege)}")
     print(f"🔗 URLs ergänzt:          {enriched_count}")
     print(f"🗑  Tote URLs archiviert:  {tote_urls_archiviert}")
+    print(f"📦 Inaktiv archiviert:    {inaktiv_archiviert}")
     print(f"📄 Gutachten analysiert:  {gutachten_enriched}")
     print(f"🔭 Vision analysiert:     {vision_enriched}")
     print(f"⚠️  Fehler:                {len(fehler)}")
@@ -4404,6 +4687,8 @@ async def main() -> None:
             if not stat_resp.get("has_more"):
                 break
             stat_cursor = stat_resp.get("next_cursor")
+            if not stat_cursor:
+                break
 
         total_aktiv = sum(phase_counts.values())
         stat_lines = [
