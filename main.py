@@ -400,6 +400,7 @@ def _telegram_send_raw(url: str, payload_dict: dict) -> None:
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         r.read()
+    time.sleep(0.05)  # ~20 Msg/s – unter Telegram-Limit von 30 Msg/s
 
 
 def _truncate_plain(text: str, limit: int = 4096) -> str:
@@ -633,7 +634,8 @@ def gdrive_get_service():
             padded = key_raw.strip() + "=" * (4 - len(key_raw.strip()) % 4)
             key_raw = base64.b64decode(padded).decode("utf-8")
         creds_info = json.loads(key_raw)
-        print(f"[GDrive] 👤 Service Account: {creds_info.get('client_email', '?')}")
+        email = creds_info.get('client_email', '?')
+        print(f"[GDrive] 👤 Service Account: {email[:4]}…")
         creds = _gsa.Credentials.from_service_account_info(
             creds_info,
             scopes=["https://www.googleapis.com/auth/drive"],
@@ -2124,69 +2126,66 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
 
     eid = item.get('edikt_id', '?')
 
+    def _update(props: dict) -> None:
+        notion_with_retry(notion.pages.update, page_id=page_id, properties=props)
+
     # Fall 1: Bereits archiviert → nur Art des Edikts anpassen, sonst nichts
     if archiviert:
-        notion.pages.update(
-            page_id=page_id,
-            properties={
-                "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
-            },
-        )
-        print(f"  [Notion] 🗄  Entfall im Archiv vermerkt: {eid}")
+        try:
+            _update({"Art des Edikts": {"select": {"name": "Entfall des Termins"}}})
+            print(f"  [Notion] 🗄  Entfall im Archiv vermerkt: {eid}")
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Entfall-Update fehlgeschlagen: {exc}")
         return
 
     # Fall 2: Status Rot → IMMER archivieren (egal welche Phase)
-    # Rot = manuell abgelehnt/abgebrochen; Phase bleibt erhalten damit
-    # man später sehen kann in welcher Phase der Abbruch erfolgte.
     if status == "🔴 Rot":
-        notion.pages.update(
-            page_id=page_id,
-            properties={
+        try:
+            _update({
                 "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
                 "Archiviert":     {"checkbox": True},
-                # Workflow-Phase NICHT überschreiben → bleibt erhalten,
-                # damit sichtbar ist in welcher Phase der Abbruch erfolgte
                 "Neu eingelangt": {"checkbox": False},
-            },
-        )
-        print(f"  [Notion] 🔴 Entfall archiviert (Status Rot, Phase '{phase}' bleibt erhalten): {eid}")
+            })
+            print(f"  [Notion] 🔴 Entfall archiviert (Status Rot, Phase '{phase}' bleibt erhalten): {eid}")
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Entfall-Update fehlgeschlagen: {exc}")
         return
 
     # Fall 3: Status Grün oder Gelb → relevant/aktiv in Bearbeitung → NUR vermerken
     if status in ("🟢 Grün", "🟡 Gelb"):
-        notion.pages.update(
-            page_id=page_id,
-            properties={
+        try:
+            _update({
                 "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
                 "Neu eingelangt": {"checkbox": False},
-            },
-        )
-        print(f"  [Notion] 🔒 Entfall vermerkt (Status {status} – kein Auto-Archiv): {eid}")
+            })
+            print(f"  [Notion] 🔒 Entfall vermerkt (Status {status} – kein Auto-Archiv): {eid}")
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Entfall-Update fehlgeschlagen: {exc}")
         return
 
     # Fall 4: Fortgeschrittene Phase ohne Status → nur vermerken
     if phase in SCHUTZ_PHASEN:
-        notion.pages.update(
-            page_id=page_id,
-            properties={
+        try:
+            _update({
                 "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
                 "Neu eingelangt": {"checkbox": False},
-            },
-        )
-        print(f"  [Notion] 🔒 Entfall vermerkt (Phase '{phase}' – kein Auto-Archiv): {eid}")
+            })
+            print(f"  [Notion] 🔒 Entfall vermerkt (Phase '{phase}' – kein Auto-Archiv): {eid}")
+        except Exception as exc:
+            print(f"  [Notion] ⚠️  Entfall-Update fehlgeschlagen: {exc}")
         return
 
-    # Fall 5: Unbearbeitet (Neu eingelangt / kein Status) → normal archivieren
-    notion.pages.update(
-        page_id=page_id,
-        properties={
+    # Fall 5: Unbearbeitet → normal archivieren
+    try:
+        _update({
             "Art des Edikts": {"select": {"name": "Entfall des Termins"}},
             "Archiviert":     {"checkbox": True},
             "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
             "Neu eingelangt": {"checkbox": False},
-        },
-    )
-    print(f"  [Notion] 🔴 Entfall archiviert: {eid}")
+        })
+        print(f"  [Notion] 🔴 Entfall archiviert: {eid}")
+    except Exception as exc:
+        print(f"  [Notion] ⚠️  Entfall-Update fehlgeschlagen: {exc}")
 
 
 def notion_enrich_urls(notion: Client, db_id: str) -> int:
@@ -4334,6 +4333,7 @@ async def main() -> None:
             print(f"  [ERROR] {msg}")
             fehler.append(msg)
             continue
+        time.sleep(1)  # kurze Pause zwischen Bundesland-Anfragen (IP-Schutz)
 
         for item in results:
             try:
