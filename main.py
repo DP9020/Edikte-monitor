@@ -2045,6 +2045,7 @@ def notion_update_edikt_eintrag(
     # ── Bestehende Werte lesen um echte Änderungen zu erkennen ──────────────
     hat_echte_aenderung = False
     existing_hash_ids = ""
+    retrieve_ok = False  # Konnte Notion-Seite gelesen werden?
     try:
         page = notion_with_retry(notion.pages.retrieve, page_id=page_id)
         existing_props = page.get("properties", {})
@@ -2055,7 +2056,9 @@ def notion_update_edikt_eintrag(
         # Bestehende Hash-IDs lesen (können mehrere sein, newline-getrennt)
         existing_hash_rt = existing_props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
         existing_hash_ids = existing_hash_rt[0].get("plain_text", "").strip() if existing_hash_rt else ""
-    except Exception:
+        retrieve_ok = True
+    except Exception as exc:
+        print(f"  [Notion] ⚠️  Bestehende Werte nicht lesbar – überspringe Änderungserkennung: {exc}")
         existing_termin = ""
         existing_vk = ""
 
@@ -2081,14 +2084,16 @@ def notion_update_edikt_eintrag(
             print(f"  [Notion] ℹ️  Älterer Termin ignoriert ({termin_iso} < {existing_termin})")
         else:
             props["Versteigerungstermin"] = {"date": {"start": termin_iso}}
-            if termin_iso != existing_termin:
+            # Änderung nur erkennen wenn wir den bestehenden Wert lesen konnten –
+            # bei Retrieve-Fehler wäre existing_termin="" und JEDER Termin wäre "neu".
+            if retrieve_ok and termin_iso != existing_termin:
                 hat_echte_aenderung = True
 
     verkehrswert = detail.get("schaetzwert")
     if verkehrswert is not None:
         vk_str = f"{verkehrswert:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
         props["Verkehrswert"] = {"rich_text": [{"text": {"content": vk_str}}]}
-        if vk_str != existing_vk:
+        if retrieve_ok and vk_str != existing_vk:
             hat_echte_aenderung = True
 
     if props:
