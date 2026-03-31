@@ -721,7 +721,7 @@ def gdrive_clear_placeholder_links(notion: Client, db_id: str, all_pages: list[d
         status     = (props.get("Status", {}).get("select") or {}).get("name", "")
         if drive_link == PLACEHOLDER and status == "🟡 Gelb":
             try:
-                notion.pages.update(
+                notion_with_retry(notion.pages.update,
                     page_id=page["id"],
                     properties={"Google Drive Link": {"url": None}},
                 )
@@ -808,7 +808,7 @@ def gdrive_sync_gelb_entries(
         except Exception as fetch_exc:
             print(f"  [GDrive] ⚠️  Edikt-Seite nicht erreichbar: {fetch_exc}")
             try:
-                notion.pages.update(
+                notion_with_retry(notion.pages.update,
                     page_id=page_id,
                     properties={"Google Drive Link": {"url": "https://drive.google.com/drive/folders/nicht-verfuegbar"}},
                 )
@@ -847,7 +847,7 @@ def gdrive_sync_gelb_entries(
                     print(f"  [GDrive] ⚠️  Upload fehlgeschlagen ({upload_name}): {up_exc}")
 
             # Drive-Link in Notion speichern (verhindert erneuten Upload)
-            notion.pages.update(
+            notion_with_retry(notion.pages.update,
                 page_id=page_id,
                 properties={"Google Drive Link": {"url": folder_url}},
             )
@@ -1557,7 +1557,7 @@ def gutachten_enrich_notion_page(
         pdfs = attachments["pdfs"]
     except Exception as exc:
         print(f"    [Gutachten] ⚠️  Fehler beim Laden der Edikt-Seite: {exc}")
-        notion.pages.update(
+        notion_with_retry(notion.pages.update,
             page_id=page_id,
             properties={
                 "Gutachten analysiert?": {"checkbox": True},
@@ -1569,7 +1569,7 @@ def gutachten_enrich_notion_page(
     if not pdfs:
         # BUG 9: analysiert?=True setzen damit dieser Eintrag nicht endlos wiederholt wird
         print("    [Gutachten] ℹ️  Kein PDF-Anhang gefunden – markiere als abgeschlossen")
-        notion.pages.update(
+        notion_with_retry(notion.pages.update,
             page_id=page_id,
             properties={
                 "Gutachten analysiert?": {"checkbox": True},
@@ -1585,7 +1585,7 @@ def gutachten_enrich_notion_page(
         pdf_bytes = gutachten_download_pdf(gutachten["url"])
     except Exception as exc:
         print(f"    [Gutachten] ⚠️  Download-Fehler: {exc}")
-        notion.pages.update(
+        notion_with_retry(notion.pages.update,
             page_id=page_id,
             properties={
                 "Gutachten analysiert?": {"checkbox": True},
@@ -1603,7 +1603,7 @@ def gutachten_enrich_notion_page(
             doc.close()
     except Exception as exc:
         print(f"    [Gutachten] ⚠️  PDF-Text-Fehler: {exc}")
-        notion.pages.update(
+        notion_with_retry(notion.pages.update,
             page_id=page_id,
             properties={
                 "Gutachten analysiert?": {"checkbox": True},
@@ -1632,7 +1632,7 @@ def gutachten_enrich_notion_page(
             print("    [Gutachten] 🔍 Regex-Fallback verwendet")
         except Exception as exc:
             print(f"    [Gutachten] ⚠️  Parse-Fehler: {exc}")
-            notion.pages.update(
+            notion_with_retry(notion.pages.update,
                 page_id=page_id,
                 properties={
                     "Gutachten analysiert?": {"checkbox": True},
@@ -2131,6 +2131,7 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
         "✅ Relevant – Brief vorbereiten",
         "📩 Brief versendet",
         "📊 Gutachten analysiert",
+        "✅ Gekauft",
     }
 
     # Aktuellen Zustand der Seite lesen (mit Retry bei Rate-Limit)
@@ -2237,7 +2238,7 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
             kwargs["start_cursor"] = start_cursor
 
         try:
-            resp = notion.databases.query(database_id=db_id, **kwargs)
+            resp = _notion_query_with_retry(notion, db_id, **kwargs)
         except Exception as exc:
             print(f"  [URL-Anreicherung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
             break
@@ -2269,7 +2270,7 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
                     f"{BASE_URL}/edikte/ex/exedi3.nsf/alldoc/{edikt_id}!OpenDocument"
                 )
                 try:
-                    notion.pages.update(
+                    notion_with_retry(notion.pages.update,
                         page_id=page_id,
                         properties={"Link": {"url": constructed_link}},
                     )
@@ -2300,7 +2301,7 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
         if len(matches) == 1:
             candidate = matches[0]
             try:
-                notion.pages.update(
+                notion_with_retry(notion.pages.update,
                     page_id=page_id,
                     properties={
                         "Link": {"url": candidate["link"]},
@@ -2411,7 +2412,7 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
             kwargs["start_cursor"] = start_cursor
 
         try:
-            resp = notion.databases.query(database_id=db_id, **kwargs)
+            resp = _notion_query_with_retry(notion, db_id, **kwargs)
         except Exception as exc:
             print(f"  [Gutachten-Anreicherung] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
             break
@@ -2457,7 +2458,7 @@ def notion_enrich_gutachten(notion: Client, db_id: str) -> int:
             print(f"  [Gutachten-Anreicherung] ❌ Fehler für {entry['page_id'][:8]}…: {exc}")
             try:
                 # Checkbox NICHT auf True setzen – Eintrag soll beim nächsten Run neu verarbeitet werden
-                notion.pages.update(
+                notion_with_retry(notion.pages.update,
                     page_id=entry["page_id"],
                     properties={
                         "Notizen": {"rich_text": [{"text": {"content": f"[Analyse fehlgeschlagen] Unerwarteter Fehler: {exc}"}}]},
@@ -2556,7 +2557,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
         print(f"  [Bereinigung] 🔄 {len(to_reanalyze)} analysierte Einträge ohne Adresse → werden neu analysiert …")
         for page_id in to_reanalyze:
             try:
-                notion.pages.update(
+                notion_with_retry(notion.pages.update,
                     page_id=page_id,
                     properties={"Gutachten analysiert?": {"checkbox": False}}
                 )
@@ -2573,7 +2574,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
     fixed = 0
     for page_id in to_fix:
         try:
-            notion.pages.update(
+            notion_with_retry(notion.pages.update,
                 page_id=page_id,
                 properties={
                     "Verpflichtende Partei": {"rich_text": []},
@@ -2787,7 +2788,7 @@ def notion_qualitaetscheck(notion: Client, db_id: str,
     reset_count = 0
     for page_id in to_reset:
         try:
-            notion.pages.update(
+            notion_with_retry(notion.pages.update,
                 page_id=page_id,
                 properties={"Gutachten analysiert?": {"checkbox": False}}
             )
@@ -2939,7 +2940,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
             kwargs["start_cursor"] = start_cursor
 
         try:
-            resp = notion.databases.query(database_id=db_id, **kwargs)
+            resp = _notion_query_with_retry(notion, db_id, **kwargs)
         except Exception as exc:
             print(f"  [Vision-Analyse] ❌ Notion-Abfrage fehlgeschlagen: {exc}")
             break
@@ -3043,7 +3044,7 @@ def notion_enrich_gescannte(notion: Client, db_id: str) -> int:
                         '', notizen_alt
                     ).strip()
                     notizen_neu += "\n(Endgültig unleserlich – kein Eigentümer auffindbar)"
-                    notion.pages.update(
+                    notion_with_retry(notion.pages.update,
                         page_id=entry["page_id"],
                         properties={
                             "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]}
@@ -3257,7 +3258,7 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
             bereits_alarmiert = False
             notizen_alt = ""
             try:
-                page_data  = notion.pages.retrieve(page_id=entry["page_id"])
+                page_data  = notion_with_retry(notion.pages.retrieve, page_id=entry["page_id"])
                 notizen_rt = page_data["properties"].get("Notizen", {}).get("rich_text", [])
                 notizen_alt = "".join(
                     (b.get("text") or {}).get("content", "") for b in notizen_rt
@@ -3276,7 +3277,7 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
                 notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
                               "⚠️ Edikt-Seite nicht mehr verfügbar (HTTP 404) – bitte manuell prüfen"
                 try:
-                    notion.pages.update(
+                    notion_with_retry(notion.pages.update,
                         page_id=entry["page_id"],
                         properties={
                             "Notizen": {"rich_text": [{"text": {"content": notizen_neu[:2000]}}]},
@@ -3298,7 +3299,7 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
             )
 
         try:
-            page_data   = notion.pages.retrieve(page_id=entry["page_id"])
+            page_data   = notion_with_retry(notion.pages.retrieve, page_id=entry["page_id"])
             notizen_rt  = page_data["properties"].get("Notizen", {}).get("rich_text", [])
             notizen_alt = "".join(
                 (b.get("text") or {}).get("content", "") for b in notizen_rt
@@ -3306,7 +3307,7 @@ def notion_archiviere_tote_urls(notion: Client, db_id: str,
             notizen_neu = (notizen_alt + "\n" if notizen_alt else "") + \
                           "Edikt-Seite nicht mehr verfügbar (HTTP 404) – automatisch archiviert"
 
-            notion.pages.update(
+            notion_with_retry(notion.pages.update,
                 page_id=entry["page_id"],
                 properties={
                     "Archiviert":    {"checkbox": True},
@@ -4131,7 +4132,7 @@ async def send_wochenzusammenfassung(notion: Client, db_id: str) -> None:
         if brief_datum:
             try:
                 brief_date = datetime.fromisoformat(brief_datum).date()
-                if (heute_date - brief_date).days <= 7:
+                if brief_date >= (heute_date - timedelta(days=7)):
                     briefe_diese_woche += 1
             except Exception:
                 pass
@@ -4427,7 +4428,7 @@ async def main() -> None:
                                 except Exception as ge:
                                     print(f"    [Gutachten] ⚠️  Anreicherung fehlgeschlagen: {ge}")
                                     try:
-                                        notion.pages.update(
+                                        notion_with_retry(notion.pages.update,
                                             page_id=new_page_id,
                                             properties={
                                                 "Gutachten analysiert?": {"checkbox": True},
@@ -4698,7 +4699,7 @@ async def main() -> None:
             stat_kwargs: dict = {"page_size": 100}
             if stat_cursor:
                 stat_kwargs["start_cursor"] = stat_cursor
-            stat_resp = notion.databases.query(database_id=db_id, **stat_kwargs)
+            stat_resp = _notion_query_with_retry(notion, db_id, **stat_kwargs)
             for stat_page in stat_resp.get("results", []):
                 stat_props = stat_page.get("properties", {})
                 if stat_props.get("Archiviert", {}).get("checkbox", False):
