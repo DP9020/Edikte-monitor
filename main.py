@@ -1768,11 +1768,12 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             # Rot hat Vorrang: auch wenn Phase geschützt wäre, zählt Rot
             ist_geschuetzt = (not ist_rot) and (phase in GESCHUETZT_PHASEN or status in ("🟢 Grün", "🟡 Gelb"))
 
-            # Hash-ID auslesen
+            # Hash-ID auslesen – Feld kann mehrere IDs enthalten (newline-getrennt),
+            # weil notion_update_edikt_eintrag neue edikt_ids anhängt statt zu ersetzen.
             hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
-            eid = ""
-            if hash_rt:
-                eid = hash_rt[0].get("plain_text", "").strip().lower()
+            hash_full_text = hash_rt[0].get("plain_text", "").strip().lower() if hash_rt else ""
+            all_eids = [e.strip() for e in hash_full_text.split("\n") if e.strip()] if hash_full_text else []
+            eid = all_eids[0] if all_eids else ""  # Primäre ID für Kompatibilität
 
             # Titel-Fingerprint für alle Einträge holen (wird unten gespeichert)
             title_rt_all = props.get("Liegenschaftsadresse", {}).get("title", [])
@@ -1785,8 +1786,12 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
             titel_fp = f"{bundesland_all}|{title_all}" if bundesland_all else title_all
 
             if eid:
+                # ALLE edikt_ids registrieren (nicht nur die erste) – verhindert
+                # Hash-ID-Ping-Pong wenn mehrere Edikte für dieselbe Immobilie existieren.
+                _eids_to_register = all_eids if all_eids else [eid]
                 if ist_geschuetzt:
-                    known[eid] = "(geschuetzt)"
+                    for _e in _eids_to_register:
+                        known[_e] = "(geschuetzt)"
                     geschuetzt_count += 1
                     # Auch Titel-Fingerprint mit page_id speichern – damit ein neues Edikt
                     # zur selben Immobilie (neue Hash-ID) erkannt und geupdated werden kann.
@@ -1796,10 +1801,12 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
                     # Rot: Scraper legt keinen neuen Eintrag an (Duplikat-Schutz),
                     # aber die echte page_id bleibt gespeichert damit ein
                     # Entfall-Edikt die Seite archivieren kann.
-                    known[eid] = page["id"]
+                    for _e in _eids_to_register:
+                        known[_e] = page["id"]
                     geschuetzt_count += 1
                 else:
-                    known[eid] = page["id"]
+                    for _e in _eids_to_register:
+                        known[_e] = page["id"]
                     # Titel-Fingerprint auch für normale (nicht-geschützte) Einträge
                     # speichern – verhindert Doppelanlage wenn dieselbe Immobilie mit
                     # einer neuen edikt_id erscheint, aber noch in "🆕 Neu eingelangt".
@@ -2034,6 +2041,7 @@ def notion_update_edikt_eintrag(
 
     # ── Bestehende Werte lesen um echte Änderungen zu erkennen ──────────────
     hat_echte_aenderung = False
+    existing_hash_ids = ""
     try:
         page = notion.pages.retrieve(page_id=page_id)
         existing_props = page.get("properties", {})
@@ -2041,6 +2049,9 @@ def notion_update_edikt_eintrag(
         existing_termin = existing_termin_obj.get("start", "")
         existing_vk_rt = existing_props.get("Verkehrswert", {}).get("rich_text", [])
         existing_vk = existing_vk_rt[0].get("plain_text", "").strip() if existing_vk_rt else ""
+        # Bestehende Hash-IDs lesen (können mehrere sein, newline-getrennt)
+        existing_hash_rt = existing_props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
+        existing_hash_ids = existing_hash_rt[0].get("plain_text", "").strip() if existing_hash_rt else ""
     except Exception:
         existing_termin = ""
         existing_vk = ""
@@ -2050,7 +2061,13 @@ def notion_update_edikt_eintrag(
     if new_link:
         props["Link"] = {"url": new_link}
     if new_eid:
-        props["Hash-ID / Vergleichs-ID"] = {"rich_text": [{"text": {"content": new_eid}}]}
+        # Neue edikt_id ANHÄNGEN statt ersetzen – verhindert Hash-ID-Ping-Pong.
+        # Wenn die Website mehrere edikt_ids für dieselbe Immobilie listet,
+        # werden beim nächsten Run ALLE als bekannt erkannt.
+        known_ids_set = {e.strip().lower() for e in existing_hash_ids.split("\n") if e.strip()}
+        if new_eid.strip().lower() not in known_ids_set:
+            combined = f"{existing_hash_ids}\n{new_eid}".strip() if existing_hash_ids else new_eid
+            props["Hash-ID / Vergleichs-ID"] = {"rich_text": [{"text": {"content": combined}}]}
 
     termin_iso = detail.get("termin_iso")
     if termin_iso:
@@ -2238,10 +2255,12 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
         page_id = page["id"]
         props   = page.get("properties", {})
 
-        # Hash-ID vorhanden? → Link direkt bauen
+        # Hash-ID vorhanden? → Link direkt bauen (erste ID verwenden, da Feld
+        # mehrere newline-getrennte IDs enthalten kann)
         hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
         if hash_rt:
-            edikt_id = hash_rt[0].get("plain_text", "").strip()
+            _hash_full = hash_rt[0].get("plain_text", "").strip()
+            edikt_id = _hash_full.split("\n")[0].strip() if _hash_full else ""
             if edikt_id and re.fullmatch(r"[0-9a-f]{32}", edikt_id):
                 constructed_link = (
                     f"{BASE_URL}/edikte/ex/exedi3.nsf/alldoc/{edikt_id}!OpenDocument"
