@@ -139,8 +139,11 @@ def is_excluded(text: str) -> bool:
 
 
 def is_excluded_by_kategorie(kategorie: str) -> bool:
-    """Prüft ob ein Objekt anhand der Detailseiten-Kategorie ausgeschlossen werden soll."""
-    return kategorie.lower().strip() in EXCLUDE_KATEGORIEN
+    """Prüft ob ein Objekt anhand der Detailseiten-Kategorie ausgeschlossen werden soll.
+    Kategorie kann mehrere Werte enthalten, getrennt durch | oder Komma.
+    """
+    einzeln = [k.strip().lower() for k in re.split(r'[|,]', kategorie)]
+    return any(k in EXCLUDE_KATEGORIEN for k in einzeln)
 
 
 def parse_euro(raw: str) -> float | None:
@@ -2043,7 +2046,7 @@ def notion_update_edikt_eintrag(
     hat_echte_aenderung = False
     existing_hash_ids = ""
     try:
-        page = notion.pages.retrieve(page_id=page_id)
+        page = notion_with_retry(notion.pages.retrieve, page_id=page_id)
         existing_props = page.get("properties", {})
         existing_termin_obj = existing_props.get("Versteigerungstermin", {}).get("date") or {}
         existing_termin = existing_termin_obj.get("start", "")
@@ -2130,9 +2133,9 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
         "📊 Gutachten analysiert",
     }
 
-    # Aktuellen Zustand der Seite lesen
+    # Aktuellen Zustand der Seite lesen (mit Retry bei Rate-Limit)
     try:
-        page = notion.pages.retrieve(page_id=page_id)
+        page = notion_with_retry(notion.pages.retrieve, page_id=page_id)
         props = page.get("properties", {})
         phase    = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
         status   = (props.get("Status", {}).get("select") or {}).get("name", "")

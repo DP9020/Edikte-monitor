@@ -23,7 +23,7 @@ jobs:
   full-run:
     timeout-minutes: 45
     concurrency:
-      group: full-run
+      group: edikte-notion-write
       cancel-in-progress: false
     if: |
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.modus == 'full' || github.event.inputs.modus == '')) ||
@@ -84,8 +84,8 @@ jobs:
   brief-only:
     timeout-minutes: 10
     concurrency:
-      group: brief-only
-      cancel-in-progress: true
+      group: edikte-notion-write
+      cancel-in-progress: false
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'brief') ||
       github.event.schedule == '*/10 * * * *'
@@ -117,6 +117,9 @@ jobs:
   # GDRIVE_ONLY: alle 30 Minuten – Google Drive Sync für Gelb-Einträge
   gdrive-sync:
     timeout-minutes: 15
+    concurrency:
+      group: edikte-notion-write
+      cancel-in-progress: false
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'gdrive') ||
       github.event.schedule == '*/30 * * * *'
