@@ -106,17 +106,45 @@ def normalize_address(s: str) -> str:
 
 
 def extract_plz(title: str, plz_field: str) -> str:
-    """Extrahiert 4-stellige österreichische PLZ.
+    """Extrahiert eine verlässliche österreichische 4-stellige PLZ.
 
-    Zuerst aus dem expliziten PLZ-Feld, dann aus dem Titel.
+    Quellen in dieser Reihenfolge:
+      1. Notion-Feld 'Liegenschafts PLZ' (vertrauenswürdig).
+      2. Titel-Pattern '4-Ziffern gefolgt von Ort-Name' – NUR wenn die
+         4-Ziffern-Zahl direkt vor einem Wort mit Großbuchstaben steht,
+         z.B. '1120 Wien', '6273 Ried'. Das schließt Jahreszahlen aus
+         Datumsangaben ('05.05.2026') sicher aus.
+      3. Österreichische PLZ starten nicht mit 0 – Zahlen mit führender
+         0 werden verworfen.
     """
-    for src in (plz_field, title):
-        if not src:
-            continue
-        m = re.search(r"\b(\d{4})\b", src)
+    # Primärquelle: explizites PLZ-Feld
+    if plz_field:
+        m = re.search(r"\b([1-9]\d{3})\b", plz_field)
+        if m:
+            return m.group(1)
+    # Sekundärquelle: Titel, aber nur PLZ + Ort-Pattern
+    if title:
+        # 4-stellig (erste Ziffer 1-9) gefolgt von Whitespace und Großbuchstaben
+        m = re.search(r"\b([1-9]\d{3})\s+([A-ZÄÖÜ][\wäöüß.\-/]+)", title)
         if m:
             return m.group(1)
     return ""
+
+
+_SYNTHETIC_TITLE_RE = re.compile(
+    r"^(Wien|Niederösterreich|Oberösterreich|Burgenland|Steiermark|Kärnten|Salzburg|Tirol|Vorarlberg)\s*[–-]\s*\d{2}\.\d{2}\.\d{4}",
+    re.IGNORECASE,
+)
+
+
+def ist_synthetischer_titel(title: str) -> bool:
+    """True wenn der Titel ein Fallback aus 'Bundesland – DD.MM.YYYY' ist.
+
+    Solche Titel enthalten keine echte Adresse — sie dürfen NIE als
+    Dedup-Signal dienen, weil unterschiedliche Immobilien zufällig am
+    selben Datum im selben Bundesland versteigert werden können.
+    """
+    return bool(_SYNTHETIC_TITLE_RE.match(title.strip()))
 
 
 def hash_ids_of(page: dict) -> set[str]:
@@ -214,6 +242,10 @@ def build_groups(active_pages: list[dict]) -> tuple[list[list[dict]], dict]:
         title = get_titel(p)
         if not title:
             continue
+        # Synthetische Fallback-Titel nie als Dedup-Signal verwenden –
+        # sie enthalten keine echte Adresse, Hash-Overlap bleibt erlaubt.
+        if ist_synthetischer_titel(title):
+            continue
         norm = normalize_address(title)
         if not norm:
             continue
@@ -228,7 +260,8 @@ def build_groups(active_pages: list[dict]) -> tuple[list[list[dict]], dict]:
             else:
                 addr_plz_to_idx[key_b] = i
         # Strategie C (Fallback, wenn keine PLZ): Bundesland + norm
-        if bundesland:
+        # Nur zulässig wenn norm nicht-trivial (min. 10 Zeichen, kein reiner Ortsname)
+        if bundesland and len(norm) >= 10:
             key_c = (norm, bundesland)
             if key_c in addr_bl_to_idx:
                 union(i, addr_bl_to_idx[key_c])
