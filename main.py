@@ -1839,6 +1839,20 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
 
     print(f"[Notion] ✅ {len(known)} Einträge geladen "
           f"({geschuetzt_count} geschützt, {page_count} Seiten geprüft)")
+
+    # ── Sanity-Check: Paginierung muss vollständig gewesen sein ──────────────
+    # Am 21.04.2026 hat ein Run aufgrund eines Notion-API-Abbruchs nur 300 von
+    # ~1900 Pages geladen → 151 Duplikate wurden angelegt, weil known_ids
+    # unvollständig war. Dieser Check erzwingt einen Abbruch bei zu niedriger
+    # Page-Zahl, statt mit kaputten Daten weiterzuarbeiten.
+    min_expected = int(os.environ.get("NOTION_MIN_PAGES", "500"))
+    if page_count < min_expected:
+        raise RuntimeError(
+            f"notion_load_all_ids hat nur {page_count} Seiten geladen, "
+            f"erwartet ≥ {min_expected}. Paginierung vermutlich vorzeitig "
+            f"abgebrochen. Lauf wird abgebrochen, um Duplikat-Erzeugung zu "
+            f"verhindern."
+        )
     return known
 
 
