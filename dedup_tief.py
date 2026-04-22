@@ -328,15 +328,27 @@ def gruppe_ist_sicher(gruppe: list[dict]) -> tuple[bool, str]:
     az = {get_rt(p, "Aktenzeichen") for p in gruppe if get_rt(p, "Aktenzeichen")}
     az_ok = len(az) == 1
 
-    if plz_ok:
-        return True, f"PLZ identisch ({list(plzs)[0]})"
+    # Synthetische Fallback-Titel haben keinen echten Adressinhalt –
+    # deshalb dürfen PLZ/Gericht/Aktenzeichen-Matches dort NICHT als
+    # Safety dienen. Nur Hash-Overlap (dasselbe Edikt) ist dann sicher.
+    alle_synthetisch = all(ist_synthetischer_titel(get_titel(p)) for p in gruppe)
+    hat_synthetisch = any(ist_synthetischer_titel(get_titel(p)) for p in gruppe)
+
+    # Priorität: Hash-Overlap zuerst (stärkste Evidenz dass es dasselbe
+    # Edikt ist). Danach erst die schwächeren Kriterien.
     if any_overlap:
         return True, "Hash-ID-Overlap"
+    if alle_synthetisch:
+        return False, "alle Titel synthetisch & kein Hash-Overlap"
+    if hat_synthetisch:
+        return False, "mindestens 1 Titel synthetisch & kein Hash-Overlap"
+    if plz_ok:
+        return True, f"PLZ identisch ({list(plzs)[0]})"
     if gericht_ok:
         return True, f"Gericht identisch ({list(gerichte)[0][:30]})"
     if az_ok:
         return True, f"Aktenzeichen identisch ({list(az)[0][:30]})"
-    return False, "kein PLZ/Hash/Gericht/AZ-Match"
+    return False, "kein Hash/PLZ/Gericht/AZ-Match"
 
 
 def archive_page(notion: Client, page_id: str, primary_id: str, primary_phase: str) -> None:
