@@ -1,0 +1,42 @@
+name: Dedup Neu eingelangt
+
+# Bereinigt Duplikate im '🆕 Neu eingelangt' die bereits in einer anderen Phase
+# bearbeitet wurden (Brief versendet, als irrelevant markiert, gekauft etc.).
+# Manueller Trigger mit Parameter 'apply' – default ist Dry-Run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "true = tatsächlich archivieren | false = Dry-Run (zeigt nur was passieren würde)"
+        required: false
+        default: "false"
+
+jobs:
+  dedup:
+    timeout-minutes: 15
+    concurrency:
+      group: edikte-notion-write
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Duplikate in 'Neu eingelangt' bereinigen
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "true" ]; then
+            echo "▶ Modus: APPLY (echte Archivierung)"
+            python cleanup_neu_eingelangt.py --apply
+          else
+            echo "▶ Modus: DRY-RUN (nur Anzeige, keine Änderung)"
+            python cleanup_neu_eingelangt.py
+          fi

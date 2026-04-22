@@ -2604,19 +2604,27 @@ def notion_status_sync(notion: Client, db_id: str,
     """
     Synchronisiert zwei manuelle Felder → Workflow-Phase + Checkboxen.
 
+    ── Invarianten (sehr wichtig) ─────────────────────────────────────────
+    1. Phase-Änderung nur bei Initial-Phasen (🆕 Neu eingelangt, 🔎 In Prüfung,
+       leer). Fortgeschrittene Phasen (📩 Brief versendet, 📊 Gutachten
+       analysiert, ✅ Gekauft, 🗄 Archiviert, ❌ Nicht relevant,
+       ✅ Relevant – Brief vorbereiten) werden NIE zurückgesetzt – der
+       Workflow-Fortschritt bleibt erhalten, auch wenn 'Für uns relevant?'
+       unverändert 'Ja' bleibt.
+    2. Checkboxen (Relevanz geprüft?, Neu eingelangt, Archiviert) werden nur
+       geschrieben, wenn sich der Wert tatsächlich ändert (Idempotenz) –
+       verhindert sinnlose Notion-Writes und das damit verbundene
+       'last_edited'-Flackern das wie viele neue Einträge aussieht.
+
     ── Quelle 1: Status-Farbe ──────────────────────────────────────────────
-      🔴 Rot  → Phase: '❌ Nicht relevant', Neu eingelangt: False,
-                Relevanz geprüft?: True, Archiviert: True
-      🟡 Gelb → Phase: '🔎 In Prüfung',   Neu eingelangt: False
-      🟢 Grün → Phase: '✅ Gekauft',       Neu eingelangt: False
+      🔴 Rot  → Phase: '❌ Nicht relevant', Archiviert + Relevanz geprüft
+      🟡 Gelb → Phase: '🔎 In Prüfung'
+      🟢 Grün → Phase: '✅ Gekauft'
 
     ── Quelle 2: 'Für uns relevant?' (Select) ──────────────────────────────
-      Ja         → Phase: '✅ Relevant – Brief vorbereiten',
-                   Relevanz geprüft?: True, Neu eingelangt: False
-      Nein       → Phase: '❌ Nicht relevant', Status: 🔴 Rot,
-                   Relevanz geprüft?: True, Neu eingelangt: False, Archiviert: True
-      Beobachten → Phase: '🔎 In Prüfung',
-                   Relevanz geprüft?: True, Neu eingelangt: False
+      Ja         → Phase: '✅ Relevant – Brief vorbereiten'
+      Nein       → Phase: '❌ Nicht relevant', Status: 🔴 Rot, Archiviert
+      Beobachten → Phase: '🔎 In Prüfung'
 
     all_pages: vorgeladene Pages (von notion_load_all_pages). Falls None,
                wird ein eigener Scan durchgeführt.
@@ -2637,6 +2645,10 @@ def notion_status_sync(notion: Client, db_id: str,
         "Beobachten": "🔎 In Prüfung",
     }
 
+    # Phasen in denen eine automatische Phase-Änderung noch zulässig ist.
+    # Alles andere wurde bereits bearbeitet – nicht rückwärts verschieben.
+    INITIAL_PHASEN = frozenset({"", "🆕 Neu eingelangt", "🔎 In Prüfung"})
+
     print("\n[Status-Sync] 🔄 Prüfe Status + Relevanz → Phase …")
 
     pages = all_pages if all_pages is not None else notion_load_all_pages(notion, db_id)
@@ -2647,46 +2659,64 @@ def notion_status_sync(notion: Client, db_id: str,
         status    = (props.get("Status", {}).get("select") or {}).get("name", "")
         relevant  = (props.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
         phase_ist = (props.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
+
+        # Bestehende Checkbox-Werte lesen – nur schreiben wenn Änderung nötig
+        cur_geprueft   = props.get("Relevanz geprüft?", {}).get("checkbox", False)
+        cur_neu        = props.get("Neu eingelangt", {}).get("checkbox", False)
+        cur_archiviert = props.get("Archiviert", {}).get("checkbox", False)
+
         update_props: dict = {}
 
         # ── Quelle 2: 'Für uns relevant?' hat Vorrang vor Status-Farbe ──
         if relevant in RELEVANT_SOLL_PHASE:
             phase_soll = RELEVANT_SOLL_PHASE[relevant]
 
-            # Immer: Relevanz geprüft + Neu eingelangt
-            update_props["Relevanz geprüft?"] = {"checkbox": True}
-            update_props["Neu eingelangt"]   = {"checkbox": False}
-
-            # Phase nur setzen wenn noch nicht korrekt
-            if phase_ist != phase_soll:
+            # Phase nur in Initial-Phasen umstellen – Fortschritt nie zurücksetzen
+            if phase_ist in INITIAL_PHASEN and phase_ist != phase_soll:
                 update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
 
-            # Bei Nein: zusätzlich Status Rot + Archiviert
+            # Checkboxen idempotent schreiben
+            if not cur_geprueft:
+                update_props["Relevanz geprüft?"] = {"checkbox": True}
+            if cur_neu:
+                update_props["Neu eingelangt"] = {"checkbox": False}
+
+            # Bei Nein: zusätzlich Status Rot + Archiviert (nur wenn nötig)
             if relevant == "Nein":
-                update_props["Status"]    = {"select": {"name": "🔴 Rot"}}
-                update_props["Archiviert"] = {"checkbox": True}
+                if status != "🔴 Rot":
+                    update_props["Status"] = {"select": {"name": "🔴 Rot"}}
+                if not cur_archiviert:
+                    update_props["Archiviert"] = {"checkbox": True}
 
         # ── Quelle 1: Status-Farbe (nur wenn kein Relevanz-Wert gesetzt) ─
         elif status in STATUS_SOLL_PHASE:
             phase_soll = STATUS_SOLL_PHASE[status]
 
-            if phase_ist != phase_soll:
+            if phase_ist in INITIAL_PHASEN and phase_ist != phase_soll:
                 update_props["Workflow-Phase"] = {"select": {"name": phase_soll}}
 
-            update_props["Neu eingelangt"] = {"checkbox": False}
+            if cur_neu:
+                update_props["Neu eingelangt"] = {"checkbox": False}
 
             if status == "🔴 Rot":
-                update_props["Relevanz geprüft?"] = {"checkbox": True}
-                update_props["Archiviert"]        = {"checkbox": True}
+                if not cur_geprueft:
+                    update_props["Relevanz geprüft?"] = {"checkbox": True}
+                if not cur_archiviert:
+                    update_props["Archiviert"] = {"checkbox": True}
 
-        # Keine relevanten Felder gesetzt → überspringen
+        # Keine Änderung nötig → überspringen
         if not update_props:
             continue
 
+        neue_phase = update_props.get("Workflow-Phase", {}).get("select", {}).get("name", "")
         to_update.append({
             "page_id":      page["id"],
             "update_props": update_props,
-            "label":        f"relevant={relevant or '–'} status={status or '–'} → phase={update_props.get('Workflow-Phase', {}).get('select', {}).get('name', phase_ist)}",
+            "label":        (
+                f"relevant={relevant or '–'} status={status or '–'} "
+                f"phase_ist='{phase_ist or '–'}' → "
+                f"{('phase=' + neue_phase) if neue_phase else '(nur Checkboxen)'}"
+            ),
         })
 
     print(f"  [Status-Sync] 📋 {len(to_update)} Einträge werden synchronisiert")
