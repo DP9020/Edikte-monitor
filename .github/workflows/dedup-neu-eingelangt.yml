@@ -5,6 +5,9 @@ name: Dedup Neu eingelangt
 # Manueller Trigger mit Parameter 'apply' – default ist Dry-Run.
 
 on:
+  schedule:
+    # Mo / Mi / Fr um 03:30 UTC (~05:30 Wien) – ca. alle 48 h Auto-Apply
+    - cron: "30 3 * * 1,3,5"
   workflow_dispatch:
     inputs:
       apply:
@@ -33,7 +36,9 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
-          if [ "${{ github.event.inputs.apply }}" = "true" ]; then
+          # Scheduled Runs laufen immer im Apply-Modus; manuelle Runs
+          # nutzen den 'apply'-Input (default: Dry-Run).
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event.inputs.apply }}" = "true" ]; then
             echo "▶ Modus: APPLY (echte Archivierung)"
             python cleanup_neu_eingelangt.py --apply
           else
