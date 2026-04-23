@@ -3961,13 +3961,15 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             eq_key = kontakt["email"]
             if eq_key not in email_queue:
                 email_queue[eq_key] = {
-                    "kontakt":         kontakt,
-                    "attachments":     [],
+                    "kontakt":          kontakt,
+                    "attachments":      [],
                     "eigentuemer_list": [],
+                    "page_ids":         [],   # für Fehler-Notion-Notizen
                 }
             hinweis = f" ⚠️ FEHLENDE FELDER: {', '.join(fehlende_felder)}" if fehlende_felder else ""
             email_queue[eq_key]["attachments"].append((docx_bytes, dateiname_docx))
             email_queue[eq_key]["eigentuemer_list"].append(f"{eigentuemer[:60]}{hinweis}")
+            email_queue[eq_key]["page_ids"].extend(p["id"] for p in gruppe)
 
             # ── Telegram-Dokument ─────────────────────────────────────────────
             tg_caption = (
@@ -4035,18 +4037,87 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     # ── Sammel-E-Mail pro Betreuer versenden ──────────────────────────────────
     print(f"[Brief] 📬 Versende Sammel-E-Mails ({len(email_queue)} Betreuer) …")
     emails_ok = 0
+    email_failures: list[dict] = []  # {kontakt, page_ids, reason}
     for eq_key, eq_data in email_queue.items():
+        reason = ""
         try:
             ok = _brief_send_email_sammlung(
-                kontakt_email   = eq_data["kontakt"]["email"],
-                kontakt_name    = eq_data["kontakt"]["name"],
-                attachments     = eq_data["attachments"],
+                kontakt_email    = eq_data["kontakt"]["email"],
+                kontakt_name     = eq_data["kontakt"]["name"],
+                attachments      = eq_data["attachments"],
                 eigentuemer_list = eq_data["eigentuemer_list"],
             )
             if ok:
                 emails_ok += 1
+                continue
+            reason = "SendGrid meldete Fehler (siehe Log)"
         except Exception as exc:
+            reason = f"Exception beim Versand: {exc}"
             print(f"  [Brief] ⚠️  Sammel-E-Mail an {eq_key} fehlgeschlagen: {exc}")
+        email_failures.append({
+            "kontakt":  eq_data["kontakt"],
+            "page_ids": eq_data.get("page_ids", []),
+            "reason":   reason,
+            "anzahl":   len(eq_data["attachments"]),
+        })
+
+    # ── Bei E-Mail-Fehlern: Notion-Einträge markieren + Telegram-Alarm ────────
+    # 'Brief erstellt am' ist bereits im Loop gesetzt worden. Damit Fritz
+    # trotzdem merkt, dass die Mail nicht ankam, markieren wir die betroffenen
+    # Pages zusätzlich mit einer auffälligen Notiz.
+    if email_failures:
+        for f in email_failures:
+            warn_text = (
+                f"⚠️ E-Mail-Versand an {f['kontakt']['name']} "
+                f"({f['kontakt']['email']}) FEHLGESCHLAGEN: {f['reason'][:200]}. "
+                f"DOCX wurde erstellt + via Telegram gesendet, aber "
+                f"Sammel-E-Mail ging nicht raus. Manuell nachsenden."
+            )
+            for pid in f["page_ids"]:
+                try:
+                    page = notion_with_retry(notion.pages.retrieve, page_id=pid)
+                    notizen_rt = page.get("properties", {}).get("Notizen", {}).get("rich_text", [])
+                    alt = "".join(t.get("text", {}).get("content", "") for t in notizen_rt).strip()
+                    neu = (alt + "\n" + warn_text).strip()[:2000] if alt else warn_text[:2000]
+                    notion_with_retry(
+                        notion.pages.update,
+                        page_id=pid,
+                        properties={
+                            "Notizen": {"rich_text": [{"type": "text", "text": {"content": neu}}]},
+                        },
+                    )
+                except Exception as exc:
+                    print(f"  [Brief] ⚠️  Fehler-Notiz konnte nicht geschrieben werden: {exc}")
+                time.sleep(0.3)
+
+        # Telegram-Alarm an Fritz (Hauptchat) – direkt sync via _telegram_send_raw,
+        # da notion_brief_erstellen keine async-Funktion ist.
+        try:
+            fehler_zusammen = "\n".join(
+                f"• {html_escape(f['kontakt']['name'])} "
+                f"({html_escape(f['kontakt']['email'])}): "
+                f"{f['anzahl']}× Brief – {html_escape(f['reason'][:120])}"
+                for f in email_failures
+            )
+            alert = (
+                "🚨 <b>E-Mail-Versand fehlgeschlagen!</b>\n"
+                f"{len(email_failures)} Sammel-E-Mail(s) gingen NICHT raus.\n"
+                f"DOCX wurden erstellt + via Telegram verschickt – manuelle Weiterleitung nötig.\n\n"
+                f"{fehler_zusammen}"
+            )
+            tg_token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+            tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+            if tg_token and tg_chat_id:
+                _telegram_send_raw(
+                    f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                    {
+                        "chat_id":    tg_chat_id,
+                        "text":       _truncate_plain(alert, 4000),
+                        "parse_mode": "HTML",
+                    },
+                )
+        except Exception as exc:
+            print(f"  [Brief] ⚠️  Telegram-Alarm konnte nicht gesendet werden: {exc}")
 
     print(f"[Brief] ✅ {erstellt} Brief(e) erstellt, {emails_ok}/{len(email_queue)} Sammel-E-Mail(s) gesendet ({len(to_process)} Einträge)")
     return erstellt, telegram_lines
