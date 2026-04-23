@@ -7,6 +7,7 @@ Alle Bundesländer | HTTP-Request (kein Browser nötig) | Notion | Telegram
 
 import os
 import re
+import sys
 import json
 import time
 import asyncio
@@ -1195,14 +1196,31 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
     Extrahiert Eigentümer, Adresse, Gläubiger und Forderungsbetrag aus dem PDF.
     Unterstützt Grundbuchauszug-Format (Kärnten-Stil) und professionelle
     Gutachten mit 'Verpflichtete Partei:'-Angabe (Wien-Stil).
-    Gibt leeres Dict zurück wenn fitz nicht verfügbar ist.
+    Gibt leeres Dict zurück wenn fitz nicht verfügbar, das PDF leer oder
+    kaputt ist.
     """
     if not FITZ_AVAILABLE:
         return {}
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if not pdf_bytes:
+        print("    [PDF] ⚠️  Leere PDF-Bytes – Extraktion übersprungen")
+        return {}
+
     try:
-        all_text = [p.get_text() for p in doc if p.get_text().strip()]
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        print(f"    [PDF] ⚠️  PDF-Öffnen fehlgeschlagen: {exc}")
+        return {}
+
+    try:
+        if len(doc) == 0:
+            print("    [PDF] ⚠️  PDF hat 0 Seiten – Extraktion übersprungen")
+            return {}
+        try:
+            all_text = [p.get_text() for p in doc if p.get_text().strip()]
+        except Exception as exc:
+            print(f"    [PDF] ⚠️  Text-Extraktion fehlgeschlagen: {exc}")
+            return {}
         full_text = "\n".join(all_text)
     finally:
         doc.close()
@@ -4426,8 +4444,11 @@ async def main() -> None:
         try:
             _pages = notion_load_all_pages(notion, db_id)
         except Exception as exc:
-            print(f"[Modus] ⚠️  Page-Laden fehlgeschlagen: {exc}")
-            return
+            # Fatal: ohne Pages können wir nichts synchronisieren.
+            # Mit sys.exit(1) damit GitHub Actions rot-markiert und
+            # der Failure-Alert via Workflow greift (statt stummer Erfolg).
+            print(f"[Modus] ❌ Page-Laden fehlgeschlagen: {exc}")
+            sys.exit(1)
 
         try:
             _gdrive_service = gdrive_get_service()
@@ -4441,9 +4462,15 @@ async def main() -> None:
                 count = gdrive_sync_gelb_entries(notion, db_id, _pages, _gdrive_service)
                 print(f"[Modus] ✅ GDRIVE_ONLY fertig – {count} Eintrag/Einträge verarbeitet")
             else:
-                print("[GDrive] ℹ️  Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
+                # Kein Service = Konfigurationsproblem (Key fehlt / Bibliothek
+                # nicht installiert) – das ist ein echter Fehler, nicht "ok".
+                print("[GDrive] ❌ Kein Service verfügbar (Bibliothek nicht installiert oder Key fehlt)")
+                sys.exit(1)
+        except SystemExit:
+            raise  # sys.exit(1) von oben durchreichen
         except Exception as exc:
             print(f"[Modus] ❌ GDrive-Sync fehlgeschlagen: {exc}")
+            sys.exit(1)
         return
 
     # ── BRIEF_ONLY-Modus: nur Status-Sync + Brief-Erstellung ─────────────────
