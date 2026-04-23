@@ -189,8 +189,15 @@ def fetch_detail(link: str) -> dict:
             link,
             headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
         )
+        # Hartes Read-Limit gegen unkontrolliert große Responses.
+        # Normale Edikt-Detailseiten sind < 200 KB; 10 MB ist sehr großzügig.
+        MAX_HTML_BYTES = 10_000_000
         with urllib.request.urlopen(req, timeout=20) as r:
-            html = r.read().decode("utf-8", errors="replace")
+            raw = r.read(MAX_HTML_BYTES + 1)
+            if len(raw) > MAX_HTML_BYTES:
+                print(f"    [Detail] ⚠️  Response >{MAX_HTML_BYTES} Bytes – abgeschnitten")
+                raw = raw[:MAX_HTML_BYTES]
+            html = raw.decode("utf-8", errors="replace")
     except Exception as exc:
         print(f"    [Detail] ⚠️  Fehler beim Laden: {exc}")
         return {}
@@ -341,41 +348,66 @@ def _clean_adresse(adr: str) -> str:
     return adr
 
 
-def notion_with_retry(fn, *args, max_retries: int = 3, **kwargs):
+def _is_transient_error(exc: Exception) -> tuple[bool, str]:
+    """Entscheidet ob ein API-Fehler retry-würdig ist.
+
+    Transient = 429 Rate-Limit, 5xx Server-Errors, Netzwerk-Timeouts.
+    Nicht transient = 4xx (außer 429) → sofort raisen damit der Fehler
+    sichtbar wird statt still zu warten.
     """
-    Führt eine Notion-API-Funktion mit automatischem Retry bei Rate-Limit (429) aus.
-    Wartet bei 429: 5s, 15s, 30s (exponential backoff).
+    err_str = str(exc).lower()
+    # Rate-Limit
+    if "429" in err_str or "rate_limited" in err_str or "rate limit" in err_str:
+        return True, "429 Rate-Limit"
+    # 5xx Server-Fehler
+    for code in ("500", "502", "503", "504"):
+        if code in err_str:
+            return True, f"{code} Server-Fehler"
+    # Netzwerk / DNS / Socket
+    if "timeout" in err_str or "timed out" in err_str:
+        return True, "Timeout"
+    if "connection reset" in err_str or "connection aborted" in err_str:
+        return True, "Connection reset"
+    if "temporary failure" in err_str or "temporaryfailure" in err_str:
+        return True, "Temporary failure"
+    return False, ""
+
+
+def notion_with_retry(fn, *args, max_retries: int = 3, **kwargs):
+    """Notion-API mit Retry bei 429, 5xx und Netzwerk-Timeouts.
+
+    Wartezeiten: 5s, 15s, 30s. 4xx-Fehler (außer 429) werden sofort propagiert,
+    damit echte Bugs nicht versteckt hinter minutenlangem Warten verschwinden.
     """
     delays = [5, 15, 30]
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
-            err_str = str(exc).lower()
-            is_rate_limit = "429" in err_str or "rate_limited" in err_str or "rate limit" in err_str
-            if is_rate_limit and attempt < max_retries - 1:
+            transient, reason = _is_transient_error(exc)
+            if transient and attempt < max_retries - 1:
                 wait = delays[attempt]
-                print(f"  [Notion] ⏳ Rate-Limit (429) – warte {wait}s (Versuch {attempt+1}/{max_retries})")
+                print(f"  [Notion] ⏳ {reason} – warte {wait}s (Versuch {attempt+1}/{max_retries})")
                 time.sleep(wait)
             else:
                 raise
 
 
 def _openai_with_retry(fn, *args, max_retries: int = 3, **kwargs):
-    """
-    Führt einen OpenAI-API-Call mit automatischem Retry bei Rate-Limit (429) aus.
-    Wartet bei 429: 10s, 30s, 60s.
+    """OpenAI-API mit Retry bei 429, 5xx und Netzwerk-Timeouts.
+
+    Wartezeiten: 10s, 30s, 60s. Nicht-transient (z.B. 401 invalid key, 400 bad
+    request) werden sofort propagiert.
     """
     delays = [10, 30, 60]
     for attempt in range(max_retries):
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
-            err_str = str(exc).lower()
-            is_rate_limit = "429" in err_str or "rate_limit" in err_str or "rate limit" in err_str
-            if is_rate_limit and attempt < max_retries - 1:
+            transient, reason = _is_transient_error(exc)
+            if transient and attempt < max_retries - 1:
                 wait = delays[attempt]
-                print(f"  [OpenAI] ⏳ Rate-Limit (429) – warte {wait}s (Versuch {attempt+1}/{max_retries})")
+                print(f"  [OpenAI] ⏳ {reason} – warte {wait}s (Versuch {attempt+1}/{max_retries})")
                 time.sleep(wait)
             else:
                 raise
@@ -870,13 +902,26 @@ def gutachten_fetch_attachment_links(edikt_url: str) -> dict:
     """
     Öffnet die Edikt-Detailseite und gibt alle Anhang-Links zurück.
     Rückgabe: {"pdfs": [...], "images": [...]}
+
+    Bei HTTP-Fehlern wird ein leeres Dict zurückgegeben statt eine
+    Exception zu werfen – der Aufrufer kann so mit der nächsten
+    Immobilie weitermachen statt den ganzen Run zu riskieren.
     """
     req = urllib.request.Request(
         edikt_url,
         headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        html = r.read().decode("utf-8", errors="replace")
+    MAX_HTML_BYTES = 10_000_000
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read(MAX_HTML_BYTES + 1)
+            if len(raw) > MAX_HTML_BYTES:
+                print(f"    [Anhänge] ⚠️  Response >{MAX_HTML_BYTES} Bytes – abgeschnitten")
+                raw = raw[:MAX_HTML_BYTES]
+            html = raw.decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"    [Anhänge] ⚠️  Edikt-Seite nicht ladbar ({edikt_url[:70]}): {exc}")
+        return {"pdfs": [], "images": []}
 
     pattern = re.compile(
         r'href="(/edikte/ex/exedi3\.nsf/0/[^"]+\$file/([^"]+))"',
@@ -906,14 +951,26 @@ def gutachten_pick_best_pdf(pdfs: list) -> dict | None:
     return pdfs[0] if pdfs else None
 
 
-def gutachten_download_pdf(url: str) -> bytes:
-    """Lädt ein PDF herunter und gibt die Bytes zurück."""
+def gutachten_download_pdf(url: str, max_bytes: int = 100_000_000) -> bytes:
+    """Lädt ein PDF herunter.
+
+    Hartes Größen-Limit (default 100 MB) verhindert OOM-Crash auf dem
+    GitHub-Runner wenn edikte.justiz.gv.at einen kaputten/gigantischen
+    Download liefert. Bei Überschreitung wird RuntimeError geworfen –
+    der Aufrufer fällt dann auf Vision/LLM zurück bzw. markiert
+    'Gutachten analysiert?' nicht.
+    """
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "Mozilla/5.0 (compatible; EdikteMonitor/1.0)"}
     )
     with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read()
+        data = r.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise RuntimeError(
+                f"PDF zu groß (>{max_bytes} Bytes) – Download abgebrochen: {url}"
+            )
+        return data
 
 
 def _gb_extract_section(text: str, start_marker: str, end_marker: str) -> str:
