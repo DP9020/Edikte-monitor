@@ -27,6 +27,8 @@ if os.path.exists(_env_path):
 
 from notion_client import Client
 
+from _notion_helpers import paginated_query, with_retry
+
 # ── Phasen-Priorität: höherer Index = wertvoller ────────────────────────────
 PHASE_RANG = {
     "🆕 Neu eingelangt":               0,
@@ -61,20 +63,10 @@ def clean_db_id(raw: str) -> str:
 
 
 def load_all_pages(notion: Client, db_id: str) -> list[dict]:
+    """Alle Pages mit Retry-geschütztem Paginierungs-Helper."""
     print("Lade alle Pages …")
-    pages = []
-    cursor = None
-    while True:
-        kwargs = {"page_size": 100}
-        if cursor:
-            kwargs["start_cursor"] = cursor
-        resp = notion.databases.query(database_id=db_id, **kwargs)
-        pages.extend(resp.get("results", []))
-        print(f"  {len(pages)} Pages geladen …", end="\r")
-        if not resp.get("has_more"):
-            break
-        cursor = resp.get("next_cursor")
-    print(f"\n✅ {len(pages)} Pages geladen")
+    pages = paginated_query(notion, db_id)
+    print(f"✅ {len(pages)} Pages geladen")
     return pages
 
 
@@ -170,7 +162,8 @@ def archiviere_duplikate(notion, duplikat_gruppen: dict, label: str, pass2: bool
 
             if not DRY_RUN:
                 try:
-                    notion.pages.update(
+                    with_retry(
+                        notion.pages.update,
                         page_id=dup_id,
                         properties={
                             "Archiviert":     {"checkbox": True},

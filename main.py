@@ -2218,15 +2218,12 @@ def notion_mark_entfall(notion: Client, page_id: str, item: dict) -> None:
 
     Unbearbeitet        → Normal archivieren
     """
-    # Phasen die NICHT auto-archiviert werden (manuell in Bearbeitung)
-    # Gilt NUR wenn Status != 🔴 Rot
-    SCHUTZ_PHASEN = {
-        "🔎 In Prüfung",
-        "✅ Relevant – Brief vorbereiten",
-        "📩 Brief versendet",
-        "📊 Gutachten analysiert",
-        "✅ Gekauft",
-    }
+    # Phasen die NICHT auto-archiviert werden (manuell in Bearbeitung).
+    # Gilt NUR wenn Status != 🔴 Rot.
+    # Verwendet die globale GESCHUETZT_PHASEN-Konstante statt einer lokalen
+    # Duplikat-Liste, damit Phase-Definitionen nicht auseinanderlaufen
+    # ('❌ Nicht relevant' und '🗄 Archiviert' sind ebenfalls geschützt).
+    SCHUTZ_PHASEN = GESCHUETZT_PHASEN
 
     # Aktuellen Zustand der Seite lesen (mit Retry bei Rate-Limit)
     try:

@@ -48,6 +48,8 @@ if os.path.exists(_env_path):
 
 from notion_client import Client  # noqa: E402
 
+from _notion_helpers import paginated_query, with_retry  # noqa: E402
+
 
 NEU_PHASE = "🆕 Neu eingelangt"
 
@@ -87,20 +89,8 @@ def normalize_address(s: str) -> str:
 
 
 def load_all_pages(notion: Client, db_id: str) -> list[dict]:
-    pages: list[dict] = []
-    cursor = None
-    while True:
-        kwargs: dict = {"database_id": db_id, "page_size": 100}
-        if cursor:
-            kwargs["start_cursor"] = cursor
-        resp = notion.databases.query(**kwargs)
-        pages.extend(resp.get("results", []))
-        print(f"  {len(pages)} Pages geladen …", end="\r")
-        if not resp.get("has_more"):
-            break
-        cursor = resp.get("next_cursor")
-    print()
-    return pages
+    """Alle Pages mit Retry-geschütztem Paginierungs-Helper."""
+    return paginated_query(notion, db_id)
 
 
 def summarize(page: dict) -> dict:
@@ -210,7 +200,8 @@ def main() -> None:
     fehler = 0
     for neu, primary in misplaced:
         try:
-            notion.pages.update(
+            with_retry(
+                notion.pages.update,
                 page_id=neu["id"],
                 properties={
                     "Workflow-Phase": {"select": {"name": "🗄 Archiviert"}},
