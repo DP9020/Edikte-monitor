@@ -42,3 +42,12 @@ jobs:
             echo "▶ Modus: DRY-RUN"
             python dedup_tief.py
           fi
+      - name: Fehler-Benachrichtigung (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          JOB_NAME: "dedup-tief"
+        run: |
+          python3 .github/workflows/_telegram_failure.py

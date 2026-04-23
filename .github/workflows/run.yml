@@ -2,14 +2,19 @@ name: Edikte Monitor
 
 on:
   schedule:
+    # ── Full-Run (Scraping + Gutachten): Mo-Fr 05:30 / 07:00 / 10:00 / 13:00 UTC ──
     - cron: "30 5 * * 1-5"
     - cron: "0 7 * * 1-5"
     - cron: "0 10 * * 1-5"
     - cron: "0 13 * * 1-5"
+    # ── Brief-Only: alle 10 Minuten ──
     - cron: "*/10 * * * *"
+    # ── GDrive-Sync: alle 30 Minuten ──
     - cron: "*/30 * * * *"
-    - cron: "0 4 * * 1"
-    - cron: "0 6 * * 1"
+    # ── Cleanup-Duplikate: Dienstag 03:00 UTC (war Mo 04:00 – Kollision mit full-run/wochenbericht entflochten) ──
+    - cron: "0 3 * * 2"
+    # ── Wochenbericht: Mo 07:30 UTC (nach dem 05:30-full-run abgeschlossen, vor 10:00-full-run) ──
+    - cron: "30 7 * * 1"
   workflow_dispatch:
     inputs:
       modus:
@@ -21,7 +26,7 @@ jobs:
 
   # Vollständiger Run: Scraping + Gutachten-Analyse
   full-run:
-    timeout-minutes: 45
+    timeout-minutes: 60
     concurrency:
       group: edikte-notion-write
       cancel-in-progress: false
@@ -63,29 +68,18 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          JOB_NAME: "full-run"
         run: |
-          python3 << 'EOF'
-          import urllib.request, json, os
-          token = os.environ['TELEGRAM_BOT_TOKEN']
-          chat_id = os.environ['TELEGRAM_CHAT_ID']
-          run_url = os.environ.get('GH_RUN_URL', '')
-          url = f'https://api.telegram.org/bot{token}/sendMessage'
-          msg = f'❌ Edikte-Monitor Fehler\nJob: full-run\n{run_url}'
-          data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
-          req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-          try:
-              urllib.request.urlopen(req, timeout=10)
-              print('Telegram-Alert gesendet')
-          except Exception as e:
-              print(f'Telegram-Alert fehlgeschlagen: {e}')
-          EOF
+          python3 .github/workflows/_telegram_failure.py
 
   # BRIEF_ONLY: alle 10 Minuten – nur Status-Sync + Brief-Erstellung
   brief-only:
-    timeout-minutes: 10
+    timeout-minutes: 8
     concurrency:
       group: edikte-notion-write
-      cancel-in-progress: false
+      # Wenn ein neuer brief-only kommt, darf der alte abgebrochen werden
+      # (Daten sind ohnehin frisch neu zu laden, alter Job ist obsolet)
+      cancel-in-progress: true
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'brief') ||
       github.event.schedule == '*/10 * * * *'
@@ -113,6 +107,16 @@ jobs:
           BRIEF_ONLY: "true"
         run: |
           python main.py
+      - name: Fehler-Benachrichtigung (Telegram)
+        # Nur bei echtem Fehler, nicht bei concurrency-cancel (das ist normal)
+        if: failure() && !cancelled()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          JOB_NAME: "brief-only"
+        run: |
+          python3 .github/workflows/_telegram_failure.py
 
   # GDRIVE_ONLY: alle 30 Minuten – Google Drive Sync für Gelb-Einträge
   gdrive-sync:
@@ -150,22 +154,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          JOB_NAME: "gdrive-sync"
         run: |
-          python3 << 'EOF'
-          import urllib.request, json, os
-          token = os.environ['TELEGRAM_BOT_TOKEN']
-          chat_id = os.environ['TELEGRAM_CHAT_ID']
-          run_url = os.environ.get('GH_RUN_URL', '')
-          url = f'https://api.telegram.org/bot{token}/sendMessage'
-          msg = f'❌ Edikte-Monitor Fehler\nJob: gdrive-sync\n{run_url}'
-          data = json.dumps({'chat_id': chat_id, 'text': msg}).encode()
-          req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-          try:
-              urllib.request.urlopen(req, timeout=10)
-              print('Telegram-Alert gesendet')
-          except Exception as e:
-              print(f'Telegram-Alert fehlgeschlagen: {e}')
-          EOF
+          python3 .github/workflows/_telegram_failure.py
 
   # TELEGRAM-TEST: Testnachricht an alle Betreuer senden
   telegram-test:
@@ -202,12 +193,15 @@ jobs:
                   print(f'FEHLER {name} ({cid}): {e}')
           "
 
-  # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Montag 04:00 UTC)
+  # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Dienstag 03:00 UTC)
   cleanup-duplikate:
-    timeout-minutes: 10
+    timeout-minutes: 15
+    concurrency:
+      group: edikte-notion-write
+      cancel-in-progress: false
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'cleanup') ||
-      github.event.schedule == '0 4 * * 1'
+      github.event.schedule == '0 3 * * 2'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -224,13 +218,25 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
           python cleanup_duplikate.py
+      - name: Fehler-Benachrichtigung (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          JOB_NAME: "cleanup-duplikate"
+        run: |
+          python3 .github/workflows/_telegram_failure.py
 
-  # WOCHENBERICHT: Wöchentliche Zusammenfassung (Mo 06:00 UTC = 07:00/08:00 Wien)
+  # WOCHENBERICHT: Wöchentliche Zusammenfassung (Mo 07:30 UTC = 09:30 Wien, nach 05:30-full-run)
   wochenbericht:
-    timeout-minutes: 10
+    timeout-minutes: 15
+    concurrency:
+      group: edikte-notion-write
+      cancel-in-progress: false
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'wochenbericht') ||
-      github.event.schedule == '0 6 * * 1'
+      github.event.schedule == '30 7 * * 1'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -252,3 +258,12 @@ jobs:
           WOCHENBERICHT: "true"
         run: |
           python main.py
+      - name: Fehler-Benachrichtigung (Telegram)
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          JOB_NAME: "wochenbericht"
+        run: |
+          python3 .github/workflows/_telegram_failure.py
