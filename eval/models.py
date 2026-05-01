@@ -74,9 +74,9 @@ class ProviderConfig:
     api_key_env: str        # Name der ENV-Variable
     model: str
     supports_vision: bool = False
-    # Cold-Start-Faktor: erster Call kann lange dauern
-    timeout_warmup: int = 90
-    timeout_call: int = 60
+    # Cold-Start-Faktor: erster Call kann lange dauern (NIM Free Tier 60–90s+)
+    timeout_warmup: int = 180
+    timeout_call: int = 120
 
 
 def _key(config: ProviderConfig) -> str:
@@ -205,22 +205,63 @@ def call_vision(
         return CallResult(None, 0, None, None, f"{type(exc).__name__}: {exc}")
 
 
-def warmup(config: ProviderConfig) -> CallResult:
-    """Sendet einen 'PONG'-Mini-Call und verwirft ihn. Mildert Cold-Start im Free Tier."""
+_WARMUP_DUMMY = """Im Folgenden steht ein synthetischer Edikt-Auszug zur Modell-Aufwärmung.
+Sachverständigengutachten zur Liegenschaft EZ 9999 Grundbuch 12345
+Verpflichtete Partei: Max Mustermann, geb. 01.01.1970, Beispielstraße 10, 1010 Wien
+Betreibende Partei: Beispielbank AG, vertreten durch Dr. Test, Rechtsanwalt
+Hereinbringung von EUR 100.000 samt Anhang
+Versteigerungstermin: 01.06.2026
+PFANDRECHT Höchstbetrag EUR 200.000
+""" * 30   # ~3000–4000 Tokens, ähnlich realer Edikte
+
+
+def liveness_check(config: ProviderConfig, *, timeout_s: int = 8) -> CallResult:
+    """Schneller PONG-Check (max ~timeout_s). Erkennt komplett tote Modelle.
+    Anders als Warmup: kurzer Prompt + harter Timeout, schlägt schnell fehl.
+    """
     try:
-        client = _make_client(config)
-        # Höherer Timeout fürs Warmup
-        client = client.with_options(timeout=config.timeout_warmup)
+        from openai import OpenAI
+        client = OpenAI(api_key=_key(config), base_url=config.base_url, timeout=timeout_s)
         t0 = time.perf_counter()
         resp = client.chat.completions.create(
             model=config.model,
-            messages=[{"role": "user", "content": "Antworte NUR mit dem Wort: PONG"}],
-            max_tokens=5,
+            messages=[{"role": "user", "content": "PONG"}],
+            max_tokens=3,
             temperature=0,
         )
         dt = int((time.perf_counter() - t0) * 1000)
         return CallResult(
-            raw_text=(resp.choices[0].message.content or "").strip(),
+            raw_text=(resp.choices[0].message.content or "").strip()[:30],
+            latency_ms=dt,
+            prompt_tokens=None, completion_tokens=None,
+            error=None,
+        )
+    except Exception as exc:
+        return CallResult(None, 0, None, None, f"liveness_{type(exc).__name__}: {exc}"[:100])
+
+
+def warmup(config: ProviderConfig) -> CallResult:
+    """Schickt einen real-ähnlichen ~4k-Token-Prompt und verwirft die Antwort.
+    Wichtig: ein 5-Token-PONG warmt das Modell NICHT für unsere echten Edikt-
+    Prompts vor (im Smoke-Run gemessen: GLM5/DeepSeek brauchen >50s beim
+    ersten echten Call trotz PONG-Warmup).
+    """
+    try:
+        client = _make_client(config)
+        client = client.with_options(timeout=config.timeout_warmup)
+        t0 = time.perf_counter()
+        resp = client.chat.completions.create(
+            model=config.model,
+            messages=[
+                {"role": "system", "content": PROMPT_TEXT},
+                {"role": "user",   "content": _WARMUP_DUMMY},
+            ],
+            max_tokens=200,
+            temperature=0,
+        )
+        dt = int((time.perf_counter() - t0) * 1000)
+        return CallResult(
+            raw_text=(resp.choices[0].message.content or "").strip()[:60],
             latency_ms=dt,
             prompt_tokens=None, completion_tokens=None,
             error=None,

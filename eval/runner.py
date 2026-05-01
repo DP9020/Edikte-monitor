@@ -30,8 +30,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EVAL_DIR  = REPO_ROOT / "eval"
@@ -106,7 +106,7 @@ def main() -> int:
     load_env(REPO_ROOT / ".env")
 
     sys.path.insert(0, str(EVAL_DIR))
-    from models  import CONFIGS, TEXT_CONFIGS, VISION_CONFIGS, call_text, call_vision, warmup
+    from models  import CONFIGS, TEXT_CONFIGS, VISION_CONFIGS, call_text, call_vision, warmup, liveness_check
     from metrics import evaluate, aggregate, composite_score, knockouts
 
     only_filter = {x.strip() for x in args.only.split(",") if x.strip()}
@@ -137,13 +137,40 @@ def main() -> int:
     if only_filter:
         used_configs &= only_filter
 
+    # ── Pre-flight Liveness-Check: tote Modelle aussortieren ──
+    # Parallel + 30s Timeout: gibt NIM-Cold-Start (10-20s im Free Tier) eine faire Chance
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    LIVENESS_TIMEOUT = 30
+    print(f"[Runner] Liveness-Check ({len(used_configs)} Configs, parallel, ~{LIVENESS_TIMEOUT}s Timeout)...", flush=True)
+    dead_configs: set[str] = set()
+    with ThreadPoolExecutor(max_workers=len(used_configs)) as ex:
+        futures = {ex.submit(liveness_check, CONFIGS[cid], timeout_s=LIVENESS_TIMEOUT): cid
+                   for cid in used_configs}
+        for fut in as_completed(futures):
+            cid = futures[fut]
+            r = fut.result()
+            if r.error:
+                dead_configs.add(cid)
+                print(f"           {cid:24s} DEAD ({r.error[:60]})", flush=True)
+            else:
+                print(f"           {cid:24s} alive ({r.latency_ms}ms)", flush=True)
+
+    used_configs -= dead_configs
+    if dead_configs:
+        print(f"[Runner] {len(dead_configs)} Config(s) ausgeschlossen: {sorted(dead_configs)}", flush=True)
+    if not used_configs:
+        print("[Runner] Alle Configs DEAD — Abbruch.", flush=True)
+        return 1
+
+    # ── Warmup für lebendige Configs (sequentiell, aber nur Lebendige) ──
     if not args.skip_warmup:
-        print(f"[Runner] Warmup ({len(used_configs)} Configs)...")
+        print(f"[Runner] Warmup ({len(used_configs)} lebendige Configs, kann je Config 30-180s dauern)...", flush=True)
         for cid in sorted(used_configs):
             cfg = CONFIGS[cid]
+            print(f"           {cid:24s} ... ", end="", flush=True)
             r = warmup(cfg)
             tag = f"{r.latency_ms}ms" if r.error is None else f"ERR {r.error[:50]}"
-            print(f"           {cid:24s} {tag}")
+            print(tag, flush=True)
 
     # Pro-Call-Records
     per_call_fp = per_call_path.open("w", encoding="utf-8")
@@ -157,26 +184,26 @@ def main() -> int:
             gt        = item["ground_truth"]
 
             if not pdf_path.exists():
-                print(f"  [{ix:02d}] {eid}  PDF MISSING")
+                print(f"  [{ix:02d}] {eid}  PDF MISSING", flush=True)
                 continue
 
-            print(f"\n  [{ix:02d}] {eid}  modality={modality}  liegen={item.get('liegenschaftsadresse','')[:50]}")
+            print(f"\n  [{ix:02d}/{len(items):02d}] {eid}  modality={modality}  liegen={item.get('liegenschaftsadresse','')[:50]}", flush=True)
 
-            # Configs für dieses Item
+            # Configs für dieses Item — nur lebendige aus used_configs
             if modality in ("text", "edge_case"):
-                configs = [c for c in TEXT_CONFIGS if (not only_filter) or c.id in only_filter]
+                configs = [c for c in TEXT_CONFIGS if c.id in used_configs]
                 # PDF-Text einmal extrahieren
                 try:
                     snippet = pdf_text_snippet(pdf_path)
                 except Exception as exc:
-                    print(f"      [PDF] FAIL extract text: {exc}")
+                    print(f"      [PDF] FAIL extract text: {exc}", flush=True)
                     continue
             elif modality == "vision":
-                configs = [c for c in VISION_CONFIGS if (not only_filter) or c.id in only_filter]
+                configs = [c for c in VISION_CONFIGS if c.id in used_configs]
                 try:
                     images = pdf_to_images_b64(pdf_path)
                 except Exception as exc:
-                    print(f"      [PDF] FAIL render images: {exc}")
+                    print(f"      [PDF] FAIL render images: {exc}", flush=True)
                     continue
             else:
                 print(f"      Unbekannte modality: {modality} -> skip")
@@ -233,7 +260,7 @@ def main() -> int:
                     if m.get("glaubiger_f1") is not None:  parts.append(f"glF1={m['glaubiger_f1']:.2f}")
                     tag = " ".join(parts) or "ok"
                 err_tag = f" ERR={res.error[:40]}" if res.error else ""
-                print(f"      [{cfg.id:24s}] {res.latency_ms:>5}ms  {tag}{err_tag}")
+                print(f"      [{cfg.id:24s}] {res.latency_ms:>5}ms  {tag}{err_tag}", flush=True)
     finally:
         per_call_fp.close()
 
