@@ -1,5 +1,7 @@
 # Lokale Secrets – niemals committen!
 .env
+.env.*
+!.env.example
 *service-account*.json
 *-credentials.json
 *.key.json
@@ -11,3 +13,7 @@ __pycache__/
 
 # Lokale Briefe / Ausgaben
 briefe/
+
+# Eval-Artefakte (Roh-PDFs, Run-Logs, Eval-Set bleiben lokal)
+eval/data/pdfs/
+eval/runs/
