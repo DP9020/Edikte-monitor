@@ -3710,6 +3710,105 @@ def _brief_anrede(eigentuemer: str) -> str:
     return "Sehr geehrte Damen und Herren,"
 
 
+def _http_post_json(url: str, headers: dict, payload: dict, timeout: int = 30) -> tuple[int, str, str]:
+    """POST JSON; gibt (status, body, error_msg) zurueck. error_msg ist bei
+    Netzwerk-/Transportfehlern gefuellt, sonst leer."""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req  = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.getcode(), r.read().decode("utf-8", errors="replace"), ""
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        return exc.code, body, ""
+    except Exception as exc:
+        return -1, "", f"{type(exc).__name__}: {exc}"
+
+
+def _send_via_sendgrid(api_key: str, absender: str, to_email: str, to_name: str,
+                       subject: str, body_text: str,
+                       attachments_b64: list[tuple[str, str]]) -> tuple[bool, str]:
+    """attachments_b64: [(base64_content, dateiname), ...]"""
+    payload = {
+        "personalizations": [{"to": [{"email": to_email, "name": to_name}]}],
+        "from": {"email": absender},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body_text}],
+        "attachments": [
+            {
+                "content":     b64,
+                "type":        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "filename":    name,
+                "disposition": "attachment",
+            }
+            for b64, name in attachments_b64
+        ],
+    }
+    status, body, transport_err = _http_post_json(
+        "https://api.sendgrid.com/v3/mail/send",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        payload=payload,
+    )
+    if transport_err:
+        return False, f"SendGrid Netzwerkfehler: {transport_err}"
+    if status in (200, 202):
+        return True, ""
+    body_short = " ".join(body.split())[:300]
+    msg = f"SendGrid HTTP {status}"
+    if body_short:
+        msg += f" – {body_short}"
+    return False, msg
+
+
+def _send_via_smtp(host: str, port: int, username: str, password: str,
+                   absender: str, to_email: str, to_name: str,
+                   subject: str, body_text: str,
+                   attachments_b64: list[tuple[str, str]]) -> tuple[bool, str]:
+    """SMTP-Versand (Brevo-Relay oder beliebiger anderer SMTP-Server).
+    Aufbau: STARTTLS auf Port 587, AUTH LOGIN, Multipart-Mail mit DOCX-Anhängen."""
+    import smtplib
+    from email.mime.multipart  import MIMEMultipart
+    from email.mime.text       import MIMEText
+    from email.mime.application import MIMEApplication
+    from email.utils           import formataddr, make_msgid, formatdate
+
+    msg = MIMEMultipart()
+    msg["From"]    = formataddr(("Edikte-Monitor", absender))
+    msg["To"]      = formataddr((to_name, to_email))
+    msg["Subject"] = subject
+    msg["Date"]    = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=absender.split("@", 1)[-1] or "edikte-monitor")
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
+
+    for b64, name in attachments_b64:
+        part = MIMEApplication(
+            base64.b64decode(b64),
+            _subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Name=name,
+        )
+        part["Content-Disposition"] = f'attachment; filename="{name}"'
+        msg.attach(part)
+
+    try:
+        with smtplib.SMTP(host, port, timeout=30) as srv:
+            srv.ehlo()
+            srv.starttls()
+            srv.ehlo()
+            srv.login(username, password)
+            srv.sendmail(absender, [to_email], msg.as_string())
+        return True, ""
+    except smtplib.SMTPAuthenticationError as exc:
+        return False, f"SMTP Auth-Fehler {exc.smtp_code}: {exc.smtp_error.decode('utf-8', errors='replace') if isinstance(exc.smtp_error, bytes) else exc.smtp_error}"
+    except smtplib.SMTPException as exc:
+        return False, f"SMTP {type(exc).__name__}: {exc}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 def _brief_send_email_sammlung(
     kontakt_email: str,
     kontakt_name: str,
@@ -3717,22 +3816,26 @@ def _brief_send_email_sammlung(
     eigentuemer_list: list[str],
 ) -> tuple[bool, str]:
     """
-    Sendet ALLE Briefe eines Runs als Sammel-E-Mail (ein Mail, mehrere Anhänge)
-    via SendGrid API.
+    Sendet ALLE Briefe eines Runs als Sammel-E-Mail (ein Mail, mehrere Anhänge).
 
-    Benötigte Umgebungsvariablen:
-      SENDGRID_API_KEY  – API-Key (beginnt mit SG.)
-      SMTP_USER         – Absender-Adresse (muss in SendGrid verifiziert sein)
+    Provider-Wahl per Environment:
+      BREVO_SMTP_KEY    gesetzt → Brevo SMTP-Relay (bevorzugt)
+      SENDGRID_API_KEY  gesetzt → SendGrid REST (Legacy)
+      SMTP_USER → Absender-Adresse, muss beim Provider verifiziert sein
+      BREVO_SMTP_LOGIN  → optional; Brevo-Account-Login. Default = SMTP_USER.
 
     Gibt (True, "") bei Erfolg, (False, "<reason>") bei Fehler zurück.
-    Reason enthält bei HTTP-Fehlern den SendGrid-Response-Body, damit Auth-/
-    Quota-/Sender-Identity-Probleme sofort diagnostizierbar sind.
     """
-    api_key  = os.environ.get("SENDGRID_API_KEY", "")
-    absender = os.environ.get("SMTP_USER", "")
+    brevo_smtp_key = os.environ.get("BREVO_SMTP_KEY", "").strip()
+    sendgrid_key   = os.environ.get("SENDGRID_API_KEY", "").strip()
+    absender       = os.environ.get("SMTP_USER", "").strip()
 
-    if not api_key or not absender:
-        msg = "SendGrid nicht konfiguriert (SENDGRID_API_KEY/SMTP_USER fehlt)"
+    if not absender:
+        msg = "SMTP_USER (Absender-Adresse) fehlt"
+        print(f"  [Brief] ℹ️  {msg}")
+        return False, msg
+    if not brevo_smtp_key and not sendgrid_key:
+        msg = "Kein Mail-Provider konfiguriert (BREVO_SMTP_KEY oder SENDGRID_API_KEY noetig)"
         print(f"  [Brief] ℹ️  {msg}")
         return False, msg
 
@@ -3750,64 +3853,39 @@ def _brief_send_email_sammlung(
             "",
             "Automatisch erstellt vom Edikte-Monitor.",
         ])
-
         subject = (
             f"Edikte-Monitor: {anzahl} neuer Anschreiben-Entwurf"
             if anzahl == 1 else
             f"Edikte-Monitor: {anzahl} neue Anschreiben-Entwürfe"
         )
+        attachments_b64 = [
+            (base64.b64encode(docx_bytes).decode("utf-8"), dateiname)
+            for docx_bytes, dateiname in attachments
+        ]
 
-        att_list = []
-        for docx_bytes, dateiname in attachments:
-            att_list.append({
-                "content":     base64.b64encode(docx_bytes).decode("utf-8"),
-                "type":        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "filename":    dateiname,
-                "disposition": "attachment",
-            })
+        if brevo_smtp_key:
+            provider = "Brevo-SMTP"
+            smtp_login = os.environ.get("BREVO_SMTP_LOGIN", "").strip() or absender
+            ok, reason = _send_via_smtp(
+                host="smtp-relay.brevo.com", port=587,
+                username=smtp_login, password=brevo_smtp_key,
+                absender=absender, to_email=kontakt_email, to_name=kontakt_name,
+                subject=subject, body_text=body_text,
+                attachments_b64=attachments_b64,
+            )
+        else:
+            provider = "SendGrid"
+            ok, reason = _send_via_sendgrid(
+                sendgrid_key, absender, kontakt_email, kontakt_name,
+                subject, body_text, attachments_b64,
+            )
 
-        payload = {
-            "personalizations": [{"to": [{"email": kontakt_email, "name": kontakt_name}]}],
-            "from": {"email": absender},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": body_text}],
-            "attachments": att_list,
-        }
-
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req  = urllib.request.Request(
-            "https://api.sendgrid.com/v3/mail/send",
-            data=data,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type":  "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            status = r.getcode()
-
-        if status in (200, 202):
-            print(f"  [Brief] ✉️  Sammel-E-Mail ({anzahl} Anhänge) gesendet an {kontakt_email}")
+        if ok:
+            print(f"  [Brief] ✉️  Sammel-E-Mail ({anzahl} Anhänge) gesendet an {kontakt_email} via {provider}")
             return True, ""
-        msg = f"SendGrid HTTP {status} (unerwarteter Status)"
-        print(f"  [Brief] ⚠️  {msg}")
-        return False, msg
+        print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen ({provider}): {reason}")
+        return False, reason
 
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace").strip()
-        except Exception:
-            pass
-        # SendGrid 4xx-Bodies sind JSON wie {"errors":[{"message":"...","field":...}]}
-        # → kompakt machen, damit's in Telegram (4000-Zeichen-Limit) und Notion-Notiz passt.
-        body_short = " ".join(body.split())[:300]
-        msg = f"HTTP {exc.code} {exc.reason}"
-        if body_short:
-            msg += f" – {body_short}"
-        print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {msg}")
-        return False, msg
     except Exception as exc:
         msg = f"{type(exc).__name__}: {exc}"
         print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {msg}")
