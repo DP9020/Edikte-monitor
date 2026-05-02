@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       modus:
-        description: "Modus: full | brief | gdrive | cleanup | telegram-test | wochenbericht | sendgrid-check | brevo-check"
+        description: "Modus: full | brief | gdrive | cleanup | telegram-test | wochenbericht | sendgrid-check | brevo-check | mail-testsend"
         required: false
         default: "full"
 
@@ -229,6 +229,27 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
         run: |
           python3 scripts/brevo_healthcheck.py
+
+  # MAIL-TESTSEND: schickt eine Test-Mail an SMTP_USER (verbraucht 1 Credit)
+  mail-testsend:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'mail-testsend'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Test-Mail senden
+        env:
+          BREVO_SMTP_KEY: ${{ secrets.BREVO_SMTP_KEY }}
+          BREVO_SMTP_LOGIN: ${{ secrets.BREVO_SMTP_LOGIN }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+        run: |
+          python3 scripts/mail_testsend.py
 
   # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Dienstag 03:00 UTC)
   cleanup-duplikate:

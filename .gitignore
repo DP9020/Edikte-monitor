@@ -17,3 +17,8 @@ briefe/
 # Eval-Artefakte (Roh-PDFs, Run-Logs, Eval-Set bleiben lokal)
 eval/data/pdfs/
 eval/runs/
+
+# Lokale Browser-Setups via Playwright (Profile + Screenshots mit Account-Daten)
+scripts/_brevo_setup.py
+scripts/_brevo_setup_screens/
+scripts/_brevo_profile/
