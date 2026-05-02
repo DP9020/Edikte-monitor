@@ -46,7 +46,7 @@ Betreiber: **Immo-in-Not GmbH** — kauft Immobilien von Eigentümern vor Zwangs
 | `run.yml` `brief-only` | alle 10 Min | Status-Sync + Brief-Erstellung (~30 s) |
 | `run.yml` `gdrive-sync` | alle 30 Min | Drive-Upload für gelbe Einträge |
 | `run.yml` `cleanup-duplikate` | Di 03:00 UTC | Duplikat-Bereinigung |
-| `run.yml` `wochenbericht` | Mo 07:30 UTC | wöchentlicher Status-Report |
+| `run.yml` `wochenbericht` | Mo 08:15 UTC | wöchentlicher Status-Report (eigene concurrency-group) |
 | `dedup-neu-eingelangt.yml` | Mo/Mi/Fr 03:30 UTC | 🆕-Duplikate gegen bearbeitete Zwillinge |
 | `dedup-tief.yml` | manuell | tiefe Union-Find-Bereinigung |
 

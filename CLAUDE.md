@@ -50,7 +50,7 @@ Workflows in `.github/workflows/`:
 - **`run.yml` `brief-only`**: alle 10 Min — Status-Sync + Brief-Erstellung (~30 Sek. Laufzeit)
 - **`run.yml` `gdrive-sync`**: alle 30 Min — Drive-Upload für gelb markierte Einträge
 - **`run.yml` `cleanup-duplikate`**: Di 03:00 UTC — Duplikat-Bereinigung (`--apply`)
-- **`run.yml` `wochenbericht`**: Mo 07:30 UTC — wöchentlicher Statusbericht
+- **`run.yml` `wochenbericht`**: Mo 08:15 UTC — wöchentlicher Statusbericht (eigene concurrency-group)
 - **`dedup-neu-eingelangt.yml`**: Mo/Mi/Fr 03:30 UTC — 🆕-Duplikate gegen bereits bearbeitete Zwillinge
 - **`dedup-tief.yml`**: nur manuell (workflow_dispatch) — tiefe Bereinigung mit Union-Find
 
