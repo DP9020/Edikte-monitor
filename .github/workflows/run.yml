@@ -22,6 +22,10 @@ on:
         required: false
         default: "full"
 
+# Default-Permissions auf read-only setzen. Workflow muss nichts schreiben.
+permissions:
+  contents: read
+
 jobs:
 
   # Vollständiger Run: Scraping + Gutachten-Analyse
