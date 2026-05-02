@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       modus:
-        description: "Modus: full | brief | gdrive | cleanup | telegram-test | wochenbericht"
+        description: "Modus: full | brief | gdrive | cleanup | telegram-test | wochenbericht | sendgrid-check"
         required: false
         default: "full"
 
@@ -192,6 +192,22 @@ jobs:
               except Exception as e:
                   print(f'FEHLER {name} ({cid}): {e}')
           "
+
+  # SENDGRID-CHECK: API-Key + Sender Identity diagnostizieren (manuell)
+  sendgrid-check:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'sendgrid-check'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Healthcheck
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+        run: |
+          python3 scripts/sendgrid_healthcheck.py
 
   # CLEANUP: Duplikate in Notion-Datenbank archivieren (manuell + jeden Dienstag 03:00 UTC)
   cleanup-duplikate:
