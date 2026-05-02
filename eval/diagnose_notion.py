@@ -26,7 +26,17 @@ notion = Client(auth=os.environ["NOTION_TOKEN"])
 db_id  = os.environ["NOTION_DATABASE_ID"]
 
 
-def _rt(rt): return "".join(t.get("text", {}).get("content", "") for t in rt or []).strip()
+def _rt(rt):
+    parts = []
+    for t in rt or []:
+        plain = t.get("plain_text") if isinstance(t, dict) else None
+        if isinstance(plain, str) and plain:
+            parts.append(plain); continue
+        text_obj = (t.get("text") if isinstance(t, dict) else None) or {}
+        c = text_obj.get("content") if isinstance(text_obj, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+    return "".join(parts).strip()
 
 
 total = 0

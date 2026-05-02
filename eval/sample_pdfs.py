@@ -64,7 +64,19 @@ def load_env(path: Path) -> None:
 
 
 def _rt(rt) -> str:
-    return "".join(t.get("text", {}).get("content", "") for t in rt or []).strip()
+    parts: list[str] = []
+    for t in rt or []:
+        if not isinstance(t, dict):
+            continue
+        plain = t.get("plain_text")
+        if isinstance(plain, str) and plain:
+            parts.append(plain)
+            continue
+        text_obj = t.get("text") or {}
+        c = text_obj.get("content") if isinstance(text_obj, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+    return "".join(parts).strip()
 
 
 def fetch_candidates(notion, db_id: str) -> list[dict]:

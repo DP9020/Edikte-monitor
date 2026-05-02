@@ -54,6 +54,29 @@ from notion_client import Client  # noqa: E402
 from _notion_helpers import paginated_query, with_retry  # noqa: E402
 
 
+def _rt_text(rt: list | None) -> str:
+    """Verkettet alle Blöcke einer Notion rich_text Property.
+    Notion splittet rich_text bei >2000 Zeichen in mehrere Blöcke und
+    Mention/Equation-Blöcke haben kein "text"-Dict – beides muss hier
+    sicher behandelt werden, sonst gehen Hash-IDs verloren oder es
+    crasht."""
+    if not rt:
+        return ""
+    parts: list[str] = []
+    for block in rt:
+        if not isinstance(block, dict):
+            continue
+        plain = block.get("plain_text")
+        if isinstance(plain, str) and plain:
+            parts.append(plain)
+            continue
+        text_obj = block.get("text") or {}
+        content = text_obj.get("content") if isinstance(text_obj, dict) else None
+        if isinstance(content, str):
+            parts.append(content)
+    return "".join(parts)
+
+
 # ── Phasen-Ranking (höher = wertvoller, behalten) ───────────────────────────
 PHASE_RANG = {
     "🆕 Neu eingelangt": 0,
@@ -152,15 +175,13 @@ def ist_synthetischer_titel(title: str) -> bool:
 def hash_ids_of(page: dict) -> set[str]:
     """Gibt alle Hash-IDs einer Page als Set zurück (cumulatives Feld)."""
     hash_rt = page.get("properties", {}).get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
-    if not hash_rt:
-        return set()
-    full = hash_rt[0].get("plain_text", "").strip().lower()
+    full = _rt_text(hash_rt).strip().lower()
     return {e.strip() for e in full.split("\n") if e.strip()}
 
 
 def get_titel(page: dict) -> str:
     title_rt = page.get("properties", {}).get("Liegenschaftsadresse", {}).get("title", [])
-    return title_rt[0].get("plain_text", "").strip() if title_rt else ""
+    return _rt_text(title_rt).strip()
 
 
 def get_select(page: dict, field: str) -> str:
@@ -169,7 +190,7 @@ def get_select(page: dict, field: str) -> str:
 
 def get_rt(page: dict, field: str) -> str:
     rt = page.get("properties", {}).get(field, {}).get("rich_text", [])
-    return rt[0].get("plain_text", "").strip() if rt else ""
+    return _rt_text(rt).strip()
 
 
 def page_rang(page: dict) -> int:
