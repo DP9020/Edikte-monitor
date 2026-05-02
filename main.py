@@ -310,6 +310,30 @@ def _rt(text: str) -> dict:
     return {"rich_text": [{"text": {"content": str(text)[:2000]}}]}
 
 
+def _rt_to_text(rt: list | None) -> str:
+    """
+    Verkettet alle Blöcke einer Notion rich_text Property zu einem String.
+    Notion splittet rich_text bei >2000 Zeichen oder beim manuellen Editieren
+    in mehrere Blöcke. Mention/Equation-Blöcke haben kein "text"-Dict.
+    Nur den ersten Block zu lesen führt zu Datenverlust und Crashes.
+    """
+    if not rt:
+        return ""
+    parts: list[str] = []
+    for block in rt:
+        if not isinstance(block, dict):
+            continue
+        plain = block.get("plain_text")
+        if isinstance(plain, str) and plain:
+            parts.append(plain)
+            continue
+        text_obj = block.get("text") or {}
+        content = text_obj.get("content") if isinstance(text_obj, dict) else None
+        if isinstance(content, str):
+            parts.append(content)
+    return "".join(parts)
+
+
 def _str_val(val) -> str:
     """Konvertiert einen Wert sicher zu str."""
     return str(val).strip() if val else ""
@@ -1791,10 +1815,12 @@ def _notion_query_with_retry(notion: "Client", db_id: str, **kwargs) -> dict:
         except Exception as exc:
             last_exc = exc
             if attempt < 2:
-                wait = 5 * (attempt + 1) * 3  # 5s, 15s
+                wait = 5 * (3 ** attempt)  # 5s, 15s
                 print(f"  [Notion] ⚠️  API-Fehler (Versuch {attempt+1}/3), warte {wait}s: {exc}")
                 time.sleep(wait)
-    raise last_exc  # type: ignore[misc]
+    if last_exc is None:
+        raise RuntimeError("notion query failed without captured exception")
+    raise last_exc
 
 
 def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
@@ -1849,14 +1875,16 @@ def notion_load_all_ids(notion: Client, db_id: str) -> dict[str, str]:
 
             # Hash-ID auslesen – Feld kann mehrere IDs enthalten (newline-getrennt),
             # weil notion_update_edikt_eintrag neue edikt_ids anhängt statt zu ersetzen.
+            # WICHTIG: Notion splittet rich_text bei >2000 Zeichen in mehrere Blöcke,
+            # daher müssen ALLE Blöcke verkettet werden (nicht nur [0]).
             hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
-            hash_full_text = hash_rt[0].get("plain_text", "").strip().lower() if hash_rt else ""
+            hash_full_text = _rt_to_text(hash_rt).strip().lower()
             all_eids = [e.strip() for e in hash_full_text.split("\n") if e.strip()] if hash_full_text else []
             eid = all_eids[0] if all_eids else ""  # Primäre ID für Kompatibilität
 
             # Titel-Fingerprint für alle Einträge holen (wird unten gespeichert)
             title_rt_all = props.get("Liegenschaftsadresse", {}).get("title", [])
-            title_all    = title_rt_all[0].get("plain_text", "").strip().lower() if title_rt_all else ""
+            title_all    = _rt_to_text(title_rt_all).strip().lower()
 
             # Bundesland als Teil des Fingerprints – verhindert Kollisionen zwischen
             # gleichen Adressen in verschiedenen Bundesländern (z.B. gleiche Straße in
@@ -2142,15 +2170,24 @@ def notion_update_edikt_eintrag(
         existing_termin_obj = existing_props.get("Versteigerungstermin", {}).get("date") or {}
         existing_termin = existing_termin_obj.get("start", "")
         existing_vk_rt = existing_props.get("Verkehrswert", {}).get("rich_text", [])
-        existing_vk = existing_vk_rt[0].get("plain_text", "").strip() if existing_vk_rt else ""
-        # Bestehende Hash-IDs lesen (können mehrere sein, newline-getrennt)
+        existing_vk = _rt_to_text(existing_vk_rt).strip()
+        # Bestehende Hash-IDs lesen (können mehrere sein, newline-getrennt).
+        # rich_text wird von Notion bei >2000 Zeichen in mehrere Blöcke gesplittet –
+        # daher MÜSSEN alle Blöcke verkettet werden, sonst gehen ältere IDs verloren
+        # und es entstehen Duplikate beim nächsten Scrape.
         existing_hash_rt = existing_props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
-        existing_hash_ids = existing_hash_rt[0].get("plain_text", "").strip() if existing_hash_rt else ""
+        existing_hash_ids = _rt_to_text(existing_hash_rt).strip()
         retrieve_ok = True
     except Exception as exc:
-        print(f"  [Notion] ⚠️  Bestehende Werte nicht lesbar – überspringe Änderungserkennung: {exc}")
+        print(f"  [Notion] ⚠️  Bestehende Werte nicht lesbar – überspringe Update komplett: {exc}")
         existing_termin = ""
         existing_vk = ""
+
+    # Bei Retrieve-Fehler darf das Hash-ID-Feld NICHT überschrieben werden:
+    # existing_hash_ids ist "" → Update würde alle bisher gesammelten edikt_ids
+    # verlieren (Datenverlust → Duplikat-Erzeugung beim nächsten Scrape).
+    if not retrieve_ok:
+        return False
 
     props: dict = {}
 
