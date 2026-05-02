@@ -1858,16 +1858,54 @@ def gutachten_enrich_notion_page(
 # NOTION
 # =============================================================================
 
+# Notion API 2025-09-03: Datenbanken haben jetzt "data sources". Queries und
+# pages.create-Parents müssen die data_source_id verwenden, nicht mehr die
+# database_id. Wir resolven einmalig per databases.retrieve() und cachen.
+_data_source_id_cache: dict[str, str] = {}
+
+
+def _resolve_data_source_id(notion: "Client", db_id: str) -> str:
+    """
+    Holt die data_source_id für eine Notion-Datenbank (cached).
+
+    In API-Version 2025-09-03 wurde der `Query a database`-Endpunkt durch
+    `Query a data source` ersetzt. Eine Datenbank kann mehrere Data Sources
+    enthalten; der Edikte-Monitor nutzt die erste (Default) Data Source.
+    """
+    cached = _data_source_id_cache.get(db_id)
+    if cached:
+        return cached
+
+    db = notion_with_retry(notion.databases.retrieve, database_id=db_id)
+    sources = db.get("data_sources") or []
+    if not sources:
+        raise RuntimeError(
+            f"Notion-Datenbank {db_id[:8]}… liefert keine data_sources – "
+            "ist die Integration auf API-Version 2025-09-03+ konfiguriert?"
+        )
+    ds_id = sources[0].get("id")
+    if not ds_id:
+        raise RuntimeError(f"data_sources[0].id fehlt für DB {db_id[:8]}…")
+
+    _data_source_id_cache[db_id] = ds_id
+    return ds_id
+
+
 def _notion_query_with_retry(notion: "Client", db_id: str, **kwargs) -> dict:
     """
-    Führt notion.databases.query() mit bis zu 3 Versuchen aus.
+    Führt notion.data_sources.query() mit bis zu 3 Versuchen aus.
+
+    Akzeptiert weiterhin die database_id als Eingabe (für Aufrufer-Kompatibilität)
+    und resolved intern auf data_source_id.
+
     Wartet 5s nach dem 1. Fehler, 15s nach dem 2. Fehler.
     Wirft bei dauerhaftem Fehler die letzte Exception.
     """
+    ds_id = _resolve_data_source_id(notion, db_id)
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            return notion.databases.query(database_id=db_id, **kwargs)
+            return notion.data_sources.query(data_source_id=ds_id, **kwargs)
         except Exception as exc:
             last_exc = exc
             if attempt < 2:
@@ -2183,9 +2221,11 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
     # ── Seite anlegen – erst Kern, dann optionale Felder einzeln ─────────────
     # Strategie: Kern-Properties zuerst. Falls optionale Felder nicht existieren,
     # werden sie weggelassen und der Eintrag trotzdem angelegt.
+    ds_id = _resolve_data_source_id(notion, db_id)
+
     created_page = None
     try:
-        created_page = notion_with_retry(notion.pages.create, parent={"database_id": db_id}, properties=properties)
+        created_page = notion_with_retry(notion.pages.create, parent={"data_source_id": ds_id}, properties=properties)
         print(f"  [Notion] ✅ Erstellt: {titel[:80]}")
     except Exception as e:
         err_str = str(e)
@@ -2201,7 +2241,7 @@ def notion_create_eintrag(notion: Client, db_id: str, data: dict,
         if removed:
             print(f"  [Notion] ⚠️  Felder nicht gefunden, übersprungen: {removed}")
             try:
-                created_page = notion_with_retry(notion.pages.create, parent={"database_id": db_id}, properties=properties)
+                created_page = notion_with_retry(notion.pages.create, parent={"data_source_id": ds_id}, properties=properties)
                 print(f"  [Notion] ✅ Erstellt (ohne {removed}): {titel[:80]}")
             except Exception as e2:
                 raise e2  # Wirklicher Fehler → nach oben weitergeben
@@ -2424,7 +2464,7 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
 
     enriched = 0
 
-    # Alle Seiten via databases.query() laden
+    # Alle Seiten via data_sources.query() laden
     pages_without_url: list[dict] = []
     has_more = True
     start_cursor = None

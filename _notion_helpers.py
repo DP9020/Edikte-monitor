@@ -53,13 +53,41 @@ def with_retry(fn, *args, max_retries: int = 3, label: str = "Notion", **kwargs)
                 raise
 
 
+# Notion API 2025-09-03: data_source_id ersetzt database_id für Queries.
+# Wir cachen die Resolution pro db_id, damit wir databases.retrieve() nicht
+# bei jedem Query-Aufruf wiederholen müssen.
+_data_source_id_cache: dict[str, str] = {}
+
+
+def resolve_data_source_id(notion, db_id: str) -> str:
+    """Resolved data_source_id für eine Notion-Datenbank (cached, mit Retry)."""
+    cached = _data_source_id_cache.get(db_id)
+    if cached:
+        return cached
+
+    db = with_retry(notion.databases.retrieve, database_id=db_id, label="Notion-DB-Retrieve")
+    sources = db.get("data_sources") or []
+    if not sources:
+        raise RuntimeError(
+            f"Notion-Datenbank {db_id[:8]}… liefert keine data_sources – "
+            "ist die Integration auf API-Version 2025-09-03+ konfiguriert?"
+        )
+    ds_id = sources[0].get("id")
+    if not ds_id:
+        raise RuntimeError(f"data_sources[0].id fehlt für DB {db_id[:8]}…")
+
+    _data_source_id_cache[db_id] = ds_id
+    return ds_id
+
+
 def query_with_retry(notion, db_id: str, **kwargs) -> dict:
-    """databases.query() mit Retry."""
-    return with_retry(notion.databases.query, database_id=db_id, label="Notion-Query", **kwargs)
+    """data_sources.query() mit Retry. Nimmt weiterhin die database_id und resolved intern."""
+    ds_id = resolve_data_source_id(notion, db_id)
+    return with_retry(notion.data_sources.query, data_source_id=ds_id, label="Notion-Query", **kwargs)
 
 
 def paginated_query(notion, db_id: str, page_size: int = 100) -> list[dict]:
-    """Paginiert durch die gesamte DB und gibt alle Results zurück.
+    """Paginiert durch die gesamte Data Source und gibt alle Results zurück.
 
     Verwendet query_with_retry für jeden Einzelaufruf.
     """

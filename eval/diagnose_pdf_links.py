@@ -28,6 +28,18 @@ notion = Client(auth=os.environ["NOTION_TOKEN"])
 db_id  = os.environ["NOTION_DATABASE_ID"]
 
 
+def _resolve_data_source_id(notion, db_id: str) -> str:
+    """Notion API 2025-09-03: queries laufen über data_source_id."""
+    db = notion.databases.retrieve(database_id=db_id)
+    sources = db.get("data_sources") or []
+    if not sources:
+        raise RuntimeError(f"Notion-DB {db_id[:8]}… liefert keine data_sources")
+    return sources[0]["id"]
+
+
+ds_id = _resolve_data_source_id(notion, db_id)
+
+
 def _rt(rt):
     parts = []
     for t in rt or []:
@@ -46,10 +58,10 @@ PDF_LINK_RE = re.compile(r"Gutachten-PDF:\s*(\S+)")
 with_link = []
 cursor = None
 while True:
-    kwargs = {"database_id": db_id, "page_size": 100}
+    kwargs = {"data_source_id": ds_id, "page_size": 100}
     if cursor:
         kwargs["start_cursor"] = cursor
-    resp = notion.databases.query(**kwargs)
+    resp = notion.data_sources.query(**kwargs)
     for p in resp.get("results", []):
         props = p.get("properties", {})
         if not (props.get("Gutachten analysiert?", {}).get("checkbox") or False):

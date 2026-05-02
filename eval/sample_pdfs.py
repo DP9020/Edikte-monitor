@@ -79,15 +79,25 @@ def _rt(rt) -> str:
     return "".join(parts).strip()
 
 
+def _resolve_data_source_id(notion, db_id: str) -> str:
+    """Notion API 2025-09-03: queries laufen über data_source_id."""
+    db = notion.databases.retrieve(database_id=db_id)
+    sources = db.get("data_sources") or []
+    if not sources:
+        raise RuntimeError(f"Notion-DB {db_id[:8]}… liefert keine data_sources")
+    return sources[0]["id"]
+
+
 def fetch_candidates(notion, db_id: str) -> list[dict]:
     """Alle analysierten Pages mit `Gutachten-PDF:`-Link aus Notizen."""
+    ds_id = _resolve_data_source_id(notion, db_id)
     out: list[dict] = []
     cursor = None
     while True:
-        kwargs = {"database_id": db_id, "page_size": 100}
+        kwargs = {"data_source_id": ds_id, "page_size": 100}
         if cursor:
             kwargs["start_cursor"] = cursor
-        resp = notion.databases.query(**kwargs)
+        resp = notion.data_sources.query(**kwargs)
         for p in resp.get("results", []):
             props = p.get("properties", {})
             if not (props.get("Gutachten analysiert?", {}).get("checkbox") or False):
