@@ -165,7 +165,7 @@ GitHub Actions:
 | ✅ Behoben | HTTP 400 beim Telegram-Senden an Betreuer via `extra_chat_ids` | Direkter `_telegram_send_raw()`-Aufruf |
 | ✅ Behoben | `notion_brief_erstellen()` las `"Name"` statt `"Liegenschaftsadresse"` | Feldname korrigiert |
 | ✅ Behoben | `GESCHUETZT_PHASEN` in 5 Funktionen dupliziert | Globales frozenset |
-| ⚠️ Offen | `notion_load_all_ids()` nutzt `notion.search()` statt `databases.query()` | Bei sehr großen DBs ggf. unzuverlässig |
+| ⚠️ Offen | `notion_load_all_ids()` nutzt `notion.search()` statt `data_sources.query()` | Bei sehr großen DBs ggf. unzuverlässig |
 | ⚠️ Offen | Notion-Dateilimit 5 MB → Anhänge nicht in Notion speicherbar | Geplant: Google Drive |
 | ℹ️ Info | Benjamin/Christopher bekommen nur Nachrichten bei **neu importierten** Objekten | Gewollt so – nur echte Neuzugänge |
 | ⚠️ Risiko | Workflow-Datei nicht per Code pushbar (fehlende Bot-Permission) | Muss manuell auf GitHub bearbeitet werden |
@@ -184,7 +184,7 @@ GitHub Actions:
 - **Library:** `google-api-python-client` + `google-auth`
 
 ### Priorität 2 – Technische Verbesserungen
-- `notion_load_all_ids()` auf `databases.query()` umstellen (aktuell: `notion.search()`)
+- `notion_load_all_ids()` auf `data_sources.query()` umstellen (aktuell: `notion.search()`)
 - EXCLUDE_KEYWORDS reviewen (z.B. „lager" könnte Lagerflächen in Wohngebäuden falsch filtern)
 
 ---

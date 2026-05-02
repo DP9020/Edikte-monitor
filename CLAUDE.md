@@ -92,6 +92,7 @@ edikte.justiz.gv.at (alle 9 Bundesländer)
 - **Telegram-Betreuer** immer über `_telegram_send_raw()` ansprechen — `send_telegram(..., extra_chat_ids=[...])` gibt HTTP 400
 - **`GESCHUETZT_PHASEN`** (globales `frozenset`): Einträge in diesen Phasen werden nicht automatisch überschrieben
 - **Nur Wohnimmobilien** werden importiert — `EXCLUDE_KEYWORDS` und `EXCLUDE_KATEGORIEN` filtern Gewerbe/Landwirtschaft heraus
+- **Notion API 2025-09-03**: Queries laufen über `notion.data_sources.query(data_source_id=...)`, nicht mehr `databases.query`. `pages.create` nutzt `parent={"data_source_id": ds_id}`. Resolution via `_resolve_data_source_id(notion, db_id)` in `main.py` und `_notion_helpers.py` (Modul-Cache, 1× `databases.retrieve` pro Run). Einsatz von `notion-client>=2.7.0`.
 
 ### Brief-Template-Platzhalter (`brief_vorlage.docx`)
 
