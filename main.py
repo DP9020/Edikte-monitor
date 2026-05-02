@@ -840,11 +840,11 @@ def gdrive_sync_gelb_entries(
 
         # Adresse (Title-Feld)
         title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
-        adresse  = title_rt[0].get("plain_text", "").strip() if title_rt else ""
+        adresse  = _rt_to_text(title_rt).strip()
 
         # Verpflichtende Partei (Eigentümer)
         vp_rt    = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-        vp_name  = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
+        vp_name  = _rt_to_text(vp_rt).strip()
 
         edikt_url = props.get("Link", {}).get("url") or ""
         page_id   = page["id"]
@@ -2389,10 +2389,11 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
         props   = page.get("properties", {})
 
         # Hash-ID vorhanden? → Link direkt bauen (erste ID verwenden, da Feld
-        # mehrere newline-getrennte IDs enthalten kann)
+        # mehrere newline-getrennte IDs enthalten kann; Notion splittet in
+        # mehrere Blöcke bei >2000 Zeichen)
         hash_rt = props.get("Hash-ID / Vergleichs-ID", {}).get("rich_text", [])
         if hash_rt:
-            _hash_full = hash_rt[0].get("plain_text", "").strip()
+            _hash_full = _rt_to_text(hash_rt).strip()
             edikt_id = _hash_full.split("\n")[0].strip() if _hash_full else ""
             if edikt_id and re.fullmatch(r"[0-9a-f]{32}", edikt_id):
                 constructed_link = (
@@ -2411,7 +2412,7 @@ def notion_enrich_urls(notion: Client, db_id: str) -> int:
 
         # Kein Hash-ID → Titel-Suche auf edikte.at
         title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
-        titel = title_rt[0].get("plain_text", "") if title_rt else ""
+        titel = _rt_to_text(title_rt)
 
         bl_prop = props.get("Bundesland", {}).get("select") or {}
         bundesland_name = bl_prop.get("name", "")
@@ -2641,7 +2642,7 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
 
         # 'Verpflichtende Partei' lesen
         vp_rt = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-        vp_text = "".join(t.get("text", {}).get("content", "") for t in vp_rt).strip()
+        vp_text = _rt_to_text(vp_rt).strip()
 
         if not vp_text:
             continue
@@ -2667,12 +2668,12 @@ def notion_reset_falsche_verpflichtende(notion: Client, db_id: str,
             continue
         # Aber OHNE Zustelladresse
         adr_rt = props.get("Zustell Adresse", {}).get("rich_text", [])
-        adr_text = "".join(t.get("text", {}).get("content", "") for t in adr_rt).strip()
+        adr_text = _rt_to_text(adr_rt).strip()
         if not adr_text:
             # STOPP: wenn Notizen bereits "Kein PDF" oder ähnliches enthalten
             # → das PDF ist gescannt/nicht lesbar → NICHT nochmal versuchen
             notiz_rt = props.get("Notizen", {}).get("rich_text", [])
-            notiz_text = "".join(t.get("text", {}).get("content", "") for t in notiz_rt).strip()
+            notiz_text = _rt_to_text(notiz_rt).strip()
             if any(marker in notiz_text for marker in (
                 "Kein PDF", "gescannt", "nicht lesbar", "kein Eigentümer"
             )):
@@ -3310,7 +3311,7 @@ def notion_archiviere_inaktive(notion: Client, db_id: str,
             )
             archiviert += 1
             title_rt = props.get("Liegenschaftsadresse", {}).get("title", [])
-            title    = title_rt[0].get("plain_text", "")[:40] if title_rt else page["id"][:8]
+            title    = (_rt_to_text(title_rt)[:40]) or page["id"][:8]
             print(f"  [Archivierung] 📦 Archiviert nach {alter_tage}d: {title} ({phase})")
             time.sleep(0.3)
         except Exception as exc:
@@ -3982,7 +3983,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             continue
         # Fallback: prüfe ob Notiz bereits "Brief erstellt am" enthält
         notizen_rt = props.get("Notizen", {}).get("rich_text", [])
-        notizen_text = "".join(t.get("text", {}).get("content", "") for t in notizen_rt)
+        notizen_text = _rt_to_text(notizen_rt)
         if "Brief erstellt am" in notizen_text:
             continue
         to_process.append(page)
@@ -4007,7 +4008,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     for page in to_process:
         props = page.get("properties", {})
         eigentuemer_list = props.get("Verpflichtende Partei", {}).get("rich_text", [])
-        eigentuemer      = "".join(t.get("text", {}).get("content", "") for t in eigentuemer_list).strip()
+        eigentuemer      = _rt_to_text(eigentuemer_list).strip()
         # Normalisierter Key: Kleinbuchstaben, Leerzeichen zusammengefasst
         key = " ".join(eigentuemer.lower().split()) if eigentuemer else f"__leer_{page['id']}"
         gruppen[key].append(page)
@@ -4027,18 +4028,18 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         first_props = first_page.get("properties", {})
 
         eigentuemer_list = first_props.get("Verpflichtende Partei", {}).get("rich_text", [])
-        eigentuemer      = "".join(t.get("text", {}).get("content", "") for t in eigentuemer_list).strip()
+        eigentuemer      = _rt_to_text(eigentuemer_list).strip()
 
         adresse_list = first_props.get("Zustell Adresse", {}).get("rich_text", [])
-        adresse      = "".join(t.get("text", {}).get("content", "") for t in adresse_list).strip()
+        adresse      = _rt_to_text(adresse_list).strip()
 
         plz_ort_list = first_props.get("Zustell PLZ/Ort", {}).get("rich_text", [])
-        plz_ort      = "".join(t.get("text", {}).get("content", "") for t in plz_ort_list).strip()
+        plz_ort      = _rt_to_text(plz_ort_list).strip()
 
         bundesland = (first_props.get("Bundesland", {}).get("select") or {}).get("name", "")
 
         titel_list = first_props.get("Liegenschaftsadresse", {}).get("title", [])
-        titel      = "".join(t.get("plain_text", "") for t in titel_list).strip()
+        titel      = _rt_to_text(titel_list).strip()
 
         if not bundesland or bundesland not in KONTAKT_DATEN:
             # Kein Betreuer ermittelbar → Steiermark als Fallback (Friedrich)
@@ -4055,7 +4056,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
         # Fallback: wenn Zustell PLZ/Ort leer, versuche Liegenschafts-PLZ-Feld
         if not plz_ort:
             plz_rt_fb = first_props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
-            plz_ort   = "".join(t.get("text", {}).get("content", "") for t in plz_rt_fb).strip()
+            plz_ort   = _rt_to_text(plz_rt_fb).strip()
 
         if not adresse:
             adresse = "(Zustelladresse)"
@@ -4078,16 +4079,16 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             # Notion speichert die volle Adresse (Straße + Hausnr) im Titelfeld
             # "Liegenschaftsadresse", PLZ/Ort separat in "Liegenschafts PLZ"
             titel_rt  = props.get("Liegenschaftsadresse", {}).get("title", [])
-            t_adresse = "".join(x.get("plain_text", "") for x in titel_rt).strip()
+            t_adresse = _rt_to_text(titel_rt).strip()
 
             # Fallback: altes "Name"-Feld
             if not t_adresse:
                 t_list    = props.get("Name", {}).get("title", [])
-                t_adresse = "".join(x.get("plain_text", "") for x in t_list).strip()
+                t_adresse = _rt_to_text(t_list).strip()
 
             # PLZ/Ort: zuerst dediziertes Feld, dann aus Adresse extrahieren
             plz_rt    = props.get(NOTION_PLZ_FIELD, {}).get("rich_text", [])
-            t_plz_ort = "".join(x.get("text", {}).get("content", "") for x in plz_rt).strip()
+            t_plz_ort = _rt_to_text(plz_rt).strip()
 
             if not t_plz_ort:
                 # Versuche PLZ/Ort am Ende der Adresse zu finden (z.B. "Musterstr. 1, 1010 Wien")
@@ -4192,7 +4193,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 p_id = page["id"]
                 p_props = page.get("properties", {})
                 notizen_list = p_props.get("Notizen", {}).get("rich_text", [])
-                notizen_alt  = "".join(t.get("text", {}).get("content", "") for t in notizen_list).strip()
+                notizen_alt  = _rt_to_text(notizen_list).strip()
                 neue_notiz   = notizen_alt
                 if neue_notiz and not neue_notiz.endswith("\n"):
                     neue_notiz += "\n"
@@ -4284,7 +4285,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
                 try:
                     page = notion_with_retry(notion.pages.retrieve, page_id=pid)
                     notizen_rt = page.get("properties", {}).get("Notizen", {}).get("rich_text", [])
-                    alt = "".join(t.get("text", {}).get("content", "") for t in notizen_rt).strip()
+                    alt = _rt_to_text(notizen_rt).strip()
                     neu = (alt + "\n" + warn_text).strip()[:2000] if alt else warn_text[:2000]
                     notion_with_retry(
                         notion.pages.update,
@@ -4477,7 +4478,7 @@ async def send_wochenzusammenfassung(notion: Client, db_id: str) -> None:
 
         # Offene Analyse-Fehler
         notizen_rt   = props.get("Notizen", {}).get("rich_text", [])
-        notizen_text = "".join(t.get("text", {}).get("content", "") for t in notizen_rt)
+        notizen_text = _rt_to_text(notizen_rt)
         if "[Analyse fehlgeschlagen]" in notizen_text and not ist_archiviert:
             analyse_fehler += 1
 
