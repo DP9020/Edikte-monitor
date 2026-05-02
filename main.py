@@ -1303,31 +1303,48 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
           - AT:  '1234 Wien'  oder  '1234'
           - DE:  'D-12345 Berlin'  oder  '12345 München'
           - Kombination in einer Zeile: 'Musterstraße 5, 1234 Wien'
+
+        Der Ortsname wird auf 1-4 großbuchstaben-startende Wörter begrenzt
+        und stoppt vor Tokens wie 'Tel:', '@', Doppelpunkten oder weiteren
+        Zifferngruppen, sonst frisst die Capture-Group den Rest der Zeile
+        (Telefonnummern, FAX, etc.) und kontaminiert das Adress-Feld.
         """
+        # Stoppmuster für Folgewörter: keine Telefon-/Mail-Marker mit oder ohne
+        # Doppelpunkt, kein Wort das direkt von einem Doppelpunkt gefolgt ist.
+        # _stop am Ende: lookahead auf Trennzeichen/Marker/Zeilenende, damit kein
+        # Telefon-/Faxsuffix in den Ortsnamen rutscht.
+        _stop_word = r'(?!Tel\b|Fax\b|Mobil\b|E[-]?Mail\b)'
+        _ort = (
+            r'[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+'
+            rf'(?:\s+{_stop_word}[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-]+(?!:)){{0,3}}'
+        )
+        _stop = r'(?=\s*(?:$|[,;:()\[\]\\/]|\bTel\b|\bFax\b|\bE-?Mail\b|\bMobil\b|@|\d{2,}))'
+
         # Deutsches Präfix: D-XXXXX
-        m = re.search(r'\bD[-–]\s*(\d{5})\s+(.+)', line)
+        m = re.search(rf'\bD[-–]\s*(\d{{5}})\s+({_ort}){_stop}', line)
         if m:
             return m.group(1), f"D-{m.group(1)} {m.group(2).strip()}"
         # 5-stellige PLZ (Deutschland/Liechtenstein etc.)
-        # Ortsname kann Bindestriche enthalten (z.B. Titisee-Neustadt, Baden-Baden)
-        m = re.search(r'\b(\d{5})\s+([A-ZÄÖÜ][\w\-\s]+)', line)
+        m = re.search(rf'\b(\d{{5}})\s+({_ort}){_stop}', line)
         if m:
             plz = m.group(1)
-            if not re.match(r'^(19|20)\d{3}$', plz):  # keine Jahreszahl
-                ort = m.group(2).strip().rstrip('.,')   # trailing Satzzeichen weg
-                return plz, f"{plz} {ort}"
-        # 4-stellige PLZ (Österreich/Schweiz)
-        m = re.search(r'\b(\d{4})\s+([A-ZÄÖÜ][\w\-\s]+)', line)
+            ort = m.group(2).strip().rstrip('.,')
+            return plz, f"{plz} {ort}"
+        # 4-stellige PLZ (Österreich/Schweiz) – hier gegen Jahreszahl 19xx/20xx schützen
+        m = re.search(rf'\b(\d{{4}})\s+({_ort}){_stop}', line)
         if m:
             plz = m.group(1)
             if not re.match(r'^(19|20)\d{2}$', plz):
-                ort = m.group(2).strip().rstrip('.,')   # trailing Satzzeichen weg
+                ort = m.group(2).strip().rstrip('.,')
                 return plz, f"{plz} {ort}"
         # Nur PLZ (4 oder 5 Stellen) ohne Ortsname
         m = re.search(r'\b(\d{4,5})\b', line)
         if m:
             plz = m.group(1)
-            if not re.match(r'^(19|20)\d{2,3}$', plz):
+            # Jahreszahl-Filter nur bei 4-stelligen Werten (Jahre haben 4 Stellen);
+            # 5-stellige PLZ wie 19053 (Schwerin) oder 20095 (Hamburg) sollen durchkommen.
+            ist_jahr = len(plz) == 4 and re.match(r'^(19|20)\d{2}$', plz) is not None
+            if not ist_jahr:
                 return plz, plz
         return "", ""
 
@@ -1356,7 +1373,7 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                     # BUG D: Hilfskraft/Mitarbeiter auch im Inline-Pfad filtern
                     # Prüfe sowohl den Namensteil als auch die gesamte Zeile
                     if re.search(
-                            r'(Hilfskraft|Mitarbeiter[in]*)\s+(des|der)\s+(S[Vv]|Sachverst)',
+                            r'(Hilfskraft|Mitarbeiter(?:in)?)\s+(des|der)\s+(S[Vv]|Sachverst)',
                             rest_of_line, re.IGNORECASE):
                         pass  # nicht setzen, weiter zum nächsten vp_match
                     # BUG: Nur Punkte / Sonderzeichen ohne Buchstaben/Ziffern → überspringen
@@ -1401,7 +1418,7 @@ def gutachten_extract_info(pdf_bytes: bytes) -> dict:
                         # "- Frau Mag. Zuzana ..., Hilfskraft des Sachverständigen"
                         # "Frau Dipl.-Ing. ..., Mitarbeiterin des SV"
                         if re.search(
-                                r'(Hilfskraft|Mitarbeiter[in]*)\s+(des|der)\s+(S[Vv]|Sachverst)',
+                                r'(Hilfskraft|Mitarbeiter(?:in)?)\s+(des|der)\s+(S[Vv]|Sachverst)',
                                 line, re.IGNORECASE):
                             break
                         # BUG E: Kontextzeilen wie "(Sohn der verpflichteten Partei)" überspringen
