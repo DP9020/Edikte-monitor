@@ -275,7 +275,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
-          python cleanup_duplikate.py
+          python cleanup_duplikate.py --apply
       - name: Fehler-Benachrichtigung (Telegram)
         if: failure()
         env:

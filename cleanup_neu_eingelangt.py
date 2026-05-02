@@ -93,10 +93,30 @@ def load_all_pages(notion: Client, db_id: str) -> list[dict]:
     return paginated_query(notion, db_id)
 
 
+def _rt_text(rt: list | None) -> str:
+    """Verkettet alle rich_text-Blöcke; schützt gegen None-Blocks und Multi-Block-Splits."""
+    if not rt:
+        return ""
+    parts: list[str] = []
+    for block in rt:
+        if not isinstance(block, dict):
+            continue
+        plain = block.get("plain_text")
+        if isinstance(plain, str) and plain:
+            parts.append(plain)
+            continue
+        text_obj = block.get("text") or {}
+        content = text_obj.get("content") if isinstance(text_obj, dict) else None
+        if isinstance(content, str):
+            parts.append(content)
+    return "".join(parts)
+
+
 def summarize(page: dict) -> dict:
     p = page["properties"]
     title_rt = p.get("Liegenschaftsadresse", {}).get("title", [])
-    title = title_rt[0].get("plain_text", "").strip() if title_rt else ""
+    title = _rt_text(title_rt).strip()
+    notiz_rt = p.get("Notizen", {}).get("rich_text", [])
     bundesland = (p.get("Bundesland", {}).get("select") or {}).get("name", "")
     phase = (p.get("Workflow-Phase", {}).get("select") or {}).get("name", "")
     relevant = (p.get("Für uns relevant?", {}).get("select") or {}).get("name", "")
@@ -115,6 +135,7 @@ def summarize(page: dict) -> dict:
         "archiviert": archiviert,
         "created": page.get("created_time", ""),
         "last_edited": page.get("last_edited_time", ""),
+        "notiz": _rt_text(notiz_rt).strip(),
     }
 
 
@@ -162,8 +183,10 @@ def main() -> None:
         bearb_entries = [s for s in group if ist_bearbeitet(s)]
         if not neu_entries or not bearb_entries:
             continue
-        # Bester Zwilling: zuletzt bearbeitet (der mit meisten Daten)
-        primary = max(bearb_entries, key=lambda x: x["last_edited"])
+        # Bester Zwilling: zuletzt bearbeitet (der mit meisten Daten).
+        # Tiebreaker auf created, falls last_edited leer/identisch ist –
+        # vermeidet unstabile Reihenfolge bei API-Lücken.
+        primary = max(bearb_entries, key=lambda x: (x["last_edited"] or "", x["created"] or ""))
         for neu in neu_entries:
             misplaced.append((neu, primary))
 
@@ -200,6 +223,14 @@ def main() -> None:
     fehler = 0
     for neu, primary in misplaced:
         try:
+            marker = (
+                f"[Auto-Dedup] Duplikat zu Notion-Page "
+                f"{primary['id'][:8]}… – dort bereits "
+                f"bearbeitet (Phase: {primary['phase']})."
+            )
+            alt_notiz = neu.get("notiz", "").strip()
+            neue_notiz = f"{alt_notiz}\n{marker}".strip() if alt_notiz else marker
+            neue_notiz = neue_notiz[:2000]
             with_retry(
                 notion.pages.update,
                 page_id=neu["id"],
@@ -209,16 +240,7 @@ def main() -> None:
                     "Neu eingelangt": {"checkbox": False},
                     "Notizen": {
                         "rich_text": [
-                            {
-                                "type": "text",
-                                "text": {
-                                    "content": (
-                                        f"[Auto-Dedup] Duplikat zu Notion-Page "
-                                        f"{primary['id'][:8]}… – dort bereits "
-                                        f"bearbeitet (Phase: {primary['phase']})."
-                                    )
-                                },
-                            }
+                            {"type": "text", "text": {"content": neue_notiz}}
                         ]
                     },
                 },

@@ -136,7 +136,22 @@ def latency_stats(per_call: list[dict]) -> dict[str, dict]:
 
 
 def cost_estimate(per_call: list[dict], summary: dict) -> dict[str, float]:
-    """Geschätzte API-Kosten pro Config für die Test-Run-Größe."""
+    """Geschätzte API-Kosten pro Config für die Test-Run-Größe.
+
+    Substring-Heuristik (alt) hat z.B. die Preise von DeepSeek V3.2 und V4-Pro
+    vertauscht, weil beide auf 'deepseek' matchten. Stattdessen direkter
+    Mapping-Lookup über models.CONFIGS[cid].model.
+    """
+    # Lazy-Import um Zirkular-Imports und sys.path-Mutation auf Modul-Ebene
+    # zu vermeiden – report.py wird auch standalone aus eval/ ausgeführt.
+    sys.path.insert(0, str(EVAL_DIR))
+    try:
+        import models as _models  # type: ignore
+        cfg_to_model = {cid: cfg.model for cid, cfg in _models.CONFIGS.items()}
+    finally:
+        if str(EVAL_DIR) in sys.path:
+            sys.path.remove(str(EVAL_DIR))
+
     by_cfg: dict[str, dict[str, int]] = {}
     for r in per_call:
         cid = r["config_id"]
@@ -146,19 +161,10 @@ def cost_estimate(per_call: list[dict], summary: dict) -> dict[str, float]:
         b["prompt"]     += r.get("prompt_tokens")     or 0
         b["completion"] += r.get("completion_tokens") or 0
 
-    cost = {}
+    cost: dict[str, float] = {}
     for cid, tokens in by_cfg.items():
-        # Modell aus dem Config-Namen ableiten — wir haben 1:1 Mapping in summary
-        # Fallback: 0
-        cfg_meta = summary.get(cid, {})
-        # Wir wissen Modell-Name nicht direkt aus summary; raten via Substring
-        unit_cost = None
-        for model_id, prices in TOKEN_PRICES.items():
-            if model_id.lower().split("/")[-1].split("-")[0] in cid:
-                unit_cost = prices
-                break
-        if unit_cost is None:
-            unit_cost = {"input": 0, "output": 0}
+        model_id = cfg_to_model.get(cid, "")
+        unit_cost = TOKEN_PRICES.get(model_id, {"input": 0.0, "output": 0.0})
         cost[cid] = (tokens["prompt"] * unit_cost["input"] +
                      tokens["completion"] * unit_cost["output"]) / 1_000_000
     return cost

@@ -95,4 +95,7 @@ for s in sample:
     print(f"  [{s['modality']:6s}] {tag:25s}  {s['url'][:80]}")
 
 print(f"\n[Diagnose] Sample: {ok} live / {dead} tot")
-print(f"  Hochrechnung: ~{int(len(with_link) * ok / len(sample))} live PDFs verfügbar")
+if sample:
+    print(f"  Hochrechnung: ~{int(len(with_link) * ok / len(sample))} live PDFs verfügbar")
+else:
+    print("  Hochrechnung: – (keine Sample-Pages verfügbar)")

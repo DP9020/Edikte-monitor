@@ -302,7 +302,6 @@ def gruppe_ist_sicher(gruppe: list[dict]) -> tuple[bool, str]:
     if all(h for h in hash_sets):
         # Jede Page hat Hashes, prüfen ob pro Paar Overlap existiert
         # (Union-Find hat die bereits gruppiert, das hier ist Safety-Doublecheck)
-        union_all = set().union(*hash_sets)
         # Min. eine ID die in mehreren Pages vorkommt
         id_count: dict[str, int] = {}
         for hs in hash_sets:

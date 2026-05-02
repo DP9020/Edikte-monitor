@@ -30,10 +30,17 @@ def main() -> int:
         return 1
 
     print("Sende Test-Mail an", sender, "...")
-    # Minimaler DOCX-Stub (gueltige PK-Signatur reicht NICHT als Word-Doc, aber
-    # der Mail-Client zeigt eh nur den Anhang). Wir nehmen ein paar Bytes.
-    fake_docx = b"PK\x03\x04mail-pipeline-test-payload"
-    attachments_b64 = [(base64.b64encode(fake_docx).decode("utf-8"), "Mail-Test.docx")]
+    # Echter, leerer DOCX-Container – Antiviren-Scanner und Office-Clients
+    # akzeptieren das Attachment, ohne es als kaputt zu markieren. Frühere
+    # Stub-Bytes ("PK\\x03\\x04mail-pipeline-test-payload") wurden von
+    # Brevo-Filter teilweise zurückgewiesen → Test-grün war trügerisch.
+    import io
+    from docx import Document  # type: ignore
+
+    _buf = io.BytesIO()
+    Document().save(_buf)
+    real_docx = _buf.getvalue()
+    attachments_b64 = [(base64.b64encode(real_docx).decode("utf-8"), "Mail-Test.docx")]
 
     ok, reason = _send_via_smtp(
         host="smtp-relay.brevo.com", port=587,
