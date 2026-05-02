@@ -14,6 +14,7 @@ import asyncio
 import base64
 import urllib.request
 import urllib.parse
+import urllib.error
 from html import unescape as html_unescape
 from datetime import datetime
 from notion_client import Client
@@ -3714,7 +3715,7 @@ def _brief_send_email_sammlung(
     kontakt_name: str,
     attachments: list[tuple[bytes, str]],  # [(docx_bytes, dateiname), ...]
     eigentuemer_list: list[str],
-) -> bool:
+) -> tuple[bool, str]:
     """
     Sendet ALLE Briefe eines Runs als Sammel-E-Mail (ein Mail, mehrere Anhänge)
     via SendGrid API.
@@ -3723,14 +3724,17 @@ def _brief_send_email_sammlung(
       SENDGRID_API_KEY  – API-Key (beginnt mit SG.)
       SMTP_USER         – Absender-Adresse (muss in SendGrid verifiziert sein)
 
-    Gibt True bei Erfolg, False bei Fehler zurück.
+    Gibt (True, "") bei Erfolg, (False, "<reason>") bei Fehler zurück.
+    Reason enthält bei HTTP-Fehlern den SendGrid-Response-Body, damit Auth-/
+    Quota-/Sender-Identity-Probleme sofort diagnostizierbar sind.
     """
     api_key  = os.environ.get("SENDGRID_API_KEY", "")
     absender = os.environ.get("SMTP_USER", "")
 
     if not api_key or not absender:
-        print("  [Brief] ℹ️  SendGrid nicht konfiguriert (SENDGRID_API_KEY/SMTP_USER fehlt)")
-        return False
+        msg = "SendGrid nicht konfiguriert (SENDGRID_API_KEY/SMTP_USER fehlt)"
+        print(f"  [Brief] ℹ️  {msg}")
+        return False, msg
 
     try:
         anzahl = len(attachments)
@@ -3785,14 +3789,29 @@ def _brief_send_email_sammlung(
 
         if status in (200, 202):
             print(f"  [Brief] ✉️  Sammel-E-Mail ({anzahl} Anhänge) gesendet an {kontakt_email}")
-            return True
-        else:
-            print(f"  [Brief] ⚠️  SendGrid HTTP {status}")
-            return False
+            return True, ""
+        msg = f"SendGrid HTTP {status} (unerwarteter Status)"
+        print(f"  [Brief] ⚠️  {msg}")
+        return False, msg
 
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            pass
+        # SendGrid 4xx-Bodies sind JSON wie {"errors":[{"message":"...","field":...}]}
+        # → kompakt machen, damit's in Telegram (4000-Zeichen-Limit) und Notion-Notiz passt.
+        body_short = " ".join(body.split())[:300]
+        msg = f"HTTP {exc.code} {exc.reason}"
+        if body_short:
+            msg += f" – {body_short}"
+        print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {msg}")
+        return False, msg
     except Exception as exc:
-        print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {exc}")
-        return False
+        msg = f"{type(exc).__name__}: {exc}"
+        print(f"  [Brief] ⚠️  E-Mail-Versand fehlgeschlagen: {msg}")
+        return False, msg
 
 
 def notion_brief_erstellen(notion: "Client", db_id: str,
@@ -4113,7 +4132,7 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
     for eq_key, eq_data in email_queue.items():
         reason = ""
         try:
-            ok = _brief_send_email_sammlung(
+            ok, reason = _brief_send_email_sammlung(
                 kontakt_email    = eq_data["kontakt"]["email"],
                 kontakt_name     = eq_data["kontakt"]["name"],
                 attachments      = eq_data["attachments"],
@@ -4122,7 +4141,8 @@ def notion_brief_erstellen(notion: "Client", db_id: str,
             if ok:
                 emails_ok += 1
                 continue
-            reason = "SendGrid meldete Fehler (siehe Log)"
+            if not reason:
+                reason = "SendGrid meldete Fehler (siehe Log)"
         except Exception as exc:
             reason = f"Exception beim Versand: {exc}"
             print(f"  [Brief] ⚠️  Sammel-E-Mail an {eq_key} fehlgeschlagen: {exc}")
