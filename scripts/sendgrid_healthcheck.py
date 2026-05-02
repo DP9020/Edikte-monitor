@@ -37,6 +37,30 @@ def _get(path: str, api_key: str, timeout: int = 15) -> tuple[int, str]:
         return -1, f"{type(exc).__name__}: {exc}"
 
 
+def _post_json(path: str, api_key: str, payload: dict, timeout: int = 15) -> tuple[int, str]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://api.sendgrid.com{path}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.getcode(), r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return exc.code, body
+    except Exception as exc:
+        return -1, f"{type(exc).__name__}: {exc}"
+
+
 def main() -> int:
     api_key = os.environ.get("SENDGRID_API_KEY", "").strip()
     sender  = os.environ.get("SMTP_USER", "").strip()
@@ -142,11 +166,45 @@ def main() -> int:
     else:
         print(f"      Body: {body[:300]}")
 
+    # 5) Sandbox Mail Send  ────────────────────────────────────────────────
+    # SendGrid unterstuetzt mail_settings.sandbox_mode: validiert die ganze
+    # Pipeline (Auth, Sender-Pruefung, Payload-Format), sendet aber NICHT.
+    # Erfolgs-Status ist 200 (statt 202 bei echtem Send).
+    print("\n[5/5] POST /v3/mail/send  (Sandbox – kein echter Versand)")
+    if not sender:
+        print("      uebersprungen (kein Sender konfiguriert)")
+        sandbox_ok = None
+    else:
+        sandbox_payload = {
+            "personalizations": [{"to": [{"email": sender}]}],
+            "from": {"email": sender},
+            "subject": "Healthcheck Sandbox",
+            "content": [{"type": "text/plain", "value": "sandbox"}],
+            "mail_settings": {"sandbox_mode": {"enable": True}},
+        }
+        status, body = _post_json("/v3/mail/send", api_key, sandbox_payload)
+        print(f"      HTTP {status}")
+        if status == 200:
+            print("      [OK] Mail-Send-Pipeline akzeptiert die Anfrage.")
+            sandbox_ok = True
+        else:
+            body_short = " ".join(body.split())[:400]
+            print(f"      [FAIL] Body: {body_short}")
+            sandbox_ok = False
+
     # Verdict ───────────────────────────────────────────────────────────────
     print()
     print("=" * 60)
     print("ERGEBNIS")
     print("=" * 60)
+    if sandbox_ok is False:
+        print("[FAIL] Sandbox-Send wurde abgelehnt — Mail-Versand ist AKTUELL kaputt.")
+        print("       Siehe Body oben fuer den exakten SendGrid-Grund.")
+        return 1
+    if sandbox_ok is True:
+        print("[OK] Sandbox-Send akzeptiert — Versand ist aktuell funktionsfaehig.")
+        print("     Falls vorher 401 auftrat, war das Problem vermutlich ein")
+        print("     temporaeres Limit (Free-Tier 100/Tag) oder Compliance-Hold.")
     if sender:
         if sender_verified or domain_match:
             via = "Domain-Auth" if domain_match else "Single-Sender"
