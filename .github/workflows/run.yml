@@ -82,9 +82,11 @@ jobs:
   brief-only:
     timeout-minutes: 8
     concurrency:
-      group: edikte-notion-write
-      # Wenn ein neuer brief-only kommt, darf der alte abgebrochen werden
-      # (Daten sind ohnehin frisch neu zu laden, alter Job ist obsolet)
+      # Eigene Group: brief-only darf seinen Vorgänger abbrechen (frische Daten),
+      # aber NICHT andere Notion-Schreibe-Jobs (full-run, gdrive-sync, cleanup,
+      # dedup). Race-Conditions sind unkritisch, weil Brief-Erstellung idempotent
+      # ist (siehe `Brief erstellt am`-Check in main.py erstelle_briefe_fuer_relevante).
+      group: edikte-brief-only
       cancel-in-progress: true
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.modus == 'brief') ||
@@ -333,3 +335,35 @@ jobs:
           JOB_NAME: "wochenbericht"
         run: |
           python3 .github/workflows/_telegram_failure.py
+
+  # NOTIFY-FAILURE: Workflow-level Safety-Net.
+  # Die per-Job Failure-Steps (`if: failure()`) laufen NICHT, wenn ein Job in der
+  # Setup-Phase abgebrochen wird (z.B. durch Concurrency-Cancel oder Job-Timeout
+  # im "Set up job"-Schritt). Dieser Job läuft am Ende immer und alarmiert dann.
+  # brief-only-Cancels werden bewusst ignoriert (das ist erwartet: neuer Tick
+  # ersetzt obsoleten Vorgänger).
+  notify-failure:
+    needs: [full-run, brief-only, gdrive-sync, cleanup-duplikate, wochenbericht]
+    if: |
+      always() && (
+        contains(needs.*.result, 'failure') ||
+        needs.full-run.result == 'cancelled' ||
+        needs.gdrive-sync.result == 'cancelled' ||
+        needs.cleanup-duplikate.result == 'cancelled' ||
+        needs.wochenbericht.result == 'cancelled'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Send Telegram failure alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          FULL_RUN_RESULT: ${{ needs.full-run.result }}
+          BRIEF_ONLY_RESULT: ${{ needs.brief-only.result }}
+          GDRIVE_SYNC_RESULT: ${{ needs.gdrive-sync.result }}
+          CLEANUP_RESULT: ${{ needs.cleanup-duplikate.result }}
+          WOCHENBERICHT_RESULT: ${{ needs.wochenbericht.result }}
+        run: |
+          python3 .github/workflows/_telegram_workflow_failure.py

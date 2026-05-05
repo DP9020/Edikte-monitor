@@ -54,6 +54,24 @@ Workflows in `.github/workflows/`:
 - **`dedup-neu-eingelangt.yml`**: Mo/Mi/Fr 03:30 UTC — 🆕-Duplikate gegen bereits bearbeitete Zwillinge
 - **`dedup-tief.yml`**: nur manuell (workflow_dispatch) — tiefe Bereinigung mit Union-Find
 
+#### Concurrency-Architektur (kritisch)
+
+Drei getrennte concurrency-groups verhindern, dass häufig laufende Jobs (alle 10 Min) langsame Jobs (bis 60 Min) abbrechen:
+
+| Group | Jobs | `cancel-in-progress` |
+|-------|------|---------------------|
+| `edikte-brief-only` | brief-only | **true** (neuer Tick darf alten ersetzen) |
+| `edikte-notion-write` | full-run, gdrive-sync, cleanup-duplikate, dedup-neu-eingelangt | false (sequentielles Schreiben) |
+| `edikte-wochenbericht` | wochenbericht | false |
+
+⚠️ **NIE brief-only zurück in `edikte-notion-write` packen** — `cancel-in-progress: true` würde sonst alle Notion-Schreibe-Jobs killen (passiert war: Mai 2026, full-run und gdrive-sync wurden vom 10-Min-brief-only-Tick gekillt).
+
+Race-Condition zwischen brief-only und full-run ist akzeptabel, weil Brief-Erstellung idempotent ist (`Brief erstellt am`-Property-Check in `erstelle_briefe_fuer_relevante`).
+
+#### Failure-Notification
+
+Pro-Job `if: failure()`-Steps decken nur Fehler innerhalb des Jobs ab. Setup-Cancellations (Concurrency-Cancel, Job-Timeout vor erstem Step) erzeugen **keine** Step-Logs → kein Telegram-Alert. Der workflow-level `notify-failure`-Job am Ende von `run.yml` ist Safety-Net und sendet via `_telegram_workflow_failure.py`. Brief-only-Cancellations werden bewusst ignoriert (das ist erwartet).
+
 ## Architektur
 
 ### Single-File (`main.py`, ~3800 Zeilen)
